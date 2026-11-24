@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">东油通</string>
+    <!-- 添加小组件时，选择器里名字下面那行说明（0.49.0 加）。
+         2026-11-11：全部压到 8 个字以内。以前写「今天几节课、今日任务做到哪了」——
+         那是把整个功能的说明书写进一个标签里，用户在这个界面上只是要挑一个尺寸。 -->
+    <string name="widget_desc">今天的课</string>
+    <string name="widget_label">今日课表（4×2）</string>
+    <!-- 0.52.0 v12：三个新尺寸。名字后面必须带尺寸 —— 选择器里四个都是
+         「今日课表」的话，用户只能靠试：加上去、看看、删掉、换一个。
+         尺寸写在名字里，一眼就知道挑哪个。 -->
+    <string name="widget_label_small">今日课表（2×2）</string>
+    <string name="widget_desc_small">几节、下一节</string>
+    <string name="widget_label_strip">今日课表（4×1）</string>
+    <string name="widget_desc_strip">一行看完</string>
+    <string name="widget_label_large">今日课表（4×4）</string>
+    <string name="widget_desc_large">一屏看全</string>
+
+    <!-- 长按桌面图标那四个快捷方式（2026-11-11）。
+         🔴 ShortLabel 只有大约 10 个字符的位置，超过就被截成「看课…」；
+            LongLabel 在长按弹出的菜单里。
+            两个都不写的话，系统会用 shortcutId（一个英文单词）。
+
+         🔴 2026-11-11 用户改过一次：「今天第几节、在哪间教室」为什么不直接写
+            「课表」？「现在哪间教室空着」写成「空教室」不行吗？
+            —— 长按菜单是**入口**，不是说明书。用户在这个位置已经知道
+            自己要干什么了，再加一句解释只是让他多读七个字。
+            所以短标签和长标签写成同一句，两个都 ≤ 4 字。 -->
+    <string name="sc_schedule_short">课表</string>
+    <string name="sc_schedule_long">课表</string>
+    <string name="sc_exams_short">作业</string>
+    <string name="sc_exams_long">作业</string>
+    <string name="sc_rooms_short">空教室</string>
+    <string name="sc_rooms_long">空教室</string>
+    <string name="sc_campus_short">校园</string>
+    <string name="sc_campus_long">校园</string>
+</resources>

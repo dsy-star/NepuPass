@@ -1,0 +1,70 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 小组件卡片背景（0.47.8 起，0.49.0 重做两次）。
+
+     用户 2026-11-07：「小组件很丑内容很少，你把它按咱们的项目风格来，也要有
+     那种晶莹剔透的感觉」→ 第一版做出来之后又说「现在只有边缘有一点晶莹剔透」。
+
+     ## 第一版为什么失败
+     底色写成了 #FDFEFF —— 那是**不透明的白**。不透明就没有「玻璃」可言：
+     壁纸透不上来，三层渐变全被压在纸下面，看上去就是一张白卡，
+     只有最边上一圈描边还留着一点渐变的痕迹。这也正是用户说的「只有边缘」。
+
+     ## 现在怎么做的
+     底色整体降到 **77%~96% 半透明**：壁纸从卡片里隐隐透出来，这才是玻璃。
+     四层从下往上：
+       ① 底：竖向渐变，上偏白、下偏淡蓝（和 app.css 的 bg-grad 同一路）；
+       ② 高光：上沿亮、腰部消失的白，模拟光从上面打下来；
+       ③ 底部反射：最下面 20% 泛一点淡蓝，卡片才有厚度，不然像一片纸；
+       ④ 边：1.2dp 半透明白描边。Android 12 起系统会给小组件套一层圆角遮罩，
+          自己再画 26dp 正好和遮罩贴合，不画的话边角会被裁成直角。
+
+     🔴 四层都要 26dp 圆角。少一层圆角，那一层就会在四角露出一小块方角 ——
+        因为颜色都接近白色，露出来**基本看不出来**，只有深色壁纸上才发现。
+     🔴 描边那层必须**不填色**（只有 stroke）。填了就把下面三层全盖住。
+     🔴 半透明会让深色壁纸上的文字对比度下降，所以底色最低只到 77%：
+        再透一点更好看，但课名会糊在壁纸的花纹里。 -->
+<layer-list xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- ① 底：半透明的白，上亮下偏蓝。 -->
+    <item>
+        <shape android:shape="rectangle">
+            <gradient
+                android:angle="270"
+                android:startColor="#F5FFFFFF"
+                android:centerColor="#E6FBFDFF"
+                android:endColor="#C4E6F2FF" />
+            <corners android:radius="26dp" />
+        </shape>
+    </item>
+
+    <!-- ② 高光：上沿 48% 白，到腰部就没有了。再多会把课名糊掉。 -->
+    <item>
+        <shape android:shape="rectangle">
+            <gradient
+                android:angle="270"
+                android:startColor="#7AFFFFFF"
+                android:centerColor="#14FFFFFF"
+                android:endColor="#00FFFFFF" />
+            <corners android:radius="26dp" />
+        </shape>
+    </item>
+
+    <!-- ③ 底部反射：从最底下往上 12% 的淡蓝，给卡片一点厚度。 -->
+    <item>
+        <shape android:shape="rectangle">
+            <gradient
+                android:angle="90"
+                android:startColor="#1F8FC4FF"
+                android:endColor="#008FC4FF" />
+            <corners android:radius="26dp" />
+        </shape>
+    </item>
+
+    <!-- ④ 边：只有 stroke，没有 solid。 -->
+    <item>
+        <shape android:shape="rectangle">
+            <stroke android:width="1.2dp" android:color="#A6FFFFFF" />
+            <corners android:radius="26dp" />
+        </shape>
+    </item>
+</layer-list>

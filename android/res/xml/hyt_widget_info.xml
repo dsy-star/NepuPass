@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 桌面小组件的元数据（0.47.8 起，0.49.0 加 previewLayout / description）。
+
+     minWidth / minHeight 不是随便填的：系统按「70dp × 格数 − 30dp」算，
+     250dp × 110dp 就是桌面上的 4×2 格。填小了系统给的位置装不下内容，
+     超出部分直接被裁掉（而且看不出来是被裁的）。
+     ⚠️ 0.49.0 加了「今日任务」那一行之后高度更紧了，但**尺寸不能跟着涨** ——
+        改了会让用户桌面上已经摆好的小组件重新排一遍。
+
+     updatePeriodMillis 1800000 = 半小时，这是系统允许的最快值，而且**不保证**
+     准点执行（省电模式下会更慢）。所以这个小组件只适合「今天有几节课」这种
+     不要求准点的信息；到点提醒是通知那边的事，别指望这里。
+     真正的刷新时机是「用户打开 App」—— 那时候网页会推一份新数据，
+     WidgetProvider 收到就立刻重画，比等系统这半小时可靠得多。
+
+     🔴 previewLayout（Android 12+）：选择器里拿它当预览图。
+        指向 hyt_widget 本身 —— 那份布局的静态文字**故意写的是示例课表**
+        （见文件头注释）。不指的话，选择器里显示的是 App 图标，
+        用户 2026-11-07 原话：「在小组件里面选的时候直接就是航院通图标」。
+        指向自己而不是另存一份：两份布局迟早会走样，而走样的预览比没有预览更糟。
+     🔴 label / description 是选择器里那两行字。不写就显示包名和空白。
+
+     resizeMode 两个方向都放开：只在桌面放得下 4×2，但用户可以拉成 4×1
+     只看标题，或者拉宽让课名不那么容易被省略号截断。 -->
+<appwidget-provider xmlns:android="http://schemas.android.com/apk/res/android"
+    android:minWidth="250dp"
+    android:minHeight="110dp"
+    android:updatePeriodMillis="1800000"
+    android:initialLayout="@layout/hyt_widget"
+    android:previewLayout="@layout/hyt_widget"
+    android:description="@string/widget_desc"
+    android:label="@string/widget_label"
+    android:resizeMode="horizontal|vertical"
+    android:widgetCategory="home_screen" />

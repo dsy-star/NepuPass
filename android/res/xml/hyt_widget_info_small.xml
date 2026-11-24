@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 2×2 方形小组件的元数据（0.52.0 v12 加）。
+
+     minWidth / minHeight 按系统的算法填：70dp × 格数 − 30dp。
+     2 格 = 110dp。填大了系统给的位置装不下内容，超出部分直接被裁掉，
+     而且看不出来是被裁的（用户只会说「显示不全」）。
+
+     其余字段的来历见 hyt_widget_info.xml 的注释，这里只写不一样的地方：
+     🔴 previewLayout 指自己的布局，不指 4×2 那一份 —— 预览尺寸和真机摆放的
+        尺寸对不上时，用户在添加前看到的是「三列课表」，加上去却变成两句话。 -->
+<appwidget-provider xmlns:android="http://schemas.android.com/apk/res/android"
+    android:minWidth="110dp"
+    android:minHeight="110dp"
+    android:updatePeriodMillis="1800000"
+    android:initialLayout="@layout/hyt_widget_small"
+    android:previewLayout="@layout/hyt_widget_small"
+    android:description="@string/widget_desc_small"
+    android:label="@string/widget_label_small"
+    android:resizeMode="horizontal|vertical"
+    android:widgetCategory="home_screen" />

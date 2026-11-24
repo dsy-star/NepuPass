@@ -1,0 +1,61 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 2×2 方形小组件（0.52.0 v12 加）。
+
+     为什么单独一份布局、不跟 4×2 共用：
+     4×2 的一行课是「时间段 58dp + 课名 + 教室」三列，2 格宽只有 110dp，
+     减掉左右留白 24 之后剩 86dp：时间段一项就吃掉 58，课名只剩 28dp（三个字），
+     教室更是挤没。所以这个尺寸不显示三列，改成「今天几节 + 下一节是什么」。
+
+     能用什么控件、不能用什么，与 hyt_widget.xml 文件头那一段完全一样：
+     只许 LinearLayout / TextView / ProgressBar 这一层，分隔线不许用裸 <View>。
+     这份布局里没有分隔线，也没有进度条 —— 2×2 只够说两句话，塞第三件事就挤了。
+
+     🔴 静态文字**故意写成示例数据**：系统拿这份布局当「添加前的预览」。
+        写空白的话，用户在小组件选择器里看到的是一块白板。
+        真机上每次重画都会把这两行重新设一遍，示例不会盖住真实内容。 -->
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/hwRoot"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="@drawable/hw_bg"
+    android:orientation="vertical"
+    android:paddingLeft="12dp"
+    android:paddingRight="12dp"
+    android:paddingTop="10dp"
+    android:paddingBottom="10dp">
+
+    <TextView
+        android:id="@+id/hwTitle"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="今天 · 周六"
+        android:maxLines="1"
+        android:ellipsize="end"
+        android:textColor="#5A6B85"
+        android:textSize="11sp" />
+
+    <!-- 中间这一格吃掉剩余高度，让「几节」大致居中：2×2 的高度不固定，
+         用户拉高一点也不会全挤在上半截。 -->
+    <TextView
+        android:id="@+id/hwBig"
+        android:layout_width="match_parent"
+        android:layout_height="0dp"
+        android:layout_weight="1"
+        android:gravity="center_vertical"
+        android:maxLines="1"
+        android:ellipsize="end"
+        android:text="3 节"
+        android:textColor="#14203A"
+        android:textSize="20sp"
+        android:textStyle="bold" />
+
+    <TextView
+        android:id="@+id/hwNext"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:maxLines="2"
+        android:ellipsize="end"
+        android:text="16:30 形势与政策"
+        android:textColor="#5A6B85"
+        android:textSize="10sp" />
+</LinearLayout>

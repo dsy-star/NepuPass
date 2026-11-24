@@ -1,0 +1,458 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 桌面小组件：今天的课（0.47.8 起；0.49.0 重做外观；0.52.0 v17 去掉行间分隔线）。
+
+     ⚠️ 这份布局只能用**系统认可的远程视图控件**：LinearLayout / TextView /
+        ImageView / ProgressBar 这一层，不能用自定义 View、不能放 WebView、
+        不能跑 JS。所以课表页那套 HTML 一个像素都搬不过来，这里是照着它重画的。
+        🔴 连裸 <View> 都不行（0.49.0 v2 用 <View> 画分隔线，整个小组件加载失败，
+           选择器里写「无法添加小部件」、桌面上放上去一片空白）。
+
+     ## 一行课长什么样
+        16:30~18:10   形势与政策        01B102
+         ← 时间段       ← 课名           ← 教室
+     🔴 时间段是**这一整段连堂课**的起止，不是某一小节的开始时间。
+        用户 2026-11-07：「这两个课程明明是同一节课，你却把它分为两节课了」
+        —— 同一门课连上两小节，网页那边会合并成一条再推过来（见 app.js
+        的 widgetPush），所以这里画出来就是一节课，左侧是 16:30~18:10。
+
+     ## 🔴 课与课之间**不画分隔线**（0.52.0 v17，2026-11-11）
+     以前每行自带一条 1dp 的线 + 上 6 下 5 的边距，一行要 26dp。
+     用户 2026-11-11 的截图：标题写着「5 节」，卡片上只有 4 行，第 5 节
+     （晚上的课）根本没出现 —— 他的原话是「小组件还是无法完整显示」。
+
+     那 8dp 不是花在信息上，是花在**线**上：一天 5~6 节时，那几条线正好
+     吃掉一整行课（20dp）。去掉线、行距收到 4dp 之后一行 = 18dp，
+     同样高的卡片能多画两行。
+
+     靠留白分条也好读：左边的时间列本身就是一条对齐的竖线，每行的起点
+     已经很清楚了 —— 这也正是用户要的极简（参考「出水小部件」那种
+     「一句话一件事」的排版）。
+
+     ## 空状态为什么单独一行
+     「今天没课」/「还没同步」共用 hwEmpty。它有 weight=1：可见时吃掉中间所有
+     空隙、把任务行推到底；有课的时候它是 GONE，由 hwGap 接手吃空隙。
+     🔴 两个「吃空隙」的控件只能有一个可见，所以 Provider 里每次都要一起设。
+
+     🔴 静态文字**故意写成示例数据**（下面那两行）。
+        原因：系统把这份布局当「添加前的预览」用。写空白的话，用户在选小组件时
+        看到的是一块白板（Android 12 以下更是直接显示 App 图标）——
+        那就是用户 2026-11-07 说的「在小组件里面选的时候直接就是东油通图标」。
+        WidgetProvider 每次重画都会把每一处文字重新设一遍、每一行的显隐也重设，
+        所以桌面上的真实内容不会被这两行示例盖住。
+        ⚠️ 第 3 行之后默认 gone：预览里只该看到两行课，多出来的示例会让
+           用户在添加前误以为这个小部件有 6 节课。
+
+     🔴 每行 maxLines=1 + ellipsize：课名长起来会把这行撑成两行，
+        整个卡片就超出格子被裁掉。
+
+     ## 各段高度（dp。WidgetProvider.fitRows 的常数就是从这里量的）
+        上下留白 20 + 标题 17 + 课与任务之间的分隔 12 + 任务行 13 = 62
+        第 1 行 = 上边距 5 + 内容 14 = 19；之后每行 = 4 + 14 = 18
+        ⇒ n 行需要 63 + 18n。
+        🔴 改这里任何一处间距/字号，`fitRows` 里的 63 / 18 必须跟着改，
+           否则会出现「以为放得下、真机裁掉半行」。judge: check_remind.py
+           会拿这份布局的间距把两行课的高度再算一遍，和公式对不上就红。 -->
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/hwRoot"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="@drawable/hw_bg"
+    android:orientation="vertical"
+    android:paddingLeft="14dp"
+    android:paddingRight="14dp"
+    android:paddingTop="10dp"
+    android:paddingBottom="10dp">
+
+    <!-- 标题行：左边「周三 · 3 节」，右边最近一条要交的作业（2026-11-13）。
+         🔴 作业**放进标题这一行**，不另开一行：另开一行要 18dp，
+            4×2（110dp）上正好等于一节晚课 —— 用户就会看到「标题写 5 节、
+            卡片上 4 行」，那正是 0.52.0 v17 刚修好的毛病。
+            11sp 的右侧文字撑不高 14sp 的标题行，所以 fitRows 的公式不用改。 -->
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:gravity="center_vertical"
+        android:orientation="horizontal">
+
+        <TextView
+            android:id="@+id/hwTitle"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:text="周三 · 3 节"
+            android:maxLines="1"
+            android:ellipsize="end"
+            android:textColor="#14203A"
+            android:textSize="14sp"
+            android:textStyle="bold" />
+
+        <!-- 默认藏：这是**实时数据**，不是示例。写成示例的话，任何一条没被
+            重设到的代码路径都会让卡片一直挂着一条并不存在的作业。 -->
+        <TextView
+            android:id="@+id/hwDue"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginLeft="8dp"
+            android:maxLines="1"
+            android:ellipsize="end"
+            android:text=""
+            android:textColor="#2F6BEE"
+            android:textSize="11sp"
+            android:visibility="gone" />
+    </LinearLayout>
+
+    <!-- 第二条提醒（作业 / 考试里的另一类，0.52.3）。
+         🔴 只有**高卡片**（4 行课以上，≈135dp）才画：4×2 的 110dp 再挤 15dp
+            就是把最下面那节课裁掉，而那正是用户抱怨过的老毛病。
+         🔴 默认藏：这是实时数据，不是示例（理由同上面 hwDue）。 -->
+    <TextView
+        android:id="@+id/hwDue2"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="3dp"
+        android:maxLines="1"
+        android:ellipsize="end"
+        android:text=""
+        android:textColor="#5A6B85"
+        android:textSize="10sp"
+        android:visibility="gone" />
+
+    <!-- 「今天没课」/「还没同步」两种情况共用这一行（weight 吃掉中间空隙）。 -->
+    <TextView
+        android:id="@+id/hwEmpty"
+        android:layout_width="match_parent"
+        android:layout_height="0dp"
+        android:layout_weight="1"
+        android:layout_marginTop="6dp"
+        android:gravity="center_vertical"
+        android:text="打开东油通同步课表"
+        android:maxLines="2"
+        android:ellipsize="end"
+        android:textColor="#5A6B85"
+        android:textSize="11sp"
+        android:visibility="gone" />
+
+    <!-- ============ 课程：最多六行（实际用几行按格子高度算）============ -->
+
+    <!-- 第 1 行 -->
+    <LinearLayout
+        android:id="@+id/hwRow1"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="5dp"
+        android:gravity="center_vertical"
+        android:orientation="horizontal">
+
+        <TextView
+            android:id="@+id/hwT1"
+            android:layout_width="58dp"
+            android:layout_height="wrap_content"
+            android:maxLines="1"
+            android:text="16:30~18:10"
+            android:layout_marginRight="8dp"
+            android:textColor="#5A6B85"
+            android:textSize="9.5sp" />
+
+        <TextView
+            android:id="@+id/hwC1"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:maxLines="1"
+            android:ellipsize="end"
+            android:text="形势与政策"
+            android:textColor="#14203A"
+            android:textSize="12sp" />
+
+        <TextView
+            android:id="@+id/hwR1"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginLeft="6dp"
+            android:maxLines="1"
+            android:ellipsize="end"
+            android:text="01B102"
+            android:textColor="#5A6B85"
+            android:textSize="10sp" />
+    </LinearLayout>
+
+    <!-- 第 2 行 -->
+    <LinearLayout
+        android:id="@+id/hwRow2"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="4dp"
+        android:gravity="center_vertical"
+        android:orientation="horizontal">
+
+        <TextView
+            android:id="@+id/hwT2"
+            android:layout_width="58dp"
+            android:layout_height="wrap_content"
+            android:maxLines="1"
+            android:text="19:00~20:40"
+            android:layout_marginRight="8dp"
+            android:textColor="#5A6B85"
+            android:textSize="9.5sp" />
+
+        <TextView
+            android:id="@+id/hwC2"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:maxLines="1"
+            android:ellipsize="end"
+            android:text="大学英语"
+            android:textColor="#14203A"
+            android:textSize="12sp" />
+
+        <TextView
+            android:id="@+id/hwR2"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginLeft="6dp"
+            android:maxLines="1"
+            android:ellipsize="end"
+            android:text="02A201"
+            android:textColor="#5A6B85"
+            android:textSize="10sp" />
+    </LinearLayout>
+
+    <!-- 第 3 行（默认藏：预览里只该看到两行） -->
+    <LinearLayout
+        android:id="@+id/hwRow3"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="4dp"
+        android:gravity="center_vertical"
+        android:orientation="horizontal"
+        android:visibility="gone">
+
+        <TextView
+            android:id="@+id/hwT3"
+            android:layout_width="58dp"
+            android:layout_height="wrap_content"
+            android:maxLines="1"
+            android:text=""
+            android:layout_marginRight="8dp"
+            android:textColor="#5A6B85"
+            android:textSize="9.5sp" />
+
+        <TextView
+            android:id="@+id/hwC3"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:maxLines="1"
+            android:ellipsize="end"
+            android:text=""
+            android:textColor="#14203A"
+            android:textSize="12sp" />
+
+        <TextView
+            android:id="@+id/hwR3"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginLeft="6dp"
+            android:maxLines="1"
+            android:ellipsize="end"
+            android:text=""
+            android:textColor="#5A6B85"
+            android:textSize="10sp" />
+    </LinearLayout>
+
+    <!-- 第 4 行（默认藏） -->
+    <LinearLayout
+        android:id="@+id/hwRow4"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="4dp"
+        android:gravity="center_vertical"
+        android:orientation="horizontal"
+        android:visibility="gone">
+
+        <TextView
+            android:id="@+id/hwT4"
+            android:layout_width="58dp"
+            android:layout_height="wrap_content"
+            android:maxLines="1"
+            android:text=""
+            android:layout_marginRight="8dp"
+            android:textColor="#5A6B85"
+            android:textSize="9.5sp" />
+
+        <TextView
+            android:id="@+id/hwC4"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:maxLines="1"
+            android:ellipsize="end"
+            android:text=""
+            android:textColor="#14203A"
+            android:textSize="12sp" />
+
+        <TextView
+            android:id="@+id/hwR4"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginLeft="6dp"
+            android:maxLines="1"
+            android:ellipsize="end"
+            android:text=""
+            android:textColor="#5A6B85"
+            android:textSize="10sp" />
+    </LinearLayout>
+
+    <!-- 第 5 行（默认藏：只有 4×4 那种高卡片才画得到） -->
+    <LinearLayout
+        android:id="@+id/hwRow5"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="4dp"
+        android:gravity="center_vertical"
+        android:orientation="horizontal"
+        android:visibility="gone">
+
+        <TextView
+            android:id="@+id/hwT5"
+            android:layout_width="58dp"
+            android:layout_height="wrap_content"
+            android:maxLines="1"
+            android:text=""
+            android:layout_marginRight="8dp"
+            android:textColor="#5A6B85"
+            android:textSize="9.5sp" />
+
+        <TextView
+            android:id="@+id/hwC5"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:maxLines="1"
+            android:ellipsize="end"
+            android:text=""
+            android:textColor="#14203A"
+            android:textSize="12sp" />
+
+        <TextView
+            android:id="@+id/hwR5"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginLeft="6dp"
+            android:maxLines="1"
+            android:ellipsize="end"
+            android:text=""
+            android:textColor="#5A6B85"
+            android:textSize="10sp" />
+    </LinearLayout>
+
+    <!-- 第 6 行（默认藏） -->
+    <LinearLayout
+        android:id="@+id/hwRow6"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="4dp"
+        android:gravity="center_vertical"
+        android:orientation="horizontal"
+        android:visibility="gone">
+
+        <TextView
+            android:id="@+id/hwT6"
+            android:layout_width="58dp"
+            android:layout_height="wrap_content"
+            android:maxLines="1"
+            android:text=""
+            android:layout_marginRight="8dp"
+            android:textColor="#5A6B85"
+            android:textSize="9.5sp" />
+
+        <TextView
+            android:id="@+id/hwC6"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:maxLines="1"
+            android:ellipsize="end"
+            android:text=""
+            android:textColor="#14203A"
+            android:textSize="12sp" />
+
+        <TextView
+            android:id="@+id/hwR6"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginLeft="6dp"
+            android:maxLines="1"
+            android:ellipsize="end"
+            android:text=""
+            android:textColor="#5A6B85"
+            android:textSize="10sp" />
+    </LinearLayout>
+
+    <!-- 吃掉剩余高度：把下面的任务行顶到卡片底部。
+         用户 2026-11-07 的截图里，卡片比内容高，下面空了一大块 ——
+         没有这个占位控件，内容全挤在上半截。 -->
+    <TextView
+        android:id="@+id/hwGap"
+        android:layout_width="match_parent"
+        android:layout_height="0dp"
+        android:layout_weight="1"
+        android:text="" />
+
+    <!-- 分隔：把「课」和「任务」分成两件事。只用留白的话两者像同一列数据。
+         ⚠️ 这是**两块内容之间**的分隔，不是每行之间的 —— 后者 2026-11-11 去掉了
+            （见文件头：一天 5 节时，那几条线正好吃掉一整行课）。 -->
+    <TextView
+        android:id="@+id/hwDiv"
+        android:layout_width="match_parent"
+        android:layout_height="1dp"
+        android:layout_marginTop="5dp"
+        android:layout_marginBottom="6dp"
+        android:background="#1A2F6BEE"
+        android:text="" />
+
+    <!-- ============ 积分任务：一行说完 ============ -->
+    <LinearLayout
+        android:id="@+id/hwTaskRow"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:gravity="center_vertical"
+        android:orientation="horizontal">
+
+        <TextView
+            android:id="@+id/hwTaskT"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:maxLines="1"
+            android:text="积分任务"
+            android:textColor="#5A6B85"
+            android:textSize="11sp" />
+
+        <!-- 进度条。高度 5dp：再细看不出走到哪，再粗就成了海报。
+             🔴 progressTint / progressBackgroundTint 是 API 21+ 的属性，
+                minSdk 是 23，用得起。 -->
+        <ProgressBar
+            android:id="@+id/hwProg"
+            style="?android:attr/progressBarStyleHorizontal"
+            android:layout_width="0dp"
+            android:layout_height="5dp"
+            android:layout_marginLeft="10dp"
+            android:layout_marginRight="10dp"
+            android:layout_weight="1"
+            android:max="100"
+            android:progress="60"
+            android:progressTint="#2F6BEE"
+            android:progressBackgroundTint="#D3E2FA" />
+
+        <TextView
+            android:id="@+id/hwTaskN"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:maxLines="1"
+            android:text="3/8"
+            android:textColor="#2F6BEE"
+            android:textSize="11sp"
+            android:textStyle="bold" />
+    </LinearLayout>
+</LinearLayout>

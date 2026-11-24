@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 4×4 大方块小组件的元数据（0.52.0 v12 加）。
+
+     minWidth / minHeight 按系统的算法填：70dp × 格数 − 30dp。
+     4 格 = 250dp，上下都是 4 格。
+
+     用的是 hyt_widget.xml（就是 4×2 那一份，0.52.0 v12 把课程行从 4 行加到 6 行）：
+     高度够就多画几行，不够就少画几行，行数由 WidgetProvider.fitRows 按格子
+     高度算出来。所以「4×4 显示 6 节、4×2 显示 2 节」不是两套代码，
+     是同一套按高度取行。
+
+     🔴 别为了「让 4×4 更满」把字号调大：4×2 和 4×4 共用这一份布局，
+        字号一动两边一起动，而 4×2 的高度本来就只剩 8dp 余量。 -->
+<appwidget-provider xmlns:android="http://schemas.android.com/apk/res/android"
+    android:minWidth="250dp"
+    android:minHeight="250dp"
+    android:updatePeriodMillis="1800000"
+    android:initialLayout="@layout/hyt_widget"
+    android:previewLayout="@layout/hyt_widget"
+    android:description="@string/widget_desc_large"
+    android:label="@string/widget_label_large"
+    android:resizeMode="horizontal|vertical"
+    android:widgetCategory="home_screen" />

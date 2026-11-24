@@ -1,0 +1,281 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.nepu.dongyoutong">
+
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <!-- ===== 提醒 =====
+         2026-11-07（0.47.8）加。三个权限各自解决一件不同的事，别删任何一个：
+
+         POST_NOTIFICATIONS（Android 13 起）
+             不声明这个，通知**一条都发不出来**，而且 nm.notify() 不抛异常、
+             不返回失败 —— 代码里看起来一切正常。所以它必须在运行时向用户要
+             （见 Reminder.ask），不能靠装包时自动授予。
+
+         SCHEDULE_EXACT_ALARM（Android 12 起）
+             不声明就是「不精确的闹钟」：系统会把它攒到下一个维护窗口再叫醒，
+             上课提醒可能晚十几分钟。声明了也可能被用户在系统设置里收回
+             （收回后 setExact 直接抛 SecurityException，代码里已经退到不精确那一档）。
+
+         RECEIVE_BOOT_COMPLETED
+             闹钟不写磁盘，关机就没了。没有这个权限，用户重启一次手机，
+             之后所有提醒全部静默消失 —— 而他会以为「我明明开过提醒」。
+             重排逻辑见 BootReceiver。 -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" />
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+
+    <!-- 2026-11-13：让「允许东油通后台运行」那一下能弹出系统自己的
+         「是否允许不受电池优化限制」对话框（一个按钮就完事），
+         而不是把用户扔进几十个应用的列表里自己翻。
+         没声明的话部分 ROM 会直接抛 SecurityException —— 代码里接住了，
+         会退到「打开列表」那一档。 -->
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+
+    <!-- ===== 后台自动检查（0.50.0 v5）=====
+         🔴 **故意不加 FOREGROUND_SERVICE**。第一版是「闹钟到点 → 起前台服务」，
+            那个写法在 Android 12 起直接不成立（系统禁止应用从后台启动前台服务，
+            抛 ForegroundServiceStartNotAllowedException）。后果不是崩溃，是
+            **后台一次都跑不起来**，而开关还开着 —— 用户只会说「这功能没用」。
+            现在用 JobScheduler（见 AutoJob），它本来就是给这种事设计的：
+            不需要前台服务、不需要常驻通知，也不用额外权限。 -->
+
+    <!-- 扫码加饮水机（0.31.0）。只在用户点「添加设备」时才向网页批相机权限，
+         平时不会碰相机。
+         🔴 `required="false"`：没有相机的设备照样能装 —— 那种设备上
+            「添加设备」会退化成粘贴二维码内容。 -->
+    <uses-permission android:name="android.permission.CAMERA" />
+    <uses-feature android:name="android.hardware.camera" android:required="false" />
+    <uses-feature android:name="android.hardware.camera.autofocus" android:required="false" />
+
+    <!-- ===== 碰一碰（0.52.0 v7）=====
+         用 NFC 读/写「饮水机贴纸」。两类用法，别混：
+           · 读我们的贴纸 → 系统按下面那个 hyt:// 过滤器直接拉起 App，
+             **不需要**这条权限（标签由系统分发）。
+           · 在 App 里点「碰一碰」手动读卡 / 写卡 → 要这条权限。
+         🔴 NFC **不是危险权限**，装上就有，不会弹框；但没声明的话
+            NfcAdapter 一律是 null，表现是「这台手机没有 NFC」——
+            而手机明明有。这类错最难查，因为不报错。
+         🔴 `required="false"`：没有 NFC 的手机也得能装。 -->
+    <uses-permission android:name="android.permission.NFC" />
+    <uses-feature android:name="android.hardware.nfc" android:required="false" />
+
+    <!-- 🔴 包可见性（Android 11 / API 30 起）：不在这里点名，PackageManager
+         就**查不到**别的 App 装没装 —— getLaunchIntentForPackage 一律返回 null。
+         表现是「明明装了，App 却说没装」，而且**不报错、不抛异常**，
+         只有真机才看得出来。targetSdk 是 33，这段必须有。
+
+         两个包名对应同一件事（宿舍接水）：
+           com.cloudora.android  慧生活798 官方（长沙云多啦）
+           com.water.widget      WaterWidget，第三方客户端
+                                 （nocookies111/life-798，MIT）
+         ⚠️ 加包名要同时改 NativeBridge.ALLOWED_APPS —— 那边是白名单，
+            两处对不上时表现是「点了没反应」。 -->
+    <queries>
+        <package android:name="com.cloudora.android" />
+        <package android:name="com.water.widget" />
+
+        <!-- 🔴 0.52.0：跳「自启动 / 省电策略」那一页要用的厂商包。
+             Android 11（API 30）起有**包可见性**：不在 <queries> 里声明，
+             queryIntentActivities 一律返回空、startActivity 抛
+             ActivityNotFoundException —— 表现就是「怎么点都只跳到应用信息页」。
+             用户 2026-11-09 报的「还是没法跳转到最终界面」根因就在这里：
+             PowerJump 里那些 component 名字都对，只是系统不让看。
+             ⚠️ 加/改厂商 component 时，这里要一起加，两处对不上等于没写。 -->
+        <package android:name="com.miui.powerkeeper" />
+        <package android:name="com.miui.securitycenter" />
+        <package android:name="com.huawei.systemmanager" />
+        <package android:name="com.coloros.safecenter" />
+        <package android:name="com.oplus.safecenter" />
+        <package android:name="com.coloros.oppoguardelf" />
+        <package android:name="com.vivo.permissionmanager" />
+        <package android:name="com.iqoo.secure" />
+        <package android:name="com.samsung.android.lool" />
+        <package android:name="com.meizu.safe" />
+        <package android:name="com.letv.android.letvsafe" />
+        <package android:name="com.asus.mobilemanager" />
+        <package android:name="com.evenwell.powersaving.g3" />
+        <!-- 兜底那条路（电池优化列表 / 应用信息页）走的是系统 Settings -->
+        <intent>
+            <action android:name="android.settings.IGNORE_BATTERY_OPTIMIZATION_SETTINGS" />
+        </intent>
+        <intent>
+            <action android:name="android.settings.APPLICATION_DETAILS_SETTINGS" />
+            <data android:scheme="package" />
+        </intent>
+    </queries>
+
+    <application
+        android:name=".App"
+        android:allowBackup="false"
+        android:icon="@mipmap/ic_launcher"
+        android:label="@string/app_name"
+        android:roundIcon="@mipmap/ic_launcher"
+        android:supportsRtl="true"
+        android:theme="@style/AppTheme"
+        android:usesCleartextTraffic="true">
+
+        <activity
+            android:name=".MainActivity"
+            android:configChanges="orientation|screenSize|keyboardHidden|uiMode"
+            android:exported="true"
+            android:label="@string/app_name"
+            android:launchMode="singleTop"
+            android:windowSoftInputMode="adjustResize">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+
+            <!-- 长按图标弹出来的四个快捷方式（2026-11-11）。
+                 🔴 少了这一行声明，res/xml/shortcuts.xml 就是一份没人读的
+                    文件：长按图标什么都不变，而且**没有任何报错**。
+                 🔴 快捷方式的 intent 带的是 `hyt_page` extra（见 pageOf）。
+                    应用已经开着时走 onNewIntent，没开时走启动参数 ——
+                    两条路都已经处理好了，这里只需要把入口接上。 -->
+            <meta-data
+                android:name="android.app.shortcuts"
+                android:resource="@xml/shortcuts" />
+
+            <!-- ===== 碰一碰：hyt://water/<设备编号>（0.52.0 v7）=====
+                 贴纸里写的就是这个地址。碰上去 → 系统只认我们（hyt 是我们
+                 自己的 scheme，别人不会注册），直接拉起这一页。
+
+                 🔴 **不注册 http/https**，也不注册 ilife://：
+                    那几个是慧生活 / 支付宝自己的入口。注册同一个 scheme，
+                    每次碰标签都会弹「用哪个应用打开」—— 抢走一半的点击，
+                    两家都变得难用。我们的卡只能是**我们自己的卡**。
+
+                 🔴 BROWSABLE 不能少：NFC 的地址记录走的就是「浏览」这一类，
+                    没有它，系统认为这个地址不该被外部唤起，碰了没反应。
+                 解析在 MainActivity.didOf()，取值只留 [A-Za-z0-9_.:-]。 -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="hyt" android:host="water" />
+            </intent-filter>
+        </activity>
+
+        <!-- 办事入口点进去之后的窗口（App 内 WebView，带门户 cookie）。
+             不导出：只有 App 自己能拉起它，别的应用调不动 ——
+             它会把门户的登录态倒进去，不能变成任何 App 都能借道的口子。 -->
+        <activity
+            android:name=".WebActivity"
+            android:configChanges="orientation|screenSize|keyboardHidden|uiMode"
+            android:exported="false"
+            android:label="@string/app_name"
+            android:windowSoftInputMode="adjustResize" />
+
+        <activity
+            android:name=".NepuActivity"
+            android:configChanges="orientation|screenSize|keyboardHidden|uiMode"
+            android:exported="false"
+            android:label="东北石油大学登录"
+            android:windowSoftInputMode="adjustResize" />
+
+        <!-- 导出的日历文件借给日历 App 读（2026-11-11「导出日历」）。
+             仅开放 ShareProvider 缓存目录中的 .ics 文件。
+             🔴 authorities 必须和 ShareProvider.AUTHORITY 一字不差；
+                对不上时**不报错**，只是分享出去的文件对方打不开。 -->
+        <provider
+            android:name=".ShareProvider"
+            android:authorities="com.nepu.dongyoutong.share"
+            android:exported="false"
+            android:grantUriPermissions="true" />
+
+        <!-- ===== 提醒：闹钟到点 =====
+             由系统的闹钟服务通过 PendingIntent 唤起，那时候应用可能根本不在内存里。
+             🔴 exported="false"：PendingIntent 是以**我们自己**的身份发出的，
+                所以自己收得到；别的应用发不进来 —— 否则任何应用都能替你弹一条
+                「快上课了」。 -->
+        <receiver
+            android:name=".RemindReceiver"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="com.nepu.dongyoutong.REMIND" />
+            </intent-filter>
+        </receiver>
+
+        <!-- ===== 提醒：重启后重排 =====
+             🔴 必须 exported="true"：开机广播是系统发的，收不到就等于
+                重启一次手机之后所有提醒静默消失。
+             代价是别人也能发这条广播 —— 所以 BootReceiver 只认 action、
+                不读任何 extra，最坏结果是白排一遍闹钟（无害）。
+             MY_PACKAGE_REPLACED 顺带收着：覆盖安装之后系统也会清掉闹钟，
+             一起重排。 -->
+        <receiver
+            android:name=".BootReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+            </intent-filter>
+        </receiver>
+
+        <!-- ===== 后台自动检查：到点干活的那一段（0.50.0 v5）=====
+             🔴 `android:permission="android.permission.BIND_JOB_SERVICE"` 是这个
+                组件**唯一正确的写法**：少了它，系统在 onStartJob 时直接抛
+                SecurityException，表现是「任务排上了但从来不跑」。
+             exported="false"：只有系统（JobScheduler）能唤起它。 -->
+        <service
+            android:name=".AutoJob"
+            android:exported="false"
+            android:permission="android.permission.BIND_JOB_SERVICE" />
+
+        <!-- ===== 桌面小组件 =====
+             meta-data 指向 res/xml/hyt_widget_info.xml（尺寸、刷新周期、初始布局）。
+             🔴 资源名写错不会有任何提示：桌面上加小组件时那一项直接不出现，
+                或者加上了是一片空白。改完记得真机加一次看看。 -->
+        <receiver
+            android:name=".WidgetProvider"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+            </intent-filter>
+            <meta-data
+                android:name="android.appwidget.provider"
+                android:resource="@xml/hyt_widget_info" />
+        </receiver>
+
+        <!-- ===== 另外三个尺寸（0.52.0 v12）=====
+             🔴 一个类只能挂一个 receiver，所以每个尺寸都得有自己的类。
+                那三个类都是空的，画法在 WidgetProvider 里按类分派
+                （kindOf），改画法不用改这里。
+             🔴 四个 receiver 的 meta-data 指向**四个不同的 xml**：
+                指同一个的话，四个尺寸会全变成同一个大小（系统读的是
+                provider 的元数据，不是 receiver 的名字）。 -->
+        <receiver
+            android:name=".WidgetSmall"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+            </intent-filter>
+            <meta-data
+                android:name="android.appwidget.provider"
+                android:resource="@xml/hyt_widget_info_small" />
+        </receiver>
+
+        <receiver
+            android:name=".WidgetStrip"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+            </intent-filter>
+            <meta-data
+                android:name="android.appwidget.provider"
+                android:resource="@xml/hyt_widget_info_strip" />
+        </receiver>
+
+        <receiver
+            android:name=".WidgetLarge"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+            </intent-filter>
+            <meta-data
+                android:name="android.appwidget.provider"
+                android:resource="@xml/hyt_widget_info_large" />
+        </receiver>
+    </application>
+</manifest>

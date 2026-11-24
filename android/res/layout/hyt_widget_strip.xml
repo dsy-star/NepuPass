@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 4×1 横条小组件（0.52.0 v12 加）。
+
+     40dp 高，只有一行。放不了三列课表，也放不了进度条：
+     上下留白 12 + 一行字 14 = 26，剩下的给别的一律超出去被裁掉。
+     所以这一份就一句话把三件事说完：今天几号星期几、几节课、下一节是什么。
+
+     能用什么控件、不能用什么，与 hyt_widget.xml 文件头那一段完全一样：
+     只许 LinearLayout / TextView 这一层，不许裸 <View>。
+
+     🔴 静态文字**故意写成示例数据**：系统拿这份布局当「添加前的预览」。
+        写空白的话，用户在小组件选择器里看到的是一块白板。 -->
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/hwRoot"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="@drawable/hw_bg"
+    android:gravity="center_vertical"
+    android:orientation="horizontal"
+    android:paddingLeft="14dp"
+    android:paddingRight="14dp">
+
+    <TextView
+        android:id="@+id/hwTitle"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:ellipsize="end"
+        android:maxLines="1"
+        android:text="今天 · 周六　3 节　16:30 形势与政策"
+        android:textColor="#14203A"
+        android:textSize="12sp" />
+</LinearLayout>

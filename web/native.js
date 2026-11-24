@@ -1,0 +1,8173 @@
+/* 航院通 · APK 内置数据层
+   ------------------------------------------------------------------
+   网页版靠电脑上的 bridge.py 代登录（手机浏览器不许跨域、不许混合内容）。
+   APK 里没有电脑，所以这套逻辑跟着 App 一起装进手机：
+
+     Java 侧  Android.req(...)      只负责「发 HTTP + 带 cookie」这一件事
+     本文件   登录 / 抓页面 / 解析    全部在这里，纯 JS，逻辑和 eams.py 一一对应
+
+   为什么不让 Java 也解析 HTML：WebView 里有 DOMParser，表格按表头名字取列
+   比正则稳得多，而且解析逻辑只维护一份（eams.py 是参照基准，两边有对照测试）。
+
+   🔴 对外暴露的 `NativeApi.handle(path, body)` 必须和 bridge.py 的 /api 契约
+     完全一致，否则 app.js 里那句 `api()` 就得写两套分支。
+     契约见 bridge.py 的 do_GET / do_POST。
+   ------------------------------------------------------------------ */
+(function () {
+  'use strict';
+
+  // 网页版没有 Android 桥，直接不加载（同一个 app.js 两边共用）
+  if (!window.Android || typeof window.Android.req !== 'function') return;
+
+  var BASE = 'http://jwglxt.zua.edu.cn';
+  var UA = 'Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 ' +
+           '(KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36';
+
+  // 两次请求之间的最小间隔（毫秒）。别把学校服务器打疼 ——
+  // 和 eams.py 的 POLITE_DELAY 保持一致，别单方面调小。
+  var POLITE_MS = 1200;
+  var lastReq = 0;
+
+  // ------------------------------------------------------------------ 工具
+
+  function sleep(ms) {
+    return new Promise(function (r) { setTimeout(r, ms); });
+  }
+
+  function utf8Bytes(str) {
+    var out = [];
+    for (var i = 0; i < str.length; i++) {
+      var c = str.charCodeAt(i);
+      if (c < 0x80) {
+        out.push(c);
+      } else if (c < 0x800) {
+        out.push(0xc0 | (c >> 6), 0x80 | (c & 63));
+      } else if (c >= 0xd800 && c <= 0xdbff && i + 1 < str.length) {
+        var c2 = str.charCodeAt(++i);
+        var cp = 0x10000 + ((c - 0xd800) << 10) + (c2 - 0xdc00);
+        out.push(0xf0 | (cp >> 18), 0x80 | ((cp >> 12) & 63),
+                 0x80 | ((cp >> 6) & 63), 0x80 | (cp & 63));
+      } else {
+        out.push(0xe0 | (c >> 12), 0x80 | ((c >> 6) & 63), 0x80 | (c & 63));
+      }
+    }
+    return out;
+  }
+
+  /** SHA-1，输出小写十六进制。
+   *
+   *  为什么自己写：教务系统把密码算成 SHA1('<salt>-' + 明文)，而 WebView 里
+   *  crypto.subtle 只对「安全上下文」开放，还不支持同步调用 —— 登录流程是
+   *  一串同步判断，用异步 digest 会把代码拧成一团。这 40 行是标准实现，
+   *  有单测对照 Python 的 hashlib 结果。
+   */
+  function sha1hex(str) {
+    var bytes = utf8Bytes(str);
+    var ml = bytes.length * 8;
+    bytes.push(0x80);
+    while (bytes.length % 64 !== 56) bytes.push(0);
+    // 长度按 64 位大端追加（JS 里用两个 32 位拼）
+    var hi = Math.floor(ml / 0x100000000);
+    var lo = ml >>> 0;
+    bytes.push((hi >>> 24) & 255, (hi >>> 16) & 255, (hi >>> 8) & 255, hi & 255);
+    bytes.push((lo >>> 24) & 255, (lo >>> 16) & 255, (lo >>> 8) & 255, lo & 255);
+
+    var h0 = 0x67452301, h1 = 0xEFCDAB89, h2 = 0x98BADCFE, h3 = 0x10325476, h4 = 0xC3D2E1F0;
+    var w = new Array(80);
+    var i, j, a, b, c, d, e, f, k, t;
+
+    for (i = 0; i < bytes.length; i += 64) {
+      for (j = 0; j < 16; j++) {
+        w[j] = (bytes[i + j * 4] << 24) | (bytes[i + j * 4 + 1] << 16) |
+               (bytes[i + j * 4 + 2] << 8) | bytes[i + j * 4 + 3];
+      }
+      for (j = 16; j < 80; j++) {
+        t = w[j - 3] ^ w[j - 8] ^ w[j - 14] ^ w[j - 16];
+        w[j] = (t << 1) | (t >>> 31);
+      }
+      a = h0; b = h1; c = h2; d = h3; e = h4;
+      for (j = 0; j < 80; j++) {
+        if (j < 20) { f = (b & c) | ((~b) & d); k = 0x5A827999; }
+        else if (j < 40) { f = b ^ c ^ d; k = 0x6ED9EBA1; }
+        else if (j < 60) { f = (b & c) | (b & d) | (c & d); k = 0x8F1BBCDC; }
+        else { f = b ^ c ^ d; k = 0xCA62C1D6; }
+        t = (((a << 5) | (a >>> 27)) + f + e + k + w[j]) | 0;
+        e = d; d = c; c = (b << 30) | (b >>> 2); b = a; a = t;
+      }
+      h0 = (h0 + a) | 0; h1 = (h1 + b) | 0; h2 = (h2 + c) | 0;
+      h3 = (h3 + d) | 0; h4 = (h4 + e) | 0;
+    }
+
+    function hex(x) {
+      // >>> 0 之后再补 8 位，否则负数会输出成 "-1f..."
+      return ('00000000' + (x >>> 0).toString(16)).slice(-8);
+    }
+    return hex(h0) + hex(h1) + hex(h2) + hex(h3) + hex(h4);
+  }
+
+  // ------------------------------------------------------------------ HTTP
+
+  var seq = 0;
+  var waiting = {};
+
+  /** Java 侧网络请求完成后回调进来（见 MainActivity 的 __nativeDone）。 */
+  window.__nativeDone = function (id, json) {
+    var p = waiting[id];
+    if (!p) return;
+    delete waiting[id];
+    try {
+      p.resolve(JSON.parse(json));
+    } catch (e) {
+      p.reject(new Error('App 内部通信出错了，请重试'));
+    }
+  };
+
+  /** 完美校园登录完成后回调进来（见 NativeBridge.wxLogin）。
+   *
+   *  单独一条通道，不挤 __nativeDone：那条是「一次 HTTP 请求」的回执，
+   *  而登录在 Java 侧要跑三次往返 + 两套加解密，两边的 id 空间分开更省心。
+   */
+  var wxSeq = 0;
+  var wxWaiting = {};
+  window.__wxDone = function (id, json) {
+    var p = wxWaiting[id];
+    if (!p) return;
+    delete wxWaiting[id];
+    try {
+      p.resolve(JSON.parse(json));
+    } catch (e) {
+      p.reject(new Error('App 内部通信出错了，请重试'));
+    }
+  };
+
+  /** 走一条完美校园的异步通道：Java 侧做完，回来调 `__wxDone(id, json)`。
+   *
+   *  三条路（密码登录 / 发验证码 / 验证码登录）形状一样，写法也只有一处 ——
+   *  三份复制的话，改一处必漏两处。
+   */
+  function wxDo(fn, args) {
+    return new Promise(function (resolve, reject) {
+      if (!(window.Android && typeof window.Android[fn] === 'function')) {
+        reject(new Error('这个版本还不支持，更新后再试'));
+        return;
+      }
+      var id = ++wxSeq;
+      wxWaiting[id] = { resolve: resolve, reject: reject };
+      try {
+        window.Android[fn].apply(window.Android, [id].concat(args));
+      } catch (e) {
+        delete wxWaiting[id];
+        reject(e);
+      }
+    });
+  }
+
+  /** 发一个请求。method: 'GET'|'POST'；path 以 / 开头；body 是已编码的表单串。
+   *
+   *  🔴 必须走异步：Android.req 是阻塞的，直接在 JS 线程上同步调用会把
+   *     整个界面冻住 —— 登录加同步要十来秒，转圈动画都不动，看着就是死机。
+   *
+   *  gapMs：两次请求之间至少隔多久。默认 POLITE_MS（1.2 秒），那是为了
+   *     别把**同一个**教务系统打疼。校园公告是 6 个不同域名的公开静态页，
+   *     一次抓 6 个还各等 1.2 秒就是七秒多的白等，所以那边传小值。
+   *
+   *  headers：可选的请求头（`{k:v}`）。只有取登录页那处在用 ——
+   *     给它带 `no-cache`，免得手机和中间代理把上一张登录页端回来：
+   *     那张页面里的盐值是**上一次会话**的，拿去提交必然「密码不对」，
+   *     而用户会以为自己记错了密码。老壳没有 req2 时自动退回 req，
+   *     少了这个头也照常能用。
+   */
+  function http(method, path, body, referer, gapMs, headers) {
+    return new Promise(function (resolve, reject) {
+      var polite = gapMs == null ? POLITE_MS : gapMs;
+      var gap = Date.now() - lastReq;
+      var wait = gap < polite ? polite - gap : 0;
+      setTimeout(function () {
+        var id = ++seq;
+        waiting[id] = { resolve: resolve, reject: reject };
+        try {
+          var hj = '';
+          if (headers) { try { hj = JSON.stringify(headers); } catch (e0) { hj = ''; } }
+          if (hj && typeof Android.req2 === 'function') {
+            Android.req2(id, method, path, body || '', referer || '', hj);
+          } else {
+            Android.req(id, method, path, body || '', referer || '');
+          }
+        } catch (e) {
+          delete waiting[id];
+          reject(new Error('原生请求失败：' + e));
+        }
+        lastReq = Date.now();
+      }, wait);
+    });
+  }
+
+  function form(obj) {
+    return Object.keys(obj).map(function (k) {
+      return encodeURIComponent(k) + '=' + encodeURIComponent(obj[k] == null ? '' : obj[k]);
+    }).join('&');
+  }
+
+  // ------------------------------------------------------------------ HTML 表格
+
+  /** 单元格文字。`<br>` 要变成换行 —— 教务系统拿它分隔多行内容
+   *  （比如一个格子里排两个上课时间），拍平成一串就分不开了。 */
+  function cellText(td) {
+    var c = td.cloneNode(true);
+    var brs = c.querySelectorAll('br');
+    for (var i = 0; i < brs.length; i++) {
+      brs[i].parentNode.replaceChild(document.createTextNode('\n'), brs[i]);
+    }
+    return (c.textContent || '').replace(/[ \t\r\f\v\u00a0]+/g, ' ').trim();
+  }
+
+  /** 页面里所有表格 → [ [ [cell, ...], ... ], ... ]，等价于 eams.parse_tables。
+   *  table.rows 不含嵌套表格的行，正好和 Python 那份 HTMLParser 的行为一致。 */
+  function tablesOf(html) {
+    var doc = new DOMParser().parseFromString(html, 'text/html');
+    var ts = doc.querySelectorAll('table');
+    var out = [];
+    for (var i = 0; i < ts.length; i++) {
+      var rows = [];
+      var rs = ts[i].rows;
+      for (var r = 0; r < rs.length; r++) {
+        var cells = [];
+        for (var c = 0; c < rs[r].cells.length; c++) cells.push(cellText(rs[r].cells[c]));
+        rows.push(cells);
+      }
+      out.push(rows);
+    }
+    return out;
+  }
+
+  // ------------------------------------------------------------------ 课表解析
+
+  function splitJsArgs(src) {
+    var out = [], cur = '', quote = null;
+    for (var i = 0; i < src.length; i++) {
+      var c = src[i];
+      if (quote) {
+        if (c === '\\') { cur += src.substr(i, 2); i++; continue; }
+        if (c === quote) quote = null;
+        cur += c;
+      } else if (c === '"' || c === "'") {
+        quote = c; cur += c;
+      } else if (c === ',') {
+        out.push(cur.trim()); cur = '';
+      } else {
+        cur += c;
+      }
+    }
+    if (cur) out.push(cur.trim());
+    return out;
+  }
+
+  function unquote(tok) {
+    tok = (tok || '').trim();
+    if (tok.length >= 2 && tok[0] === tok[tok.length - 1] && (tok[0] === '"' || tok[0] === "'")) {
+      return tok.slice(1, -1);
+    }
+    return tok;
+  }
+
+  /** 算 `index = 2*unitCount+6;` 这种式子。
+   *
+   *  不用 eval：页面内容来自学校服务器，哪怕只是算术式，也没必要给一条
+   *  执行代码的路。这里手写一个只认 数字 + - * ( ) 的递归下降求值器。
+   *  字符集不合法（比如 `units*i+j` 这种模板残留）一律返回 null —— 和
+   *  eams._eval_index 的判据一致。
+   */
+  function evalIndex(expr, unit) {
+    var src = String(expr).replace(/unitCount/g, String(unit)).replace(/\s+/g, '');
+    if (!/^[0-9*+\-()]+$/.test(src)) return null;
+    var i = 0;
+    function peek() { return src[i]; }
+    function number() {
+      var st = i;
+      while (i < src.length && src[i] >= '0' && src[i] <= '9') i++;
+      return i > st ? parseInt(src.slice(st, i), 10) : NaN;
+    }
+    function factor() {
+      // 一元负号：教务系统偶尔给 `index = -1;` 这种（表示「没排进格子」），
+      // 解析成 -1 交给调用方过滤，别在这里就丢掉 —— 和 eams._eval_index 保持一致。
+      if (peek() === '-') { i++; return -factor(); }
+      if (peek() === '+') { i++; return factor(); }
+      if (peek() === '(') { i++; var v = exprSum(); if (peek() === ')') i++; return v; }
+      return number();
+    }
+    function term() {
+      var v = factor();
+      while (peek() === '*') { i++; v *= factor(); }
+      return v;
+    }
+    function exprSum() {
+      var v = term();
+      while (peek() === '+' || peek() === '-') {
+        var op = src[i]; i++;
+        var r = term();
+        v = op === '+' ? v + r : v - r;
+      }
+      return v;
+    }
+    var val = exprSum();
+    if (i !== src.length || !isFinite(val)) return null;
+    return Math.trunc(val);
+  }
+
+  function parseTimetable(html) {
+    var m = /unitCount\s*=\s*(\d+)/.exec(html);
+    var unitCount = m ? parseInt(m[1], 10) : 10;
+
+    // 🔴 学期周次范围来自 `table0.marshalTable(2, 1, 24)`，不是「最后一门课的周次」。
+    //    郑航实测最后一门只排到第 18 周，而学期有 24 周 —— 取后者会让周次
+    //    选择器翻不到第 19 周以后，后半个学期的课直接看不见。
+    var weekStart = 1, weekEnd = 0;
+    var mw = /marshalTable\s*\(\s*\d+\s*,\s*(\d+)\s*,\s*(\d+)\s*\)/.exec(html);
+    if (mw) { weekStart = parseInt(mw[1], 10); weekEnd = parseInt(mw[2], 10); }
+
+    var events = [], actSpans = [], mm;
+    var actRe = /new\s+TaskActivity\(([\s\S]*?)\)\s*;/g;
+    while ((mm = actRe.exec(html)) !== null) {
+      events.push({ pos: mm.index, kind: 'act', payload: mm[1] });
+      actSpans.push({ start: mm.index, end: mm.index + mm[0].length });
+    }
+    var idxRe = /index\s*=\s*([^;]+);/g;
+    while ((mm = idxRe.exec(html)) !== null) {
+      events.push({ pos: mm.index, kind: 'idx', payload: mm[1] });
+    }
+    events.sort(function (a, b) {
+      return (a.pos - b.pos) || (a.kind < b.kind ? -1 : a.kind > b.kind ? 1 : 0);
+    });
+
+    // 教师名不是字面量，而是 actTeacherName.join(',')。每个活动前面紧挨着一段
+    // `var actTeachers = [{id:..,name:"徐璐",lab:false}];`。
+    // 只能按「上一个活动结束 → 本活动开始」切片去找，全局搜会张冠李戴。
+    var teacherOf = {};
+    var prevEnd = 0;
+    actSpans.forEach(function (sp) {
+      var chunk = html.slice(prevEnd, sp.start);
+      var last = null, m2;
+      var tRe = /actTeachers\s*=\s*\[([\s\S]*?)\]\s*;/g;
+      while ((m2 = tRe.exec(chunk)) !== null) last = m2[1];
+      if (last != null) {
+        var names = [], nRe = /name:\s*"([^"]*)"/g, nm;
+        while ((nm = nRe.exec(last)) !== null) names.push(nm[1]);
+        // 去重但保序（dict.fromkeys 的等价写法）
+        var seen = {}, uniq = [];
+        names.forEach(function (n) {
+          if (n && !seen[n]) { seen[n] = 1; uniq.push(n); }
+        });
+        teacherOf[sp.start] = uniq.join(',');
+      }
+      prevEnd = sp.end;
+    });
+
+    var raw = [], cur = null;
+    events.forEach(function (ev) {
+      if (ev.kind === 'act') {
+        var args = splitJsArgs(ev.payload);
+        if (args.length < 7) { cur = null; return; }
+        var bits = unquote(args[6]);
+        // 🔴 位图下标**就是周次本身**（第 0 位恒为 0）。按 i+1 算会整体偏一周。
+        var weeks = [];
+        for (var i = 0; i < bits.length; i++) if (bits[i] === '1' && i >= 1) weeks.push(i);
+        var full = unquote(args[3]);
+        var nm2 = /^(.*?)\s*\(([^()]*)\)\s*$/.exec(full);
+        cur = {
+          name: (nm2 ? nm2[1] : full).trim(),
+          code: (nm2 ? nm2[2] : '').trim(),
+          teacher: teacherOf[ev.pos] != null ? teacherOf[ev.pos] : unquote(args[1]),
+          room: unquote(args[5]),
+          weeks: weeks,
+          slots: [],
+        };
+        raw.push(cur);
+        return;
+      }
+      if (!cur) return;
+      var idx = evalIndex(ev.payload, unitCount);
+      if (idx == null || idx < 0) return;
+      var day = Math.floor(idx / unitCount), period = idx % unitCount;
+      if (day >= 0 && day < 7 && period >= 0 && period < unitCount) {
+        var dup = cur.slots.some(function (s) { return s.day === day && s.period === period; });
+        if (!dup) cur.slots.push({ day: day, period: period });
+      }
+    });
+
+    // 「停课」是调课记录，不是真上课，别画到格子里
+    raw.forEach(function (c) { if (c.room === '停课') c.slots = []; });
+
+    // 同一门课（同名/同教师/同教室/同周次）合并
+    var merged = {}, order = [];
+    raw.forEach(function (c) {
+      if (!c.slots.length) return;
+      var key = [c.name, c.code, c.teacher, c.room, c.weeks.join(',')].join('\u0001');
+      if (merged[key]) {
+        c.slots.forEach(function (s) {
+          var dup = merged[key].slots.some(function (x) { return x.day === s.day && x.period === s.period; });
+          if (!dup) merged[key].slots.push(s);
+        });
+      } else {
+        merged[key] = c;
+        order.push(key);
+      }
+    });
+
+    var courses = order.map(function (k) { return merged[k]; });
+    courses.sort(function (a, b) {
+      return (a.slots[0].day - b.slots[0].day) || (a.slots[0].period - b.slots[0].period);
+    });
+
+    var maxWeek = 0;
+    courses.forEach(function (c) {
+      if (c.weeks.length) maxWeek = Math.max(maxWeek, Math.max.apply(null, c.weeks));
+    });
+    var totalWeeks = Math.max(weekEnd, maxWeek);
+
+    // 学期名从课程序号里推：26271.MK00001A.001 → 2026-2027 学年第 1 学期
+    var semester = '';
+    for (var ci = 0; ci < courses.length; ci++) {
+      var sm = /^(\d{2})(\d{2})(\d)\./.exec(courses[ci].code);
+      if (sm) {
+        semester = '20' + sm[1] + '-20' + sm[2] + ' 学年第 ' + sm[3] + ' 学期';
+        break;
+      }
+    }
+
+    return {
+      unitCount: unitCount,
+      courses: courses,
+      totalWeeks: totalWeeks,
+      weekStart: weekStart,
+      semester: semester,
+    };
+  }
+
+  // ------------------------------------------------------------------ 成绩 / 学籍 / 考试
+
+  function parseGrades(html) {
+    var tables = tablesOf(html);
+    var summary = [], detail = [];
+    tables.forEach(function (rows) {
+      rows.forEach(function (r) {
+        if (r.length === 5 && /^\d{4}-\d{4}$/.test(r[0] || '')) {
+          summary.push({ year: r[0], term: r[1], count: r[2], credits: r[3], gpa: r[4] });
+        } else if (r.length >= 10 && /^\d{4}-\d{4}/.test(r[0] || '')) {
+          detail.push({
+            term: r[0], code: r[1], seq: r[2], name: r[3], category: r[4],
+            nature: r[5], credit: r[6], score: r[7], final: r[8], gpa: r[9],
+          });
+        }
+      });
+    });
+    var overall = null;
+    tables.forEach(function (rows) {
+      rows.forEach(function (r) {
+        if ((r[0] || '').indexOf('在校') >= 0 && r.length === 4) {
+          overall = { count: r[1], credits: r[2], gpa: r[3] };
+        } else if ((r[0] || '').indexOf('在校') >= 0 && r.length === 5) {
+          overall = { count: r[2], credits: r[3], gpa: r[4] };
+        }
+      });
+    });
+    return { summary: summary, overall: overall, courses: detail };
+  }
+
+  var PROFILE_KEYS = {
+    '学号': 'studentId', '姓名': 'name', '性别': 'gender', '年级': 'grade',
+    '院系': 'dept', '专业': 'major', '方向': 'direction', '所属班级': 'className',
+    '所属校区': 'campus', '学籍状态': 'status', '学历层次': 'level',
+    '学制': 'duration', '入校时间': 'enrolledAt', '毕业时间': 'graduateAt',
+  };
+
+  function parseProfile(html) {
+    // 表格是「一行塞两对」的布局：['学号：','2507…','姓名：','王…','']
+    // ⇒ 必须按 2 步长走，只看 [0]/[1] 会漏掉一半字段。
+    var out = {};
+    tablesOf(html).forEach(function (rows) {
+      rows.forEach(function (r) {
+        for (var i = 0; i < r.length - 1; i += 2) {
+          var key = (r[i] || '').trim().replace(/[：:]$/, '');
+          var val = (r[i + 1] || '').trim();
+          if (PROFILE_KEYS[key] && val && val !== '*' && !out[PROFILE_KEYS[key]]) {
+            out[PROFILE_KEYS[key]] = val;
+          }
+        }
+      });
+    });
+    return out;
+  }
+
+  var EXAM_COLS = {
+    '课程序号': 'code', '课程名称': 'name', '考试类别': 'category', '考试形式': 'form',
+    '考试周次与星期': 'weekText', '考试日期': 'date', '考试安排': 'arrange',
+    '考试地点': 'room', '考场座位号': 'seat', '考试情况': 'status', '其它说明': 'note',
+  };
+
+  function parseExams(html) {
+    var tables = tablesOf(html);
+    for (var t = 0; t < tables.length; t++) {
+      var rows = tables[t];
+      if (!rows.length) continue;
+      var head = rows[0].map(function (c) { return (c || '').trim(); });
+      if (head.indexOf('考试日期') < 0 && head.indexOf('考试地点') < 0) continue;
+
+      // 按表头名字定位列，不按下标 —— 列顺序变了也不会错位
+      var idx = {};
+      head.forEach(function (name, i) {
+        var k = EXAM_COLS[name];
+        if (k && idx[k] == null) idx[k] = i;
+      });
+
+      var out = [];
+      for (var r = 1; r < rows.length; r++) {
+        var row = rows[r];
+        var any = row.some(function (c) { return (c || '').trim(); });
+        if (!any) continue;
+        var rec = {};
+        Object.keys(idx).forEach(function (k) {
+          var i = idx[k];
+          rec[k] = i < row.length ? (row[i] || '').trim() : '';
+        });
+        // 课程名都没有的行是空壳（学校空表里就是这种），丢掉
+        if (!rec.name) continue;
+        out.push(rec);
+      }
+      return { exams: out, published: out.length > 0 };
+    }
+    return { exams: [], published: false };
+  }
+
+  function parseExamPage(html) {
+    var sid = '';
+    var m = /stdExamTable!examTable\.action\?[^"']*semester\.id=(\d+)/.exec(html);
+    if (m) sid = m[1];
+
+    var batches = [];
+    var doc = new DOMParser().parseFromString(html, 'text/html');
+    var sel = doc.querySelector('select[name="examBatch.id"]');
+    if (sel) {
+      var opts = sel.querySelectorAll('option');
+      for (var i = 0; i < opts.length; i++) {
+        batches.push({ id: (opts[i].getAttribute('value') || '').trim(),
+                       name: (opts[i].textContent || '').trim() });
+      }
+    }
+    return { semesterId: sid, batches: batches };
+  }
+
+  /** 学期下拉：`<option value="297">2026-2027学年1学期</option>`。
+   *  只留纯数字 value（学期 id），空 value 的「请选择」占位项丢掉 ——
+   *  否则界面上会多一个点不动的空按钮。 */
+  function parseSemesterList(html) {
+    var out = [], seen = {};
+    var re = /<option[^>]*value="(\d+)"[^>]*>([^<]*)<\/option>/g, m;
+    while ((m = re.exec(html)) !== null) {
+      var sid = m[1], name = (m[2] || '').trim();
+      if (!name || seen[sid]) continue;
+      seen[sid] = 1;
+      out.push({ id: sid, name: name });
+    }
+    return out;
+  }
+
+  // ------------------------------------------------------------------ 客户端
+
+  /** 空闲教室结果表：`table.gridtable` 的 tbody，6 列。
+   *  序号 / 名称 / 教学楼 / 校区 / 教室设备配置 / 容量
+   *
+   *  🔴 第一行经常是 **`停课`**（没有教学楼、容量 0）—— 那是学校塞的状态行，
+   *     不是教室。不能画成教室，也不能一声不吭删掉：单独放进 notice，
+   *     界面在「没查到教室」时可以说清楚这是学校给的标记。 */
+  function parseFreeRooms(html) {
+    var doc = new DOMParser().parseFromString(html, 'text/html');
+    var body = doc.querySelector('table.gridtable tbody') || doc.querySelector('tbody');
+    if (!body) return { rooms: [], notice: [], raw: 0 };
+    var trs = body.querySelectorAll('tr');
+    var rooms = [], notice = [], raw = 0;
+    for (var i = 0; i < trs.length; i++) {
+      var tds = trs[i].querySelectorAll('td');
+      if (tds.length < 6) continue;
+      raw++;
+      var name = (tds[1].textContent || '').trim().replace(/\s+/g, ' ');
+      var building = (tds[2].textContent || '').trim().replace(/\s+/g, ' ');
+      var campus = (tds[3].textContent || '').trim().replace(/\s+/g, ' ');
+      var kind = (tds[4].textContent || '').trim().replace(/\s+/g, ' ');
+      var cap = (tds[5].textContent || '').trim();
+      if (!name) continue;
+      if (name === '停课' || (!building && !kind && (cap === '' || cap === '0'))) {
+        if (notice.indexOf(name) < 0) notice.push(name);
+        continue;
+      }
+      var n = parseInt(cap, 10);
+      // 🔴 字段名必须和 Python 版（eams.parse_free_rooms）一模一样：
+      //    这里以前叫 kind，界面读的是 type —— 网页版有类型、APK 里是空的，
+      //    而且不报错，只是「教室类型」那一栏悄悄不显示。
+      rooms.push({ name: name, building: building, campus: campus, type: kind,
+                   capacity: isNaN(n) ? 0 : n });
+    }
+    return { rooms: rooms, notice: notice, raw: raw };
+  }
+
+  /** 空闲教室查询表单里的三个下拉：教室类型 / 校区 / 教学楼。 */
+  function parseRoomOptions(html) {
+    var doc = new DOMParser().parseFromString(html, 'text/html');
+    function opts(name) {
+      var sel = doc.querySelector('select[name="' + name + '"]');
+      if (!sel) return [];
+      var out = [], seen = {};
+      var os = sel.querySelectorAll('option');
+      for (var i = 0; i < os.length; i++) {
+        var id = (os[i].getAttribute('value') || '').trim();
+        var nm = (os[i].textContent || '').trim();
+        if (!id || !nm || seen[id]) continue;
+        seen[id] = 1;
+        out.push({ id: id, name: nm });
+      }
+      return out;
+    }
+    return {
+      types: opts('classroom.type.id'),
+      campuses: opts('classroom.campus.id'),
+      buildings: opts('classroom.building.id'),
+    };
+  }
+
+  // ------------------------------------------------------------------ 培养计划
+
+  function numOf(s) {
+    var v = parseFloat(String(s == null ? '' : s).replace(/[^\d.]/g, ''));
+    return isNaN(v) ? 0 : v;
+  }
+
+  /** 培养计划（/eams/myPlan.action）。
+   *
+   *  表一是课程清单，表二是「替代课程」对照。
+   *
+   *  🔴 列数**不固定**，这是这个解析器唯一难的地方：
+   *     大多数行是 15 列，但「个性化课程」下面还有一层子分类（专业选修课），
+   *     那种行是 16 列 —— 前面多一格，后面全错位一格。
+   *     按固定下标取的话，会把学分读成课程名、把学期标记读成必修，
+   *     **而且一个字都不会报错**。
+   *     ⇒ 一律从右往左取：末三列固定是「是否必修 / 开课学院 / 备注」，
+   *       再往左 8 列是「建议修读学期」的 1~8 打勾，再往左才是 学分 / 名称 / 代码。
+   *
+   *  还有一类行要跳过：
+   *     `[分类, '学分小计', 学分, 8个学期值, ...]`  14 列
+   *     `['全程总计', 学分, 8个学期值, ...]`        13 列
+   *     这两类不是课程，但同样是表格里的 <tr>。
+   */
+  function parsePlan(html) {
+    var out = {
+      total: 0,          // 全程总计（164）
+      cats: [],          // [{name, credit}]  各类小计 + 「应修学分」那类
+      courses: [],       // 计划里的每一门课
+      subs: [],          // [{from:{code,name,credit}, to:{...}}] 替代课程
+      specials: [],      // [{cat,name,credit,note}] 美育/四史这类子要求
+      found: false,
+    };
+    var tables = tablesOf(html);
+    var gotHeader = false;
+
+    for (var ti = 0; ti < tables.length; ti++) {
+      var rows = tables[ti];
+      for (var ri = 0; ri < rows.length; ri++) {
+        var c = rows[ri];
+        if (!c || !c.length) continue;
+
+        // 表头：分类 / 课程代码 / 课程名称 / 学分 …
+        if (!gotHeader && c[0] === '分类' && c[1] === '课程代码') {
+          gotHeader = true;
+          continue;
+        }
+        // 表头下面那行「1 2 3 4 5 6 7 8」是学期序号，不是课程
+        if (c[0] === '1' && c[1] === '2' && c[7] === '8') continue;
+
+        // 全程总计
+        if (c[0] === '全程总计') {
+          out.total = numOf(c[1]);
+          out.found = true;
+          continue;
+        }
+        // 各类小计
+        if (c[1] === '学分小计') {
+          var cname = (c[0] || '').trim();
+          if (cname) out.cats.push({ name: cname, credit: numOf(c[2]) });
+          continue;
+        }
+        // 「应修学分」这一行**出现在不同深度**，不能按第几列找：
+        //   [通识选修课, 应修学分, 4, …]                              ← 顶层分类的额度
+        //   [个性化课程, 专业选修课, 应修学分, 4, …]                   ← 子分类
+        //   [个性化课程, 特色选修课, 航空智能信息处理方向, 应修学分, …]  ← 再深一层
+        // 顶层那条**是分类学分的来源之一**：郑航的通识选修课只给额度、不列课，
+        // 所以它没有「学分小计」行。少了它，各类加起来是 160 而总计写 164，
+        // 界面上看起来像算漏了。子分类那几条只是细分，父分类已经含了，不重复加。
+        var iEq = c.indexOf('应修学分');
+        if (iEq > 0) {
+          var path = c.slice(0, iEq).join(' / ').trim();
+          var eq = numOf(c[iEq + 1]);
+          if (iEq === 1) out.cats.push({ name: path, credit: eq });
+          else out.specials.push({ cat: path, name: '应修学分', credit: eq, note: '' });
+          continue;
+        }
+        // 「美育专项 2」「四史专项 1」这类：**某个分类下面的子要求**，
+        // 学分已经算在父分类的小计里了，再加一遍就重复。
+        // 但也不能扔 —— 单独存着，将来可以提示「这个专项还差几分」。
+        if (c.length === 14 && c[1] && !/^\d/.test(c[1]) && /^[\d.]+$/.test((c[2] || '').trim())) {
+          out.specials.push({
+            cat: (c[0] || '').trim(),
+            name: c[1],
+            credit: numOf(c[2]),
+            note: (c[c.length - 1] || '').trim(),
+          });
+          continue;
+        }
+
+        // 替代课程表：序号 / 原课程 / 替代课程
+        if (c.length === 3 && /^\d+$/.test((c[0] || '').trim())) {
+          var a = splitCourseCell(c[1]), b = splitCourseCell(c[2]);
+          if (a && b) out.subs.push({ from: a, to: b });
+          continue;
+        }
+
+        // 课程行：至少要有 学分+8个学期+必修+学院+备注 = 12 列，再往左才是代码和名称
+        if (c.length < 14) continue;
+        var n = c.length;
+        var code = (c[n - 14] || '').trim();
+        if (!/^[0-9A-Za-z]+$/.test(code)) continue;   // 认不出代码就当不是课程行
+
+        var name = (c[n - 13] || '').replace(/^\s*\d+\s+/, '').trim();
+        if (!name) continue;
+
+        var terms = [];
+        for (var k = 0; k < 8; k++) {
+          if ((c[n - 11 + k] || '').indexOf('√') >= 0) terms.push(k + 1);
+        }
+        out.courses.push({
+          code: code,
+          name: name,
+          credit: numOf(c[n - 12]),
+          cat: c.slice(0, n - 14).join(' / ').trim(),
+          terms: terms,
+          required: (c[n - 3] || '').indexOf('是') >= 0,
+          dept: (c[n - 2] || '').trim(),
+          note: (c[n - 1] || '').trim(),
+        });
+        out.found = true;
+      }
+    }
+    return out;
+  }
+
+  /** 「KB008B 线性代数 (2.5)」→ {code, name, credit}。认不出返回 null。 */
+  function splitCourseCell(s) {
+    var m = /^(\S+)\s+(.+?)\s*[（(]\s*([\d.]+)\s*[)）]\s*$/.exec(String(s || '').trim());
+    if (!m) return null;
+    return { code: m[1], name: m[2].trim(), credit: numOf(m[3]) };
+  }
+
+  // ------------------------------------------------------------------ 该办的事
+
+  /** 页面正文（去脚本、去样式、压空白）。 */
+  function plainText(html) {
+    var doc = new DOMParser().parseFromString(html, 'text/html');
+    var junk = doc.querySelectorAll('script, style');
+    for (var i = 0; i < junk.length; i++) {
+      if (junk[i].parentNode) junk[i].parentNode.removeChild(junk[i]);
+    }
+    var t = doc.body ? doc.body.textContent : '';
+    return String(t).replace(/[\s\u00a0]+/g, ' ').trim();
+  }
+
+  /** 某个 <select> 里的选项（去掉空 value 的占位项）。 */
+  function selectOptions(html, name) {
+    var doc = new DOMParser().parseFromString(html, 'text/html');
+    var sel = doc.querySelector('select[name="' + name + '"]');
+    if (!sel) return null;          // null = 页面里压根没这个下拉
+    var out = [];
+    var os = sel.querySelectorAll('option');
+    for (var i = 0; i < os.length; i++) {
+      var id = (os[i].getAttribute('value') || '').trim();
+      var nm = (os[i].textContent || '').trim();
+      if (!id || !nm) continue;
+      out.push({ id: id, name: nm });
+    }
+    return out;
+  }
+
+  /** 选课（/eams/stdElectCourse.action）。
+   *
+   *  🔴 只认「明确的关门话」，认不出就报 unknown。
+   *     反过来「没看到关门话 ⇒ 开着」是危险的：页面改版、被踢回登录页、
+   *     甚至加载失败，都会让那个判断变成「选课开了」的假警报。
+   *     用户兴冲冲点进教务系统发现没开，这软件就不可信了。
+   */
+  function parseElect(html) {
+    var t = plainText(html);
+    var m = /现在未到选课时间[^！!。]*/.exec(t);
+    if (m) return { state: 'closed', text: '还没到选课时间', detail: m[0] };
+    if (/选课已结束|已过选课时间|选课时间已过/.test(t)) {
+      return { state: 'closed', text: '选课已经结束', detail: '' };
+    }
+    if (/选课/.test(t)) {
+      return { state: 'unknown', text: '状态未识别，请到教务系统查看', detail: t.slice(0, 100) };
+    }
+    return { state: 'unknown', text: '页面没认出选课内容', detail: t.slice(0, 100) };
+  }
+
+  /** 免听（/eams/teach/freeListen/freeListenApply.action）。
+   *
+   *  判据是 `select[name=freeListenSwitchId]` 里有没有批次 ——
+   *  实测「2026-2027-1正常免听」「2026-2027-1重修免听」两个。
+   *  下拉在、批次有 ⇒ 现在能申请；下拉在、没批次 ⇒ 这学期没开。
+   *  下拉都不在 ⇒ 页面结构变了，报 unknown 而不是「没开」。
+   */
+  function parseFreeListen(html) {
+    var opts = selectOptions(html, 'freeListenSwitchId');
+    if (opts === null) {
+      return { state: 'unknown', text: '页面里没找到免听批次', detail: '' };
+    }
+    var list = opts.filter(function (o) { return o.id; });
+    if (!list.length) return { state: 'closed', text: '这学期没有免听批次', detail: '' };
+    return {
+      state: 'open',
+      text: list.map(function (o) { return o.name; }).join('、'),
+      detail: '',
+    };
+  }
+
+  /** 免修（/eams/exemptionApplyNew.action）。
+   *
+   *  ⚠️ 这个页面只有「免修类型」下拉（考核/替代/退役复学/主辅修四种），
+   *     **那是固定的类型，不代表现在能申请**。没有可靠的开关信号，
+   *     所以状态一律报 unknown，只把有哪几种类型摆出来。
+   *     与其猜一个「已开放」让用户白跑一趟，不如直说「要去教务系统看」。
+   */
+  function parseExemption(html) {
+    var opts = selectOptions(html, 'type.id');
+    if (opts === null) {
+      return { state: 'unknown', text: '页面里没找到免修类型', detail: '' };
+    }
+    var list = opts.filter(function (o) { return o.id; });
+    if (!list.length) return { state: 'closed', text: '没有可申请的免修类型', detail: '' };
+    return {
+      state: 'unknown',
+      text: '有 ' + list.length + ' 种免修类型，开没开要去教务系统看',
+      detail: list.map(function (o) { return o.name; }).join('、'),
+    };
+  }
+
+  /** 量化评教（/eams/quality/stdEvaluateNew.action）。
+   *
+   *  ⚠️ 这个页面**没抓到过样本**（2026-10-20 只从首页菜单里看到入口）。
+   *     所以这里只认两种最不容易误判的信号：
+   *       正文里出现「已评」「评价完成」⇒ 已评完
+   *       正文里出现「待评」「未评」+ 数字  ⇒ 有课要评
+   *     其余一律 unknown。**不许**因为「没看到待评」就说已评完 ——
+   *     那正是「没读到」被说成「没有」的经典翻车方式。
+   */
+  function parseEvaluate(html) {
+    var t = plainText(html);
+    // 「本学期评价已完成」「评价已完成」「已完成评价」几种写法都见过，
+    // 但**没抓到过真样本**，所以这里宽一点、误判方向选「不确定」。
+    if (/已评完|评价已?完成|已完成评价/.test(t) && !/待评|未评/.test(t)) {
+      return { state: 'closed', text: '看起来已经评完了', detail: t.slice(0, 100) };
+    }
+    if (/待评|未评/.test(t)) {
+      return { state: 'open', text: '有课等着评', detail: t.slice(0, 100) };
+    }
+    return { state: 'unknown', text: '状态未识别，请到教务系统查看', detail: t.slice(0, 100) };
+  }
+
+  /** 一次把「该办的事」全查一遍。
+   *
+   *  为什么单独一个接口、不塞进 /api/sync：
+   *    这四页要打四次教务系统，学校有「别点太快」的守卫，串起来要十几秒。
+   *    每次同步都白等十几秒，为了一个一学期才变几次的状态，不值当。
+   *  所以：点一下才查，查完界面自己缓存。
+   *
+   *  🔴 任何一页取失败都**只影响它自己**，别让整块变成「全都未知」——
+   *     同时也要把失败原因写进那一项，不能安静地显示成「没开放」。
+   */
+  async function todo() {
+    var defs = [
+      { key: 'elect', name: '选课', path: '/eams/stdElectCourse.action', parse: parseElect },
+      { key: 'evaluate', name: '评教', path: '/eams/quality/stdEvaluateNew.action', parse: parseEvaluate },
+      { key: 'freeListen', name: '免听申请', path: '/eams/teach/freeListen/freeListenApply.action', parse: parseFreeListen },
+      { key: 'exemption', name: '免修申请', path: '/eams/exemptionApplyNew.action', parse: parseExemption },
+    ];
+    var items = [];
+    for (var i = 0; i < defs.length; i++) {
+      var d = defs[i];
+      try {
+        var r = await http('GET', d.path);
+        var st = d.parse(r.body);
+        // 被踢回登录页 = 这一页没拿到，不能当成「状态未知」糊过去
+        if (/loginExt|请输入密码|userPassword/.test(r.body) && /login/i.test(String(r.url || ''))) {
+          st = { state: 'unknown', text: '登录态过期了，这一项没查到', detail: '' };
+        }
+        items.push({
+          key: d.key, name: d.name, state: st.state,
+          text: st.text, detail: st.detail || '', path: d.path,
+        });
+      } catch (e) {
+        items.push({
+          key: d.key, name: d.name, state: 'unknown',
+          text: '没查到：' + ((e && e.message) || e), detail: '', path: d.path,
+        });
+      }
+    }
+    return { items: items };
+  }
+
+  var idsCache = '';
+  // 课表页里全部候选编号。辅修 / 双学位的人可能挂不止一个（见 findIdCandidates）。
+  // 失效只认 idsCache —— 别处都是清 idsCache，这里跟着一起失效，不会漏。
+  var candsCache = [];
+  // 课表页里那三样「决定参数」的东西（见 pageHints）。空 = 页面里没写。
+  var hintsCache = { kinds: [], semester: '', project: '' };
+  // 学生内部编号：课表页里由 JS 拼进表单的那一行 `addInput(form,"ids","721812")`。
+  // 🔴 2026-11-06 放宽空格/引号，和 eams.py 的 IDS_RE 一字不差 ——
+  //    写死逗号后没空格的话，学校换个版本就一个都匹配不上。
+  var IDS_RE = /addInput\(\s*form\s*,\s*["']ids["']\s*,\s*["'](\d+)["']\s*\)/;
+  // 同一页里还有两种写法也带这个编号，任何一条都够用：
+  //   var ids = "721812";  /  <input type="hidden" name="ids" value="721812">
+  // 🔴 2026-11-06：有人一直绑不上，报的是「学校没给出课表」。别把
+  //    「正则没认出来」说成「学校没给」。
+  var IDS_ALT = [
+    /\bids\s*=\s*["'](\d+)["']/,
+    /name\s*=\s*["']ids["'][^>]*value\s*=\s*["'](\d+)["']/,
+    /value\s*=\s*["'](\d+)["'][^>]*name\s*=\s*["']ids["']/,
+  ];
+  // 编号那一行在、值是空串：没分班 / 还没排课（和「页面不认识」是两件事）
+  var IDS_EMPTY = /addInput\(\s*form\s*,\s*["']ids["']\s*,\s*["']\s*["']\s*\)/;
+  // 🔴 拿到的是不是**课表页**：正方这页一定有表单和它那套 JS 助手，随便哪个都在。
+  //    少了这个判断，「网关吐一句请先登录」会被当成「学校没排课」，于是会话失效
+  //    不再触发重登 —— 用户看到的是一张永远空着的课表（2026-11-06 踩到）。
+  var TABLE_PAGE = /courseTableForStd|bg\.form|TaskActivity|<form/i;
+  // 🔴 2026-11-13：「这学期真没课」和「我们没读到」长得一模一样（都没有
+  //    TaskActivity）。区别在**有没有课表骨架**：真渲染出来的课表一定有
+  //    `new CourseTable(...)` / `marshalTable(...)` / `unitCount`（空学期也有，
+  //    网格本身要画）。一个都没有 ⇒ 空响应 / 网关错误页 / 参数不对被弹回，
+  //    不是「没课」—— 以前一律当空课表，还把本机那份真课表覆盖成空。
+  // 🔴 2026-11-13 实测收紧：「CourseTable」这个大字本身**不算骨架**。
+  //    教务出错时回的是 Struts2 报错页（HTTP 500），堆栈里写着模板路径
+  //    `…/courseTableForStd/prompt.ftl` —— 一张报错页命中了「骨架」，
+  //    被当成「这学期没课」，正是要防的那件事。所以改成咬真正画表格的代码。
+  var TABLE_RENDER = /new\s+CourseTable\s*\(|\.\s*marshalTable\s*\(|unitCount\s*=\s*\d/i;
+  // 教务的报错页（Struts2 / Freemarker）：可能 200 也可能 500，
+  // 正文里这几句才是它的身份证。
+  var ERROR_PAGE = /错误路径|Exception|Template not found|stack trace/i;
+  // 🔴 课表页里那行 ids **有两支**，靠同一段 JS 的 if/else 分开：
+  //      if (jQuery("#courseTableType").val()=="std") { addInput(form,"ids","721812"); }
+  //      else { addInput(form,"ids","6587"); }
+  //    前者是学生编号，后者是班级编号。以前无脑取第一个数字，在普通学生身上
+  //    碰巧对（学生那支写在前），换个顺序（辅修 / 双学位的课表页）就拿错，
+  //    查出来一张空课表还报「学校没给出课表」—— 等于把自己的事赖给学校。
+  var TABLE_TYPE = /courseTableType[^;]{0,80}==\s*["']([\w]+)["']/g;
+
+  /** 课表页里所有可能的编号，学生那支排最前，去重。
+   *  返回 [{id:'721812', kind:'std'}, {id:'6587', kind:'class'}]；
+   *  kind：'std' 学生编号 / 'class' 另一支（班级） / '' 页面没有 if-else 可说。 */
+  function findIdCandidates(body) {
+    var src = body || '';
+    var out = [], seen = {};
+    // ⚠️ 用全局副本扫，别直接拿 IDS_RE 循环 —— 它没有 g 标志，
+    //    exec 永远返回第一个匹配、永不返回 null，是个死循环（本地踩过）。
+    var re = new RegExp(IDS_RE.source, 'g');
+    var m;
+    while ((m = re.exec(src)) !== null) {
+      if (!m[0].length) { re.lastIndex++; continue; }
+      var vid = m[1];
+      if (seen[vid]) continue;
+      var kind = '', last = null, t;
+      TABLE_TYPE.lastIndex = 0;
+      while ((t = TABLE_TYPE.exec(src)) !== null) {
+        if (t.index >= m.index) break;
+        last = t;
+      }
+      if (last) {
+        var after = src.slice(last.index + last[0].length, m.index);
+        var kv = last[1] || '';
+        // else 那支是「不是这个值」的那一类：判断写着 std ⇒ else 是班级；
+        // 判断写着 class ⇒ else 反而是学生。写死「else 就是班级」会判反。
+        var isElse = /\belse\b/.test(after);
+        kind = (kv === 'std') ? (isElse ? 'class' : 'std')
+                              : (isElse ? 'std' : 'class');
+      }
+      seen[vid] = 1;
+      out.push({ id: vid, kind: kind });
+    }
+    if (!out.length) {
+      for (var i = 0; i < IDS_ALT.length; i++) {
+        IDS_ALT[i].lastIndex = 0;
+        var a = IDS_ALT[i].exec(src);
+        if (a && !seen[a[1]]) { out.push({ id: a[1], kind: '' }); break; }
+      }
+    }
+    out.sort(function (x, y) {
+      var rx = x.kind === 'std' ? 0 : (x.kind === '' ? 1 : 2);
+      var ry = y.kind === 'std' ? 0 : (y.kind === '' ? 1 : 2);
+      return rx - ry;
+    });
+    return out;
+  }
+
+  /** 课表页里有没有编号、首选哪一个。取不到回空串。
+   *  解析只有一份（findIdCandidates），这里只是给「只关心有没有」的调用方
+   *  （sessionAlive 探活）一个短名字 —— 两份解析迟早会走岔。 */
+  function findIds(body) {
+    var c = findIdCandidates(body);
+    return c.length ? c[0].id : '';
+  }
+
+  /** 课表页里那三样「决定参数」的东西（和 eams.py 的 page_hints 一一对应）：
+   *    kinds    —— `#courseTableType` 的选项。有人只有「班级课表」这一支。
+   *    semester —— 页面上写着的当前学期 id，比空串可靠。
+   *    project  —— 有的学期挂在某个「项目」下，不带就查不出东西。
+   *  取不到就是空，不猜。 */
+  function pageHints(body) {
+    var src = body || '', out = { kinds: [], semester: '', project: '' };
+    var m = /<select[^>]*id\s*=\s*["']courseTableType["'][^>]*>([\s\S]*?)<\/select>/i.exec(src);
+    if (m) {
+      var re = /<option[^>]*value\s*=\s*["']([^"']*)["']/gi, o;
+      while ((o = re.exec(m[1])) !== null) {
+        if (o[1] && out.kinds.indexOf(o[1]) < 0) out.kinds.push(o[1]);
+      }
+    }
+    var sem = /name\s*=\s*["']semester\.id["'][^>]*value\s*=\s*["']([^"']*)["']/i.exec(src) ||
+              /value\s*=\s*["']([^"']*)["'][^>]*name\s*=\s*["']semester\.id["']/i.exec(src) ||
+              /semesterCalendar\s*\(\s*\{[^}]*value\s*:\s*["'](\d+)["']/.exec(src);
+    if (sem && (sem[1] || '').trim()) out.semester = sem[1].trim();
+    var pm = /<select[^>]*name\s*=\s*["']project\.id["'][^>]*>([\s\S]*?)<\/select>/i.exec(src);
+    if (pm) {
+      var po = /<option[^>]*value\s*=\s*["']([^"']*)["']/i.exec(pm[1]);
+      if (po && po[1].trim()) out.project = po[1].trim();
+    }
+    return out;
+  }
+  // 当前会话是不是已经登录过（切学期查考试时复用，别每次都重登）
+  var loggedIn = false;
+  // 登录的是哪个学号。用来判断「已登录同一个账号」—— 见 login() 开头那段。
+  var loggedUser = '';
+  // 考试列表页是否访问过 —— 学期下拉接口依赖它（见 semesters()）
+  var examPageSeen = false;
+  // 这个会话里有没有「project 上下文」—— 空闲教室依赖它（见 ensureProject）
+  var projectReady = false;
+
+  /* kind='auth' 表示「学号密码不对」—— 这是唯一一种用户重输一次就能解决的失败。
+     界面据此弹「重新输入密码」，网络问题不该让人白输一遍。
+     `diag` 是一小串**给排查用的证据**（比如 `page_200_5969` = 页面回来了、
+     长度 5969、但里面没有取盐那一行）。它不上屏，只随失败上报出去 ——
+     下一次再有人说「绑不上」，看这一个字段就知道是哪一档，不用再猜。 */
+  function EamsError(msg, kind) {
+    this.name = 'EamsError'; this.message = msg; this.kind = kind || '';
+    this.diag = '';
+    // 'login' = 卡在「取登录页 / 提交」这一步。loginPage 自己已经重试过三次，
+    // 外层别再整套重来一遍 —— 用户会盯着转圈多等十几秒，结论还是一样的。
+    this.stage = '';
+  }
+  EamsError.prototype = Object.create(Error.prototype);
+
+  /** 清掉教务系统的会话 cookie（Java 侧见 NativeBridge.clearCookies）。 */
+  function clearCookies() {
+    try {
+      if (typeof Android.clearCookies === 'function') return !!Android.clearCookies();
+    } catch (e) { /* 老版本原生没有这个方法，当成清不掉 */ }
+    return false;
+  }
+
+  /** 会话还活着吗？
+   *
+   *  用一个「必须登录才拿得到」的页面探一下，只认里面那行 ids，不解析内容。
+   *  它只在**已经确认登录页被跳走**时才用来确认（见 loginPage），
+   *  平时不靠它猜。
+   */
+  async function sessionAlive() {
+    try {
+      var r = await http('GET', '/eams/courseTableForStd.action');
+      return !!findIds(r.body);
+    } catch (e) {
+      return false;
+    }
+  }
+
+  // ------------------------------------------------------------ 登录页解析
+
+  var LOGIN_PATH = '/eams/loginExt.action';
+  /* 取登录页最多试几次。
+   *
+   * 为什么要重试：2026-11-11 从这台机器连续取 24 次登录页，24 次都正常
+   * （200、5969 字节、盐值齐全），可当天有三位用户报「绑不上」——
+   * 其中两位是一次都没取到。那不是学校改版，是**那一刻**没给。
+   * 网络抖一下就让用户重来一遍，是最没必要的一种失败。 */
+  var LOGIN_TRIES = 3;
+
+  /* 登录页里那行「加盐值」。两种写法都认：
+   *
+   *   A) CryptoJS.SHA1('<盐>-' + form['password'].value)      ← 郑航现在这样
+   *   B) var pwdEncryptSalt = '<盐>'; … SHA1(pwdEncryptSalt + pwd)  ← 另一套常见写法
+   *
+   * 🔴 老代码把盐写死成 `[0-9a-fA-F\-]{36}`（36 位 UUID）。盐只要换成长度、
+   *    换成带下划线的、或者干脆不加分隔符，**页面没改也会被判成「拿不到盐」**。
+   *    现在按「字面量原样 + 密码」来算，页面用什么连接符我们都不关心。
+   */
+  var SALT_LIT = /(?:CryptoJS\.)?SHA1\s*\(\s*(['"])([^'"]{4,80})\1\s*\+/g;
+  var SALT_VAR = /pwdEncryptSalt\s*=\s*(['"])([^'"]{4,80})\1/;
+  /* 最后一道：字面量本身就带着连接符（`SHA1('3f2a…-')` 后面不写 + 密码）。
+   * 现实里的页面都会跟上 `+ form['password'].value`，但它换个写法我们就认不出，
+   * 而「认不出」会直接让用户绑不上 —— 宁可多认一种。 */
+  var SALT_BARE = /(?:CryptoJS\.)?SHA1\s*\(\s*(['"])([^'"]{4,80}-)\1\s*\)/;
+
+  /** 从登录页里取「盐值前缀」。取不到返回 {pre:'', how:''}。
+   *
+   *  优先取「后面紧跟 password 的那个 SHA1」：登录页里别处也可能有哈希调用，
+   *  抓错了会一直报密码不对 —— 那比报错还糟。
+   */
+  function saltOf(body) {
+    var s = String(body || '');
+    var re = new RegExp(SALT_LIT.source, 'g');
+    var m, first = '';
+    while ((m = re.exec(s)) !== null) {
+      if (!m[0].length) { re.lastIndex++; continue; }
+      var tail = s.slice(m.index, m.index + m[0].length + 90);
+      if (/password/i.test(tail)) return { pre: m[2], how: 'lit' };
+      if (!first) first = m[2];
+    }
+    if (first) return { pre: first, how: 'lit' };
+    var v = SALT_VAR.exec(s);
+    if (v) return { pre: v[2], how: 'var' };
+    var b = SALT_BARE.exec(s);
+    if (b) return { pre: b[2], how: 'bare' };
+    return { pre: '', how: '' };
+  }
+
+  function csrfOf(body) {
+    var m = /name=["']?_csrf["']?[^>]*value=["']([^"']+)["']/.exec(String(body || ''));
+    return m ? m[1] : '';
+  }
+
+  /** 这一页是不是「已经登录了，学校把登录页跳走了」。
+   *
+   *  两种表现，都要认：
+   *    ① 服务器 302 到 homeExt.action（HttpURLConnection 会自己跟过去）；
+   *    ② 回一个 145 字节的 <meta http-equiv="refresh" content="0;url=homeExt.action">。
+   *       Java 不会跟 meta refresh —— 不认它的话，一个**已经登录**的会话
+   *       会被说成「登录页没认出来」，而且每次刷新都撞。
+   *  长度和 password 两道限制是为了别把真登录页误判成首页（真实登录页 5969 字节，
+   *  里面没有 homeExt 字样，见 _lab/out/_live_login.html）。
+   */
+  function looksHome(r) {
+    var u = String((r && r.url) || '');
+    var b = String((r && r.body) || '');
+    if (u.indexOf('homeExt') >= 0) return true;
+    // 登录页一定有 password 输入框。没有它、又提到首页，那就不是登录页。
+    if (/name=["']?password/i.test(b)) return false;
+    if (b.length > 0 && b.length < 900 && /homeExt\.action|home\.action/.test(b)) return true;
+    // 有的部署不跳转、直接把首页回在登录页这个地址上（200 + 一整张首页）。
+    // 首页才会写「退出」「注销」；登录页不会。
+    return /homeExt\.action/.test(b) && /(退出|注销|logout)/.test(b);
+  }
+
+  /** 校园网网关 / 运营商把请求截到了它自己的登录页。
+   *
+   *  这套系统（srun）的页面里有 srun_portal、ac_id、上网认证 这些字样，
+   *  地址也会变成 10.x 或者带 ac_id=。郑航的教务登录页里这些词一个都没有
+   *  （2026-11-11 核过），所以不会误判成「网关拦截」。
+   */
+  function looksPortal(r) {
+    var u = String((r && r.url) || '');
+    var b = String((r && r.body) || '');
+    if (/srun|\/portal|ac_id=|eportal|wlanuserip/i.test(u)) return true;
+    return /srun_portal|上网认证|认证上网|校园网登录|网络已断开/.test(b);
+  }
+
+  /** 这次请求**根本没通到服务器**（超时、DNS、连接被掐）。
+   *  Java 那边用 status 0 + error 表示，body 是空的 ——
+   *  不单独认它的话，空的 body 会被当成「页面里没有盐值」，
+   *  于是网络断了也会显示「学校改版了」。 */
+  function netDead(r) {
+    return !r || Number(r.status) === 0 || !!r.error;
+  }
+
+  /** 取一张能用登录页（盐值 + csrf）。拿不到就按**实际看到的东西**报错。
+   *
+   *  🔴 2026-11-11 重写。以前这里只会抛一句「没拿到登录页的加盐值，学校可能
+   *     改版了」，可真实原因有五种，**只有最后一种跟改版有关**：
+   *       ① 网络层没通（超时 / 连不上）—— Java 回 status 0、body 为空；
+   *       ② 学校服务器 5xx 或者维护页；
+   *       ③ 校园网网关把请求截到了它自己的登录页；
+   *       ④ 会话还有效，登录页被 302 / meta refresh 跳走了（丢掉 cookie 重来）；
+   *       ⑤ 页面确实是登录页，但取盐那行变了 —— 这才叫改版。
+   *     ① ② ③ 要用户做的事完全不同（换网络 / 等一会儿 / 先连校园网），
+   *     一律说「学校改版」，等于让他等一个永远不会来的修复。
+   *     而把 ① 说成改版，还会让真正需要修的那一档永远看不到。
+   *
+   *  返回 { pre, how, csrf }。pre 是「盐值 + 连接符」的原样前缀。
+   */
+  async function loginPage() {
+    var last = null, why = '', homeSeen = 0;
+    for (var i = 0; i < LOGIN_TRIES; i++) {
+      var r = await http('GET', LOGIN_PATH, '', '', null,
+                         { 'cache-control': 'no-cache', pragma: 'no-cache' });
+      last = r || {};
+      var body = last.body || '';
+      var s = saltOf(body);
+      if (s.pre) return { pre: s.pre, how: s.how, csrf: csrfOf(body) };
+
+      if (looksHome(last)) {
+        homeSeen++;
+        // 第一次：把这个会话丢掉，再要一张干净登录页。
+        // （带着有效 cookie 要登录页，学校只会把你送回首页。）
+        if (homeSeen === 1) {
+          clearCookies();
+          loggedIn = false;
+          loggedUser = '';
+          continue;
+        }
+        // 清过一次还是首页 ⇒ 登录态真的清不掉，别再来第三遍。
+        why = 'home';
+        break;
+      }
+      why = netDead(last) ? 'net'
+          : (Number(last.status) >= 500 ? 'err'
+          : (looksPortal(last) ? 'portal' : 'page'));
+      // ① ② ③ 都可能是**这一刻**的事，退一步再要一次；⑤ 也再要一次 ——
+      // 负载均衡后面有几台机器，偶尔一台回的是别的页面。
+      if (i + 1 < LOGIN_TRIES) await sleep(900 + i * 900);
+    }
+    throw loginPageError(last, why);
+  }
+
+  /** 登录页这件事，到底出了什么。文案只说看到的事实，不猜。 */
+  function loginPageError(r, why) {
+    var st = Number((r && r.status) || 0);
+    var len = String((r && r.body) || '').length;
+    var e;
+    if (why === 'home') {
+      // 登录态清不掉。这句是真的「我们这边的问题」，但用户能做的是重开一次。
+      e = new EamsError('上次的登录状态清不掉，重新打开一次应用再试', 'session');
+    } else if (why === 'portal') {
+      e = new EamsError('网络被校园网的登录页拦住了，先连上校园网再试', 'net');
+    } else if (why === 'net' || st === 0) {
+      e = new EamsError('连不上教务系统，请检查网络后重试', 'net');
+    } else if (st >= 500) {
+      e = new EamsError('学校教务系统出错了（' + st + '），请稍后再试', 'net');
+    } else if (/(维护|升级|暂停服务|系统繁忙|正在维护)/.test(String((r && r.body) || ''))) {
+      // 页面自己写着在维护 —— 这是**它说的**，不是我们猜的。
+      e = new EamsError('学校教务系统在维护，请稍后再试', 'net');
+    } else if (len === 0) {
+      e = new EamsError('学校教务系统无返回，请稍后再试', 'net');
+    } else if (st >= 400) {
+      e = new EamsError('教务系统的登录地址打不开了（' + st + '）', 'page');
+    } else {
+      // 页面回来了、长度也正常，就是没有取盐那一行 —— 这一档才该叫「不认识了」。
+      // 🔴 不说「学校改版了」：我们只知道**自己没认出来**，不知道学校改没改。
+      // ⚠️ 这句是两段拼的，拼起来必须是通顺的一句话。0.52.3 v6 改文案时踩过：
+      //    后半截换成「在「问题反馈」里附上日志」，前半截还留着「请点下面的」，
+      //    拼出来是「请点下面的在「问题反馈」里…」——`check_copy_glue` 抓的就是这个。
+      e = new EamsError('登录页的样子变了，这个版本还不认识。'
+                        + '请在「问题反馈」里附上日志', 'page');
+    }
+    e.diag = why + '_' + st + '_' + (len > 9999 ? 9999 : len);
+    e.stage = 'login';
+    return e;
+  }
+
+  async function login(username, password) {
+    // 🔴 已经登录着**同一个账号**，就直接用现成的会话，别再登一次。
+    //
+    //    为什么：带着有效 cookie 去访问登录页，学校服务器会 302 到首页，
+    //    返回的 HTML 里没有取盐那一行 ⇒ 会白打一次登录页。
+    //    2026-10-19 用户报的「明明登录过了，一点刷新就说没拿到盐值」就是它。
+    //    ⚠️ 这里的「已登录」是**这一次打开里刚登成功过**，不是从磁盘读的；
+    //       服务器那边过期了会被 doSync 的兜底再登一次。
+    if (loggedIn && loggedUser === username) return;
+
+    var lp = await loginPage();
+    var hashed = sha1hex(lp.pre + password);
+
+    // 立刻提交会被「请不要过快点击」挡掉
+    await sleep(3000);
+    var r2 = await http('POST', LOGIN_PATH, form({
+      needModify: '0',
+      _csrf: lp.csrf,
+      username: username,
+      password: hashed,
+      session_locale: 'zh_CN',
+      login_from: 'login_from',
+    }), LOGIN_PATH);
+
+    // 提交这一步也可能压根没通到服务器。以前它会被下面那句「学校网站这会儿
+    // 不太正常」收掉 —— 网络断了说成学校的问题，用户就不会去检查网络。
+    if (netDead(r2)) {
+      var en = new EamsError('连不上教务系统，请检查网络后重试', 'net');
+      en.diag = 'post_net_' + Number((r2 && r2.status) || 0);
+      en.stage = 'login';
+      throw en;
+    }
+
+    var b2 = r2.body || '';
+    var landed = String(r2.url || '');
+    // 登录成功的两种落地：302 到 homeExt（Java 会跟过去），
+    // 或者直接回一张首页（页面里带 homeExt.action 的链接，而登录页没有）。
+    var okHome = landed.indexOf('homeExt') >= 0 ||
+                 (b2.indexOf('homeExt.action') >= 0 && !/name=["']?password/i.test(b2));
+    if (!okHome) {
+      if (b2.indexOf('请不要过快点击') >= 0) {
+        throw new EamsError('学校网站提示「请不要过快点击」，稍等几秒再试', 'net');
+      }
+      // 🔴 2026-11-05：认证失败的说法不止一种。以前只认「密码」+「错误」，
+      //    「密码不正确」「用户名或密码有误」都会掉进下面那个「系统抽风」，
+      //    用户据此以为不是自己的问题，就一直重试 —— 重试到账号被锁。
+      // 🔴 2026-11-11：这一条只按**学校页面上写着的话**判。学校说密码不对
+      //    就是密码不对，不许拿别的猜测去盖它，也不许反过来把网络问题说成密码问题。
+      if (/密码/.test(b2) && /(错误|不正确|有误|不对)/.test(b2)) {
+        var ea = new EamsError('学号或密码不对', 'auth');
+        ea.diag = 'auth_txt';
+        throw ea;
+      }
+      // 连续输错会被锁号。这时候再输也是白输，必须说清是「锁了」不是「错了」。
+      if (/(锁定|已停用|已禁用|冻结)/.test(b2)) {
+        var el = new EamsError('账号被学校锁了，先找教务处解锁', 'auth');
+        el.diag = 'locked_txt';
+        throw el;
+      }
+      // 剩下的这一档：学校回了页面，但不是首页，也没说清是什么。
+      // 如实说「没登上、没给原因」，别编一个理由。
+      var eu = new EamsError(
+        b2.length === 0
+          ? '学校教务系统无返回，请稍后再试'
+          : '登录未成功，学校未给出原因，请稍后再试',
+        b2.length === 0 ? 'net' : 'page');
+      eu.diag = 'no_home_' + Number(r2.status || 0) + '_' + (b2.length > 9999 ? 9999 : b2.length);
+      throw eu;
+    }
+    idsCache = '';
+    loggedIn = true;
+    loggedUser = username;
+  }
+
+  /** 保证有会话：没登录就用本机存的凭据登一次。 */
+  async function ensureLogin() {
+    if (loggedIn) return;
+    var c = loadCred();
+    if (!c) throw new EamsError('还没绑定账号');
+    await login(c.u, c.p);
+  }
+
+  /** 带着会话执行一次请求；会话失效（登录态过期）就**重登一次**再试。
+   *  🔴 只重试一次：重登还失败说明真有问题（密码改了 / 服务器抽风），
+   *     如实报错，别循环打学校服务器。 */
+  async function withLogin(fn) {
+    await ensureLogin();
+    try {
+      return await fn();
+    } catch (e) {
+      // 密码问题、以及「认不出来 / 清不掉」这种重来一遍也一样的，别重登。
+      if (e && (e.kind === 'auth' || e.kind === 'page' || e.kind === 'session')) throw e;
+      loggedIn = false;
+      loggedUser = '';
+      idsCache = '';
+      examPageSeen = false;
+      projectReady = false;
+      await ensureLogin();
+      return await fn();
+    }
+  }
+
+  async function studentIdCandidates() {
+    if (idsCache && candsCache.length) return candsCache;
+    var r = await http('GET', '/eams/courseTableForStd.action');
+    var body = r.body || '';
+    var got = findIdCandidates(body);
+    // 🔴 三档分开说（和 eams.py 同一套话）：
+    //    被退回登录页 ⇒ 重输密码有用；页面开了但没有编号 ⇒ 重输没用，
+    //    是学校那边没给出课表页；编号那一行在但是空的 ⇒ 还没分班 / 还没排课。
+    //    以前一律说「可能登录态过期了」，用户就一直重输密码（2026-11-05 截图）。
+    //    kind：auth = 重登有用；nottable = 学校那边的事，重登没用。
+    if (!got.length) {
+      // 🔴 2026-11-13 实测：报错页（Struts2，HTTP 500）的堆栈里带着模板路径
+      //    「…/courseTableForStd/prompt.ftl」，正好命中下面的 TABLE_PAGE，
+      //    于是「我们没读到」被说成「学校这次没给出课表」（nottable）——
+      //    因为 nottable 算学校的锅，我们连参数都不再试一次。
+      //    报错页要先认出来。
+      sanePage(r, '课表页', 'ids');
+      if (/name="password"|loginExt\.action/.test(body))
+        throw new EamsError('登录状态未保持，请重新输入密码', 'auth');
+      if (IDS_EMPTY.test(body))
+        throw new EamsError('学校尚未提供课表，可能还未分班或未排课',
+                            'nottable');
+      if (TABLE_PAGE.test(body))
+        throw new EamsError('学校这次没给出课表，请稍后重试', 'nottable');
+      // 连课表页都不像（空响应 / 网关错误页 / 只说一句「请先登录」）⇒ 别赖学校，
+      // 当成页面没打开：上层会重登一次，那是真能救回来的情况。
+      throw new EamsError('课表页没打开，可能登录状态没了，稍后再试一次');
+    }
+    candsCache = got;
+    hintsCache = pageHints(body);
+    idsCache = got[0].id;
+    return candsCache;
+  }
+
+  async function studentIds() {
+    var c = await studentIdCandidates();
+    return c[0].id;
+  }
+
+  /** 两张课表并成一张。同一门课（同名/同教师/同教室/同周次）算一条，格子取并集。
+   *  用在「一个人挂了多个编号」的情形：主修、辅修的课各自查得出来，
+   *  但学生要看到的是**一张**课表。去重规则必须和 parseTimetable 里那条一致。 */
+  function mergeTimetable(a, b) {
+    var out = {}, k;
+    for (k in a) if (Object.prototype.hasOwnProperty.call(a, k)) out[k] = a[k];
+    var merged = {}, order = [];
+    var list = ((a && a.courses) || []).concat((b && b.courses) || []);
+    for (var i = 0; i < list.length; i++) {
+      var c = list[i];
+      if (!c.slots || !c.slots.length) continue;
+      var key = [c.name, c.code, c.teacher, c.room,
+                 (c.weeks || []).join(',')].join('|');
+      if (merged[key]) {
+        for (var s = 0; s < c.slots.length; s++) {
+          var slot = c.slots[s], dup = false;
+          for (var t = 0; t < merged[key].slots.length; t++) {
+            if (merged[key].slots[t].day === slot.day &&
+                merged[key].slots[t].period === slot.period) { dup = true; break; }
+          }
+          if (!dup) merged[key].slots.push(slot);
+        }
+      } else {
+        var keep = {};
+        for (k in c) if (Object.prototype.hasOwnProperty.call(c, k)) keep[k] = c[k];
+        keep.slots = c.slots.slice();
+        merged[key] = keep;
+        order.push(key);
+      }
+    }
+    var courses = [];
+    for (var j = 0; j < order.length; j++) courses.push(merged[order[j]]);
+    courses.sort(function (x, y) {
+      return (x.slots[0].day - y.slots[0].day) ||
+             (x.slots[0].period - y.slots[0].period);
+    });
+    out.courses = courses;
+    var tw = Math.max((a && a.totalWeeks) || 0, (b && b.totalWeeks) || 0);
+    for (var m = 0; m < courses.length; m++) {
+      var w = courses[m].weeks || [];
+      if (w.length) tw = Math.max(tw, Math.max.apply(null, w));
+    }
+    out.totalWeeks = tw;
+    if (!out.semester) out.semester = (b && b.semester) || '';
+    delete out.empty;
+    return out;
+  }
+
+  async function timetable(semesterId, semesterName) {
+    // 🔴 2026-11-06 晚：辅修 / 双学位的人可能挂不止一个编号。
+    //    先用「学生」那几支查，一支都查不出课才去试「班级」那支 ——
+    //    班级编号配学生课表接口通常查不出东西，只在别无选择时试。
+    //    正常学生只命中一支，请求次数和以前一样，别让所有人多等一次。
+    // 🔴 2026-11-13：同一个人也可能「参数不对」而不是「没课」。第一次照旧按
+    //    std + 空学期发；**只有它没查出课**才按页面上的值（courseTableType 的
+    //    选项 / 隐藏的 semester.id / project.id）再试，最多三组。
+    var cands = await studentIdCandidates();
+    var primary = [], others = [];
+    for (var i = 0; i < cands.length; i++) {
+      (cands[i].kind === 'class' ? others : primary).push(cands[i]);
+    }
+    if (!primary.length) { primary = others; others = []; }
+    var variants = ttVariants(semesterId);
+    var best = null, firstErr = null;
+    var groups = [primary, others];
+    for (var g = 0; g < groups.length; g++) {
+      for (var n = 0; n < groups[g].length; n++) {
+        for (var v = 0; v < variants.length; v++) {
+          var out;
+          try {
+            out = await timetableOne(groups[g][n].id, variants[v].semester,
+                                     semesterName, variants[v].kind,
+                                     variants[v].project);
+          } catch (e) {
+            // 会话没了要立刻往外抛：拿另一支的空课表把它盖住，
+            // 用户看到的又是一张永远空着的课表（2026-11-06 踩过一次）。
+            if (e && e.kind === 'session') throw e;
+            if (!firstErr) firstErr = e;
+            continue;
+          }
+          if (out.courses && out.courses.length) {
+            best = (best && best.courses && best.courses.length)
+              ? mergeTimetable(best, out) : out;
+            break;                       // 这一支查出了课，换参数没意义
+          } else if (!best) {
+            best = out;
+          }
+        }
+      }
+      if (best && best.courses && best.courses.length) break;
+    }
+    if (!best) {
+      throw firstErr || new EamsError('课表没读到，请稍后重试', 'readfail');
+    }
+    return best;
+  }
+
+  /** 查课表时可以试的几组参数，**第一组永远是以前那一组**（和 eams.py 的
+   *  _tt_variants 同一套顺序）：① std + 调用方给的学期 ② 页面上的 semester.id
+   *  ③ 页面上非 std 的那一支。去重后最多三组；页面里什么都没写就一组。 */
+  function ttVariants(semesterId) {
+    var h = hintsCache || { kinds: [], semester: '', project: '' };
+    var out = [], seen = {};
+    function add(kind, sem, proj) {
+      var key = kind + '|' + sem + '|' + proj;
+      if (seen[key]) return;
+      seen[key] = 1;
+      out.push({ kind: kind, semester: sem, project: proj });
+    }
+    add('std', semesterId || '', '');
+    if (!semesterId && h.semester) add('std', h.semester, '');
+    for (var i = 0; i < (h.kinds || []).length; i++) {
+      var k = h.kinds[i];
+      if (k && k !== 'std') add(k, semesterId || h.semester || '', '');
+    }
+    if (h.project) {
+      for (var j = 0; j < out.length; j++) {
+        if (out[j].kind === 'std' && out[j].semester) {
+          add(out[j].kind, out[j].semester, h.project);
+          break;
+        }
+      }
+    }
+    return out.slice(0, 3);
+  }
+
+  /** 这一页**是不是真的那个页面**（而不是教务的报错页 / 网关页）。
+   *
+   *  🔴 2026-11-13 实测：教务出错时回的是 Struts2 / Freemarker 报错页
+   *     （HTTP **500**），正文里写着模板路径 `…/courseTableForStd/prompt.ftl`
+   *     和「错误路径: /stdDetail.action」。而 `courseTableForStd`、`stdDetail`
+   *     这些字，正好就是我们用来判断「这页对不对」的词 —— 于是报错页一路
+   *     骗过所有判断：课表说成「还没排课」，学籍说成「没建档」，
+   *     然后把手上那份真数据覆盖掉。
+   *
+   *     顺序必须是：先认报错页，再谈内容。状态码和报错页特征两道都过，
+   *     才有资格去问「里面有没有课 / 有没有学号」。
+   */
+  function sanePage(r, what, diag) {
+    var body = String((r && r.body) || '');
+    var st = Number((r && r.status) || 0);
+    if (st === 0) {
+      // 根本没通到服务器：这是「换网络」，不是「等一会儿」
+      var en = new EamsError('网络没通，' + what + '这次没读到', 'net');
+      en.diag = 'net_' + diag;
+      throw en;
+    }
+    if (st !== 200 || ERROR_PAGE.test(body)) {
+      var e = new EamsError(what + '本次打不开，请稍后重试', 'readfail');
+      e.diag = 'http_' + st + '_' + diag;
+      throw e;
+    }
+  }
+
+  async function timetableOne(ids, semesterId, semesterName, kind, projectId) {
+    var body = {
+      ignoreHead: '1', 'setting.kind': kind || 'std', startWeek: '',
+      'semester.id': semesterId || '', ids: ids,
+    };
+    if (projectId) body['project.id'] = projectId;
+    var r = await http('POST', '/eams/courseTableForStd!courseTable.action', form(body),
+                       '/eams/courseTableForStd.action');
+    if (r.body.indexOf('TaskActivity') < 0) {
+      // 「空学期」和「登录态过期」都会走到这里，处理方式相反：
+      // 前者显示「这学期没有课表」，后者请用户重登。用登录页特征区分。
+      if (/name="password"|loginExt\.action/.test(r.body)) {
+        // kind='session'：多候选循环里要立刻往外抛，不许被另一支的空课表盖掉
+        throw new EamsError('课表页返回里没有课程数据，可能登录态过期了', 'session');
+      }
+      // 报错页里有 courseTableForStd，会骗过下面那句骨架判断 —— 先挡住。
+      sanePage(r, '课表页', kind || 'std');
+      // 🔴 只有「响应里确实有课表骨架」才叫空学期。空响应 / 网关错误页 /
+      //    参数不对被弹回来，一个骨架都没有 —— 以前这些都算「没课」，
+      //    界面照实说「教务还没排课」，还把手上的真课表覆盖成空。
+      if (!TABLE_RENDER.test(r.body)) {
+        var e1 = new EamsError('课表本次未读到，请稍后重试', 'readfail');
+        e1.diag = 'blank_' + String(r.body || '').length + '_' + (kind || 'std');
+        throw e1;
+      }
+      var empty = parseTimetable(r.body);
+      empty.courses = [];
+      empty.empty = true;
+      if (semesterName) empty.semester = semesterName;
+      return empty;
+    }
+    var out = parseTimetable(r.body);
+    if (!out.courses.length) {
+      // 「页面上有课块，但一条都没解析出来」= 我们的事，不是学校没课。
+      // 以前这里安静返回空，界面说「还没有课表」，用户只能去找一个不存在的开关。
+      var e2 = new EamsError('课表页拿到了，但没解析出课程，可能页面改版了', 'readfail');
+      e2.diag = 'act_' + String(r.body).split('TaskActivity').length + '_' +
+                String(r.body).length;
+      throw e2;
+    }
+    // 课表里的学期名是从课程代码前缀推的，课程代码不规整就是空串；
+    // 调用方手里有教务给的规范名字，优先用那个。
+    if (semesterName) out.semester = semesterName;
+    return out;
+  }
+
+  async function grades() {
+    await http('GET', '/eams/teach/grade/course/person.action');
+    var r = await http('GET',
+      '/eams/teach/grade/course/person!historyCourseGrade.action?projectType=',
+      '', '/eams/teach/grade/course/person.action');
+    // 🔴 2026-11-01 修：空 ≠ 过期。以前只要解析不出课程就抛「登录态过期」，
+    //    新生第一学期历年成绩页本来就是空表，于是账号密码全对也绑不上。
+    //    这里和 Python 版 eams.grades() 同一套判断：有登录页特征才算过期。
+    if (/name="password"|loginExt\.action/.test(r.body)) {
+      throw new EamsError('成绩页被退回登录页，可能登录态过期了');
+    }
+    // 报错页解析出来是「没有成绩」，界面会把本机历年成绩清空。
+    sanePage(r, '成绩页', 'grades');
+    var data = parseGrades(r.body);
+    if (!data.courses.length) data.empty = true;
+    return data;
+  }
+
+  /** 学籍信息。
+   *
+   *  🔴 2026-11-05：以前这里只有一句「没拿到学籍信息，可能登录过期了」，
+   *     结果三个人三件事被压成同一句话：
+   *       ① 会话真没了（被踢回登录页）—— 重试有用
+   *       ② 学籍页打开了，但里面就是没有「学号」那一行 —— 重试一万次也没用
+   *       ③ 学校系统故障 —— 过一会儿才有用
+   *     用户看到「可能过期」，自然一直重输密码，永远出不来。
+   *
+   *     现在分开说。而且 ② 不让它拦人：学校是拿学号当登录名的，
+   *     `loggedUser` 就是学号，直接兜住 —— 课表、成绩、考试都不依赖
+   *     学籍页那一行，没理由因为学籍没建档就整个用不了。
+   */
+  async function profile() {
+    var r = await http('GET', '/eams/stdDetail.action');
+    // 报错页里有「错误路径: /stdDetail.action」，会骗过下面那句「像不像学籍页」；
+    // 被骗过之后会走到「登录名像学号就当学籍拿到了」，姓名/学院全空。
+    sanePage(r, '学籍页', 'profile');
+    var p = parseProfile(r.body);
+    if (p.studentId) return p;
+
+    // ① 被踢回登录页：会话真没了，交给上层清 cookie 重登一次
+    if (/name="password"|loginExt\.action/.test(r.body)) {
+      throw new EamsError('学籍页被退回登录页了，登录状态没保住');
+    }
+
+    // 2026-11-13：页面根本不像学籍页（空响应 / 网关错误页）⇒ 这次没读到。
+    // 不能拿「没有学号」下结论 —— 那是把「我们没拿到」说成「你没建档」。
+    if (!/学籍|stdDetail|姓名/i.test(r.body)) {
+      var eb = new EamsError('学籍页这次没读到，请稍后重试', 'readfail');
+      eb.diag = 'blank_' + String(r.body || '').length;
+      throw eb;
+    }
+
+    // ② 页面开了但要不到学号：拿登录名兜底（学校用学号登录）
+    if (/^\d{8,14}$/.test(loggedUser || '')) {
+      p.studentId = loggedUser;
+      p.fromLogin = true;
+      return p;
+    }
+
+    // ③ 连登录名都不像学号：如实说，别让人白试
+    throw new EamsError('学籍页无学号，可能未建档，问教务处');
+  }
+
+  /** 培养计划。解析不出来就抛错 —— 界面上「没读到」和「没有计划」必须分开。 */
+  async function plan() {
+    var r = await http('GET', '/eams/myPlan.action');
+    // 报错页解析出来是「没有计划」，界面会把学分进度整块清成 0。
+    sanePage(r, '培养计划页', 'plan');
+    var p = parsePlan(r.body);
+    if (!p.found || !p.courses.length) {
+      throw new EamsError('没拿到培养计划，可能登录过期或者学校改版了');
+    }
+    return p;
+  }
+
+  /** 考试安排。`semesterId` 为空 = 教务系统默认（当前学期）。
+   *  🔴 学校没排考时**不是错误**：返回空列表 + published=false，
+   *     界面照实说「还没发布」，别把「没数据」伪装成「没有考试」。 */
+  async function exams(semesterId) {
+    var path = '/eams/stdExamTable.action';
+    // 带上 semester.id 服务端就切到那个学期：批次下拉和明细链接都跟着变
+    if (semesterId) path += '?semester.id=' + encodeURIComponent(semesterId);
+    var page = await http('GET', path);
+    examPageSeen = true;
+    // 报错页里一个学期 id / 批次都没有，会走到下面那句「可能登录态过期了」；
+    // 但它不是过期，而且界面会当成「这学期没有考试」。
+    sanePage(page, '考试页', 'exams');
+    var meta = parseExamPage(page.body);
+    // 🔴 既没有学期 id 也没有批次下拉 ⇒ 多半被踢回登录页了。
+    //    必须报错：安静返回 0 条，界面就会说「这学期没有考试安排」，
+    //    等于把「没读到」说成「没有」。
+    if (!meta.semesterId && !meta.batches.length) {
+      throw new EamsError('考试页没打开，可能登录态过期了');
+    }
+    var sid = semesterId || meta.semesterId;
+    var batches = meta.batches.filter(function (b) { return b.id; });
+
+    if (!sid) {
+      return {
+        exams: [], published: false, batches: batches,
+        reason: '没找到这个学期，学校系统可能改版了',
+      };
+    }
+
+    var all = [], seen = {}, tried = [];
+    // 先按批次查；批次全空时再试「不指定批次」，学校两种写法都出现过
+    var targets = batches.map(function (b) { return b.id; }).concat(['']);
+    for (var i = 0; i < targets.length; i++) {
+      var bid = targets[i];
+      tried.push(bid);
+      var r = await http('GET', '/eams/stdExamTable!examTable.action?examBatch.id=' +
+        encodeURIComponent(bid) + '&semester.id=' + encodeURIComponent(sid));
+      var got = parseExams(r.body);
+      got.exams.forEach(function (e) {
+        var key = [e.code, e.date, e.room, e.name].join('\u0001');
+        if (seen[key]) return;
+        seen[key] = 1;
+        all.push(e);
+      });
+    }
+
+    return {
+      exams: all, published: all.length > 0,
+      batches: batches, semesterId: sid, tried: tried,
+    };
+  }
+
+  /** 全部学期（教务系统给 53 个，界面自己筛成「我在读的那几个」）。
+   *  🔴 必须先访问一次考试页，否则 dataQuery 回空 —— 和 eams.semesters() 同一条实测。 */
+  async function semesters() {
+    if (!examPageSeen) {
+      await http('GET', '/eams/stdExamTable.action');
+      examPageSeen = true;
+    }
+    var r = await http('GET', '/eams/dataQuery.action?dataType=semester');
+    return parseSemesterList(r.body);
+  }
+
+  // ------------------------------------------------------------------ 空闲教室
+  //
+  // 🔴 跟「考试页要先摸一次」同类的坑：`/eams/classroom/apply/free.action` 是
+  //    受限动作，服务端要求 session 里有 project（培养层次，郑航是「本科」）。
+  //    只访问 homeExt 不算；必须先访问 stdDetail / courseTableForStd。
+  //    2026-10-19 实测：不先摸一律 500 `project not selected`。
+  //
+  // 🔴 第二个坑：`free!search.action` 默认只回 **20 行**（grid 分页），
+  //    要传 `pageSize`。不传只能看到按容量升序的前 20 个 —— 全是常年空着的
+  //    小实验室，换节次换日期看起来都「一模一样」，像筛选没生效。
+
+  async function ensureProject() {
+    if (projectReady) return;
+    await http('GET', '/eams/stdDetail.action');
+    projectReady = true;
+  }
+
+  async function roomOptions() {
+    await ensureProject();
+    var r = await http('GET', '/eams/classroom/apply/free.action');
+    if ((r.body || '').indexOf('project not selected') >= 0) {
+      throw new EamsError('空闲教室页没打开，可能登录态过期了');
+    }
+    return parseRoomOptions(r.body);
+  }
+
+  async function freeRooms(o) {
+    o = o || {};
+    var day = String(o.date || '').trim();
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(day)) throw new EamsError('要查哪一天？日期不能空');
+    var p1 = Number(o.periodBegin), p2 = Number(o.periodEnd);
+    // 1~12 是**接口的宽容范围**，不是本校的节数。郑航只有 10 节
+    // （课表 HTML 里 `unitCount = 10`），界面按这个值生成节次块，
+    // 根本不会发 11-12 出来（见 app.js roomBlocks）。
+    // 这里放宽到 12 是为了别的学校（嘉兴等）不用改代码。
+    if (!(p1 >= 1 && p1 <= p2 && p2 <= 12)) {
+      throw new EamsError('节次要在 1~12 之间，且开始不晚于结束');
+    }
+    // 1000：服务端认这个参数，一次能拿全（实测 756 行）。
+    // 给 200 只会拿到「按容量升序」的前 200 个 —— 全是 6 座小实验室。
+    var pageSize = o.pageSize || 1000;
+    await ensureProject();
+    var r = await http('POST', '/eams/classroom/apply/free!search.action', form({
+      'classroom.type.id': o.typeId || '',
+      'classroom.campus.id': o.campusId || '',
+      'classroom.building.id': o.buildingId || '',
+      seats: o.seats || '',
+      'classroom.name': o.name || '',
+      'cycleTime.cycleCount': '1',
+      'cycleTime.cycleType': '1',          // 1=按天
+      'cycleTime.dateBegin': day,
+      'cycleTime.dateEnd': day,
+      roomApplyTimeType: '0',              // 0=按小节
+      timeBegin: String(p1),
+      timeEnd: String(p2),
+      pageSize: String(pageSize),
+    }), '/eams/classroom/apply/free.action');
+
+    if ((r.body || '').indexOf('出错了') >= 0) {
+      var m = /错误原因:[\s\S]*?<pre>([\s\S]*?)<\/pre>/.exec(r.body || '');
+      var why = m ? m[1].replace(/<[^>]+>/g, '').trim() : '未知原因';
+      throw new EamsError('空闲教室查询失败：' + why);
+    }
+    // 🔴 会话被踢时学校回的是 HTTP 200 + 一句话（「本次会话已经被过期…」），
+    //    不认这条就会解析出 0 间，界面说「没有空闲教室」—— 把错误说成事实。
+    //    抛出去还能让 withLogin 重登一次再试。
+    //    真·查不到时返回里是有 gridtable 的（只是 tbody 空），不会误判。
+    if ((r.body || '').indexOf('gridtable') < 0) {
+      var why2 = String(r.body || '').replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+      throw new EamsError('空闲教室查询没返回结果表：' + (why2.slice(0, 60) || '可能登录态过期了'));
+    }
+    var out = parseFreeRooms(r.body || '');
+    out.dateBegin = day;
+    out.dateEnd = day;
+    out.periodBegin = p1;
+    out.periodEnd = p2;
+    // 拿满了 pageSize 就说明可能还有更多 —— 界面上要照实说。
+    // ⚠️ 用 raw（含「停课」那种状态行）判，状态行也占名额。
+    out.truncated = out.raw >= pageSize;
+    return out;
+  }
+
+  // ------------------------------------------------------------------ 凭据
+
+  function loadCred() {
+    try {
+      var raw = Android.loadCred();
+      if (!raw) return null;
+      var d = JSON.parse(raw);
+      if (d && d.u && d.p) return { u: d.u, p: d.p };
+    } catch (e) { /* 解不开就当没绑 */ }
+    return null;
+  }
+
+  // ------------------------------------------------------------------ 应用内下载
+
+  /* 下载更新（Java 侧见 UpdateDownloader）。网页版没有这个对象，所以每个方法
+     调用前都要现查 —— 别在模块加载时缓存成常量，那样网页版里永远是 undefined。
+
+     🔴 这里只做「解 JSON + 兜异常」，不掺业务逻辑：要不要重试、校验不过怎么办，
+        全在 app.js 里，网页版和 APK 共用同一套判断。 */
+  function updRaw() {
+    return (window.AndroidUpdate && typeof window.AndroidUpdate.start === 'function')
+      ? window.AndroidUpdate : null;
+  }
+
+  function updJson(s) {
+    try { return JSON.parse(String(s || '')); }
+    catch (e) { return { ok: false, error: 'App 内部通信出错了，请重试' }; }
+  }
+
+  var UpdApi = {
+    /** 有没有应用内下载能力（网页版没有）。 */
+    available: function () { return !!updRaw(); },
+
+    /** 入队下载 → {ok, id} 或 {ok:false, error} */
+    start: function (url, name) {
+      var a = updRaw();
+      if (!a) return { ok: false, error: '这个版本不支持应用内下载' };
+      try { return updJson(a.start(String(url || ''), String(name || ''))); }
+      catch (e) { return { ok: false, error: '调用原生下载出错：' + e }; }
+    },
+
+    /** 查进度 → {ok, status, bytes, total, reason} */
+    state: function (id) {
+      var a = updRaw();
+      if (!a) return { ok: false, error: '这个版本不支持应用内下载' };
+      try { return updJson(a.state(id)); }
+      catch (e) { return { ok: false, error: '查下载进度出错：' + e }; }
+    },
+
+    /** 算已下载文件的 sha256；读不到返回空串（≠「算出来不一样」）。 */
+    sha256: function (id) {
+      var a = updRaw();
+      if (!a) return '';
+      try { return String(a.sha256(id) || ''); }
+      catch (e) { return ''; }
+    },
+
+    /** 拉起安装器：'' 成功 / 'need-permission' 缺授权 / 其余是原因 */
+    install: function (id) {
+      var a = updRaw();
+      if (!a) return 'fail: 这个版本不支持应用内安装';
+      try { return String(a.install(id) || ''); }
+      catch (e) { return 'fail: ' + e; }
+    },
+
+    canInstall: function () {
+      var a = updRaw();
+      if (!a) return false;
+      try { return !!a.canInstall(); } catch (e) { return false; }
+    },
+
+    openInstallSettings: function () {
+      var a = updRaw();
+      if (!a) return;
+      try { a.installSettings(); } catch (e) { /* 有些 ROM 没这个页面 */ }
+    },
+
+    cancel: function (id) {
+      var a = updRaw();
+      if (!a) return;
+      try { a.cancel(id); } catch (e) { /* 取消失败也不影响界面 */ }
+    },
+  };
+
+  // ------------------------------------------------------------------ 对外契约
+
+  /** 整份同步。**失败会强制真登一次再重来**，见下面的注释。 */
+  async function doSync(user, pwd) {
+    try {
+      return await doSyncOnce(user, pwd);
+    } catch (e) {
+      // 密码错是「用户重输一次就能解决」的，重试纯属白等。
+      // nottable = 学校没给出课表（没分班 / 没排课），重登一次还是同一句话 ——
+      // 而且那边有「点太快」防抖，白打两次反而更慢。
+      // 2026-11-11：loginPage 已经为「登录页这一关」自己重试过三次了，
+      // 所以 page（页面认不出来）/ session（登录态清不掉）这两档再整体重来一遍
+      // 只是让用户多等十来秒，结论一模一样 —— 直接如实报出去。
+      if (e && (e.kind === 'auth' || e.kind === 'nottable' ||
+                e.kind === 'page' || e.kind === 'session' ||
+                e.stage === 'login')) throw e;
+      // 🔴 为什么要这一层：
+      //    login() 开头有个短路 —— 「已经登录着同一个账号就直接用现成会话」。
+      //    这个短路是对的（不然拿不到加盐值），但它有个前提没被验证：
+      //    本地以为的「已登录」，服务器那边可能早就过期了。
+      //    这时 profile()/timetable() 会报「可能登录态过期了」，
+      //    而用户看到的是「明明登录过了，一刷新就失败」。
+      //    所以失败一次就把会话彻底丢掉，真登一次再来。
+      //    只重试一次：第二次还失败说明真有别的问题，如实报错。
+      loggedIn = false;
+      loggedUser = '';
+      idsCache = '';
+      examPageSeen = false;
+      projectReady = false;
+      clearCookies();
+      return await doSyncOnce(user, pwd);
+    }
+  }
+
+  async function doSyncOnce(user, pwd) {
+    idsCache = '';
+    examPageSeen = false;
+    projectReady = false;
+    await login(user, pwd);
+    // 🔴 2026-11-06：学籍 / 课表以前是裸调用，任何一页出问题都让整次绑定失败。
+    //    结果就是「学号密码明明对，就是绑不上」（有人一直卡在这儿）。
+    //    绑定的判据是**登录成功**，不是「每一页都读到了」。
+    //    **只兜 kind=nottable**（学校没给课表）。会话没了 / 学籍没建档要如实
+    //    失败 —— 带着一个死会话说「绑定成功」等于骗人。
+    var prof, profErr = '';
+    try {
+      prof = await profile();
+    } catch (e) {
+      if (!e || (e.kind !== 'nottable' && e.kind !== 'readfail')) throw e;
+      prof = {};
+      profErr = e.message || String(e);
+    }
+    var tt, ttErr = '', ttDiag = '';
+    try {
+      tt = await timetable();
+    } catch (e) {
+      if (!e || (e.kind !== 'nottable' && e.kind !== 'readfail')) throw e;
+      tt = { semester: '', unitCount: 0, totalWeeks: 0, courses: [], empty: true };
+      ttErr = e.message || String(e);
+      ttDiag = (e && e.diag) || '';
+    }
+    // 成绩单独兜一层，理由同 Python 版 Service.sync：没有成绩不是错误，
+    // 解析失败也不能把整次绑定连课表一起带走。
+    var gr;
+    try {
+      gr = await grades();
+    } catch (e) {
+      gr = {
+        summary: [], overall: null, courses: [],
+        error: (e && e.message) || String(e),
+      };
+    }
+    var ex;
+    // 考试表单独兜一层：万一考试页结构变了，不能把整个同步拖垮
+    try {
+      ex = await exams();
+    } catch (e) {
+      ex = { exams: [], published: false, error: (e && e.message) || String(e) };
+    }
+    // 学期列表是「考试页能选学期」的前提，属于附加信息：
+    // 取不到照样交出考试数据，只把原因写进 semestersError，界面照实说。
+    try {
+      ex.semesters = await semesters();
+    } catch (e) {
+      ex.semesters = [];
+      ex.semestersError = (e && e.message) || String(e);
+    }
+    // 培养计划同理：它只影响「学分进度」那一块。取不到不能让整次同步失败，
+    // 但**也不能安静地变成「没有培养计划」** —— 那会把「没读到」说成
+    // 「学校没给你排计划」，学生看了会以为出了大事。原因原样带回去。
+    var pl;
+    try {
+      pl = await plan();
+    } catch (e) {
+      pl = {
+        total: 0, cats: [], courses: [], subs: [],
+        error: (e && e.message) || String(e),
+      };
+    }
+    var out = {
+      ok: true,
+      syncedAt: Math.floor(Date.now() / 1000),
+      profile: prof,
+      semester: tt.semester,
+      unitCount: tt.unitCount,
+      totalWeeks: tt.totalWeeks,
+      courses: tt.courses,
+      grades: gr,
+      exams: ex,
+      plan: pl,
+    };
+    // 只在真出问题时才带这两个键：老前端不认识也不受影响，新前端见到就知道
+    // 「这块是没读到，不是没有」。
+    if (ttErr) out.timetableError = ttErr;
+    if (ttDiag) out.timetableDiag = ttDiag;
+    if (profErr) out.profileError = profErr;
+    return out;
+  }
+
+  // ------------------------------------------------------------- 校园公告
+  //
+  // 网页版走 bridge.py 的 notice.py；APK 里没有 Python，所以这一份是它的
+  // **逐条对照实现**。两边返回的 JSON 必须一模一样（app.js 只认一套）：
+  //   {ok, at, cached, total, items:[{title,url,date,source,dept,keep,tier,tags,drop}],
+  //    failed:[{source,status,count}], sources:N}
+  //
+  // 🔴 公告跟教务系统那套**完全无关**：六个源都是学校各部门的公开网页，
+  //    不需要登录、不需要 cookie、也不能带任何凭据。
+  //    所以这里一律用很小的请求间隔 —— 1.2 秒那是为了别把同一个教务系统
+  //    打疼，而这里是 6 个不同域名各一次。
+
+  var NOTICE_GAP = 220;
+  var NOTICE_TTL = 30 * 60 * 1000;
+  var noticeCache = { at: 0, data: null };
+
+  // 选源时先看栏目还在不在更新：教务处「教务通知」「教学通知」都停在 2023 年，
+  // 停更栏目留着只会让公告栏看起来像坏了。
+  var NOTICE_SOURCES = [
+    ['校级通知', 'https://www.zua.edu.cn/xwzx/tzgg.htm', '学校'],
+    ['学籍通知', 'https://jwc.zua.edu.cn/xjgl/xjtz.htm', '教务处'],
+    ['实践通知', 'https://jwc.zua.edu.cn/sjjx/sjtz.htm', '教务处'],
+    ['团委通知', 'https://tuanwei.zua.edu.cn/tzgg.htm', '团委'],
+    ['后勤动态', 'https://hqfwzgs.zua.edu.cn/', '后勤管理处'],
+    ['信息中心', 'https://xxglzx.zua.edu.cn/xwzx/tzgg.htm', '信息管理中心']
+  ];
+  // 详情只允许抓校内域名。否则 ?u=http://evil/... 就成了
+  // 「让用户的手机替我访问内网」的一个洞。
+  var NOTICE_HOSTS = ['zua.edu.cn'];
+
+  var N_DROP = [
+    ['附小', ['附小', '附属小学', '幼儿园']],
+    ['值班表', ['值班表']],
+    ['会议新闻', ['工作会议', '教学例会', '工作例会', '见面交流会', '座谈会',
+                  '调研交流', '来校调研']],
+    ['采购招标', ['采购公告', '中标', '招标', '询价']],
+    ['党建公示', ['代表候选人', '党支部', '党委会', '民主生活会', '述职']],
+    ['继续教育', ['继续教育招生', '成人教育招生', '自考招生']]
+  ];
+  var N_IMPACT = ['割接', '停水', '停电', '断网', '封楼', '封闭', '闭馆', '维修',
+                  '检修', '调休', '停课', '暂停开放', '交通管制', '禁行', '施工',
+                  '停运', '临时调整'];
+  var N_ACTION = ['报名', '缴费', '申报', '提交', '补办', '办理', '确认', '注册',
+                  '选课', '转专业', '分流', '评教', '申请', '领取', '资格审核',
+                  '资格审查', '学籍异动', '毕业论文', '实习', '学业警示', '学生证',
+                  '医保', '参保', '团籍', '推优'];
+  var N_ACTIVITY = ['校庆', '庆典', '晚会', '比赛', '竞赛', '讲座', '报告会', '展览',
+                    '文化节', '运动会', '演出', '招募', '社团', '升旗', '论坛',
+                    '沙龙', '典礼', '开放日', '发放', '餐券', '福利', '月饼', '慰问',
+                    '志愿服务', '社会实践', '表彰'];
+  var N_COHORT = ['新生', '毕业生', '本科生', '团员', '党员', '实习生', '在校生',
+                  '学生', '同学', '2026级', '2027届', '2026届', '2025级', '全校师生'];
+
+  function nHasAny(title, kws) {
+    for (var i = 0; i < kws.length; i++) if (title.indexOf(kws[i]) >= 0) return true;
+    return false;
+  }
+
+  /** 与 notice.py 的 classify() 同规则，返回 {keep, tier, tags, drop}。
+   *  层级：impact / action / activity / other / drop。 */
+  function nClassify(title) {
+    for (var i = 0; i < N_DROP.length; i++) {
+      if (nHasAny(title, N_DROP[i][1])) {
+        return { keep: false, tier: 'drop', tags: [], drop: N_DROP[i][0] };
+      }
+    }
+    if (nHasAny(title, N_IMPACT)) return { keep: true, tier: 'impact', tags: ['影响出行'], drop: '' };
+    if (nHasAny(title, N_ACTION)) return { keep: true, tier: 'action', tags: ['要办事'], drop: '' };
+    if (nHasAny(title, N_ACTIVITY)) return { keep: true, tier: 'activity', tags: ['活动'], drop: '' };
+    // 「学生 / 同学」这类受众词只用来兜住剩下的，不单独打标签 ——
+    // 打上去等于每条都挂一个「学生」，等于没分类。
+    return { keep: true, tier: 'other', tags: [], drop: '' };
+  }
+
+  function nPad2(n) { return (n < 10 ? '0' : '') + n; }
+
+  var N_DATE_RE = /(20\d{2})[-/年.](\d{1,2})[-/月.](\d{1,2})/;
+
+  function nUnescape(s) {
+    var t = document.createElement('textarea');
+    t.innerHTML = String(s == null ? '' : s);
+    return t.value;
+  }
+
+  /** 去标签 + 反转义 + 去首尾空白。和 notice.py 的 _clean() 同义。 */
+  function nCleanText(s) {
+    return nUnescape(String(s == null ? '' : s).replace(/<[^>]+>/g, '')).trim();
+  }
+
+  function nFmtDate(m) {
+    return m[1] + '-' + nPad2(+m[2]) + '-' + nPad2(+m[3]);
+  }
+
+  /** 链接附近的日期。**先看链接后面，再看前面** —— 顺序不能反。
+   *  校级站的列表是 `<li><a …>标题</a><span>2026-10-09</span></li>`，
+   *  先看前面的话窗口左边会命中**上一条**的日期，整列日期集体错位一行，
+   *  而且看上去完全正常（每条都有日期、格式也对）。 */
+  function nDateAround(html, start, end) {
+    var m = N_DATE_RE.exec(nCleanText(html.slice(end, end + 300)));
+    if (!m) m = N_DATE_RE.exec(nCleanText(html.slice(Math.max(0, start - 300), start)));
+    return m ? nFmtDate(m) : '';
+  }
+
+  function nAbsUrl(href, base) {
+    try { return new URL(href, base).href; } catch (e) { return ''; }
+  }
+
+  /** 列表页 → 条目。按**链接形状**找（/info/数字/数字.htm），不按容器找：
+   *  六个部门站的模板不一样，按容器写要写六个解析器。
+   *
+   *  🔴 这里刻意用正则扫原始 HTML，而不是 DOMParser —— 必须和 notice.py 的
+   *     parse_list 是**同一个算法**。用 DOM 的「往上找祖先」写法看着更漂亮，
+   *     但它和 Python 取日期的边界不一样（实测校级站 6/9 条日期不一致），
+   *     结果就是「网页版日期对、手机上错一行」，而且两边都不报错。
+   */
+  function nParseList(html, base) {
+    var re = /href="([^"]*?info\/\d+\/\d+\.htm)"/gi;
+    var out = [], seen = {};
+    var m;
+    while ((m = re.exec(html)) !== null) {
+      var url = nAbsUrl(m[1], base);
+      if (!url || seen[url]) continue;
+      var tail = html.slice(m.index, m.index + 400);
+      var tm = /title="([^"]{4,120})"/.exec(tail);
+      var title;
+      if (tm) {
+        title = nCleanText(tm[1]);
+      } else {
+        var am = /<a[^>]*>([\s\S]*?)<\/a>/i.exec(tail);
+        title = am ? nCleanText(am[1]) : '';
+      }
+      if (title.length < 5) continue;
+      seen[url] = 1;
+      out.push({ title: title, url: url, date: nDateAround(html, m.index, m.index + m[0].length) });
+    }
+    return out;
+  }
+
+  /** 正文 → 纯文本，块级元素之间补换行。
+   *  🔴 必须保留换行：后面抠「时间 / 地点」全靠一行一行的结构，
+   *     textContent 拍平成一整行之后，所有标签都黏在一起。 */
+  function nStripBody(html) {
+    var s = String(html || '')
+      .replace(/<script[\s\S]*?<\/script>|<style[\s\S]*?<\/style>/gi, '')
+      .replace(/<br\s*\/?>|<\/p>|<\/div>|<\/li>|<\/tr>|<\/h\d>/gi, '\n')
+      .replace(/<[^>]+>/g, '');
+    return nUnescape(s);
+  }
+
+  var N_PAIR_SRC = '([\\u4e00-\\u9fa5]{2,8})[：:]\\s*([^：:]{1,60}?)(?=\\s+[\\u4e00-\\u9fa5]{2,8}[：:]|$)';
+  // 「发布时间」「更新时间」「浏览次数」不是活动时间。教务处的页面把这两件事
+  // 写在同一行（发布时间：2026-10-20文章来源：实践教学科），只按「标签里有
+  // 『时间』」去取，会把**发布日期**当成活动时间显示出来 —— 比不显示更坏。
+  var N_SKIP_LABEL = ['发布', '更新', '浏览'];
+
+  function nPickPair(lines, want) {
+    for (var i = 0; i < lines.length; i++) {
+      var re = new RegExp(N_PAIR_SRC, 'g');
+      var m;
+      while ((m = re.exec(lines[i])) !== null) {
+        var skip = false;
+        for (var k = 0; k < N_SKIP_LABEL.length; k++) {
+          if (m[1].indexOf(N_SKIP_LABEL[k]) >= 0) { skip = true; break; }
+        }
+        if (skip) continue;
+        for (var w = 0; w < want.length; w++) {
+          if (m[1].indexOf(want[w]) >= 0) return m[2].trim();
+        }
+      }
+    }
+    return '';
+  }
+
+  function nGrabNext(lines, labels, span) {
+    span = span || 3;
+    for (var i = 0; i < lines.length; i++) {
+      var l = lines[i];
+      if (l.length > 24) continue;
+      var skip = false;
+      for (var k = 0; k < N_SKIP_LABEL.length; k++) {
+        if (l.indexOf(N_SKIP_LABEL[k]) >= 0) { skip = true; break; }
+      }
+      if (skip) continue;
+      var hit = false;
+      for (var w = 0; w < labels.length; w++) if (l.indexOf(labels[w]) >= 0) { hit = true; break; }
+      if (!hit) continue;
+      var buf = [];
+      for (var n = i + 1; n <= i + span && n < lines.length; n++) {
+        if (/^[一二三四五六七八九十]+、/.test(lines[n])) break;
+        buf.push(lines[n]);
+      }
+      if (buf.length) return buf.join(' ').slice(0, 140);
+    }
+    return '';
+  }
+
+  // 正文从哪一句开始：不同部门模板不一样，教务处直接就是「各学院：」，
+  // 少了这一项那一大批通知的摘要会整篇为空。
+  var N_BODY_START = /(各有关单位|各部门|各单位|各学院|各系|各教学单位|各二级学院|全校师生|全体学生|各位同学|同学们)/;
+  var N_BODY_END = /(下一条|上一条|关闭窗口|版权所有|ICP备|浏览次数)/;
+
+  function nParseArticle(html) {
+    var raw = nStripBody(html).split('\n');
+    var lines = [];
+    for (var i = 0; i < raw.length; i++) {
+      var t = raw[i].replace(/^[\s\u00a0]+|[\s\u00a0]+$/g, '');
+      if (t) lines.push(t);
+    }
+
+    var dept = '', pub = '';
+    for (var j = 0; j < lines.length && j < 400; j++) {
+      var m = /(?:日期|发布时间|发布日期)[：:]\s*(20\d{2}-\d{2}-\d{2})/.exec(lines[j]);
+      if (m) pub = m[1];
+      var m2 = /(?:作者|文章来源|来源)[：:]\s*(\S{2,30})/.exec(lines[j]);
+      if (m2 && !dept) dept = m2[1];
+      if (pub && dept) break;
+    }
+
+    var when = nPickPair(lines, ['时间']) ||
+               nGrabNext(lines, ['活动时间', '举办时间', '会议时间', '报名时间', '活动日期', '时间']);
+    var where = nPickPair(lines, ['地点', '场地']) ||
+                nGrabNext(lines, ['活动地点', '举办地点', '会议地点', '活动场地', '地点']);
+    if (!when) {
+      for (var k = 0; k < lines.length; k++) {
+        var m3 = /\d{1,2}\s*月\s*\d{1,2}\s*日[^\n]{0,40}?\d{1,2}\s*[:：]\s*\d{2}/.exec(lines[k]);
+        if (m3) { when = m3[0].slice(0, 140); break; }
+      }
+    }
+
+    // 正文摘要：跳过导航（前面几十行全是栏目名），从问候语之后取。
+    // ⚠️ 不能光看「句子里有没有『各单位』」—— 正文中间会出现
+    //    「（二）各单位组织讲解」这种句子，一匹配就从那儿开始截。
+    var body = [], started = false;
+    for (var a = 0; a < lines.length; a++) {
+      if (!started) {
+        if (N_BODY_START.test(lines[a]) && (lines[a].length <= 30 || /^(各|全体|各位)/.test(lines[a]))) {
+          started = true;
+        }
+        continue;
+      }
+      if (N_BODY_END.test(lines[a])) break;
+      if (lines[a].length >= 8) body.push(lines[a]);
+      if (body.join('').length > 500) break;
+    }
+
+    if (!body.length) {
+      // 兜底：从「发布时间 / 文章来源」那行之后开始，至少别让界面
+      // 显示成「这篇文章没有正文」。
+      var metaI = -1;
+      for (var b = 0; b < lines.length; b++) {
+        if (/(发布时间|文章来源|发布日期|日期[：:])/.test(lines[b])) { metaI = b; break; }
+      }
+      if (metaI >= 0) {
+        for (var c = metaI + 1; c < lines.length; c++) {
+          if (N_BODY_END.test(lines[c])) break;
+          if (lines[c].length >= 8) body.push(lines[c]);
+          if (body.join('').length > 500) break;
+        }
+      }
+    }
+
+    return { publish: pub, dept: dept, when: when, where: where,
+             summary: body.join('\n').slice(0, 500) };
+  }
+
+  async function nFetchList(limit, force) {
+    var now = Date.now();
+    if (!force && noticeCache.data && now - noticeCache.at < NOTICE_TTL) {
+      var copy = JSON.parse(JSON.stringify(noticeCache.data));
+      copy.cached = true;
+      return copy;
+    }
+
+    var all = [], failed = [];
+    for (var i = 0; i < NOTICE_SOURCES.length; i++) {
+      var name = NOTICE_SOURCES[i][0];
+      var url = NOTICE_SOURCES[i][1];
+      var dept = NOTICE_SOURCES[i][2];
+      var r = null;
+      // 单个源失败绝不能拖垮整体：6 个源坏 1 个，另外 5 个照样要出内容。
+      try { r = await http('GET', url, '', '', NOTICE_GAP); } catch (e) { r = null; }
+      var items = (r && r.status === 200) ? nParseList(r.body, url) : [];
+      if (!r || r.status !== 200 || !items.length) {
+        // 🔴 失败要往上报，不能安静地少一块 —— 否则「今天只有 3 条」
+        //    看不出是「真的只有 3 条」还是「5 个源没取到」。
+        failed.push({ source: name, status: (r && r.status) || 0, count: items.length });
+      }
+      for (var j = 0; j < items.length; j++) {
+        var it = items[j];
+        it.source = name;
+        it.dept = dept;
+        var cls = nClassify(it.title);
+        it.keep = cls.keep;
+        it.tier = cls.tier;
+        it.tags = cls.tags;
+        it.drop = cls.drop;
+        all.push(it);
+      }
+    }
+
+    var uniq = [], seen = {};
+    for (var k = 0; k < all.length; k++) {
+      var key = all[k].url.split('/info/').pop();
+      if (seen[key]) continue;
+      seen[key] = 1;
+      uniq.push(all[k]);
+    }
+    uniq.sort(function (x, y) {
+      return String(y.date || '0000').localeCompare(String(x.date || '0000'));
+    });
+
+    var kept = [];
+    for (var q = 0; q < uniq.length; q++) if (uniq[q].keep) kept.push(uniq[q]);
+
+    var data = {
+      ok: true,
+      at: Math.floor(now / 1000),
+      cached: false,
+      total: uniq.length,
+      items: kept.slice(0, limit),
+      failed: failed,
+      sources: NOTICE_SOURCES.length - failed.length
+    };
+    noticeCache = { at: now, data: data };
+    return JSON.parse(JSON.stringify(data));
+  }
+
+  async function nFetchDetail(url) {
+    var host = '';
+    try { host = new URL(url).hostname.toLowerCase(); } catch (e) { host = ''; }
+    var okHost = false;
+    for (var i = 0; i < NOTICE_HOSTS.length; i++) {
+      var h = NOTICE_HOSTS[i];
+      if (host === h || host.slice(-(h.length + 1)) === '.' + h) { okHost = true; break; }
+    }
+    if (!okHost) return { ok: false, error: '只能查看校内站点的通知' };
+
+    var r = null;
+    try { r = await http('GET', url, '', '', NOTICE_GAP); } catch (e) {
+      return { ok: false, error: '打开通知失败：' + e };
+    }
+    if (!r || r.status !== 200) {
+      return { ok: false, error: '通知未打开，请稍后再试' };
+    }
+    var d = nParseArticle(r.body);
+    d.ok = true;
+    d.url = url;
+    return d;
+  }
+
+  // ------------------------------------------------------------- 智慧门户
+  //
+  // 与 bridge.py 的 portal.py 一一对应，逻辑必须一致（有对照测试）。
+  // 三条硬规矩照抄，别绕过：
+  //   1. 🔴 绝不自动识别验证码 —— 门户错 5 次锁号，而「识别错了」和
+  //      「密码打错了」在服务器那边是同一个计数器。
+  //   2. 🔴 判据是「需要登录的接口返回 200」，不是「cookie 在不在」。
+  //   3. 🔴 过期就说过期，不把「没读到」显示成「没有数据」。
+  //
+  // 门户是「门票 + 身份证」两层：
+  //   customsid + Authorization（rhmh 域）= 门票，几小时作废
+  //   CASTGC（sfrz 域）= 身份证，拿它 POST /v1/tickets/{TGT} 就能换新门票，
+  //   不用密码也不用验证码。所以日常刷新是零成本的。
+  //
+  // ⚠️ 这里的 `tgt`（身份证）存在 localStorage 里，**不用 cookie**：
+  //   换票靠的是 URL 里那个 TGT 本身，不需要它变成 cookie。
+  //   而 `Authorization` 是服务器 Set-Cookie 下发的，JS 读不到，
+  //   只能通过 Android.cookie() 从原生的 CookieStore 里取。
+
+  var PF = {
+    SF: 'https://sfrz.zua.edu.cn/lyuapServer',
+    RH: 'https://rhmh.zua.edu.cn',
+    SERVICE: 'https://rhmh.zua.edu.cn/shiro-cas',
+    CARD: '1b1029d961e94aa196fb7f0ec072d622',
+    KEY: 'hyPortal',
+    // 上次「保活」的时间戳（毫秒）。见 pfKeepAlive。
+    TOUCH: 'hyPortal.touchAt',
+    EXP: 65537,
+    // 门户 app.js 里的 public_exponent / modulus 两个字面量
+    N: '00b5eeb166e069920e80bebd1fea4829d3d1f3216f2aabe79b6c47a3c18dcee5' +
+       'fd22c2e7ac519cab59198ece036dcf289ea8201e2a0b9ded307f8fb704136eaeb' +
+       '670286f5ad44e691005ba9ea5af04ada5367cd724b5a26fdb5120cc95b6431604' +
+       'bd219c6b7d83a6f8f24b43918ea988a76f93c333aa5a20991493d4eb1117e7b1',
+  };
+
+  var pfCap = null;          // {uid, at} 验证码是一次性的，只活在这台手机的内存里
+  var pfMod = null;
+
+  function pfModulus() {
+    if (!pfMod) pfMod = BigInt('0x' + PF.N);
+    return pfMod;
+  }
+
+  /** 大整数模幂。e=65537 = 2^16+1，其实只有 17 轮，快到可以忽略。 */
+  function pfModPow(b, e, n) {
+    var r = 1n;
+    b = b % n;
+    while (e > 0n) {
+      if (e & 1n) r = (r * b) % n;
+      b = (b * b) % n;
+      e >>= 1n;
+    }
+    return r;
+  }
+
+  /** 门户要求的密码加密。
+   *
+   *  ⚠️ **不是**标准 PKCS#1 v1.5。门户用的是老版 jsbn（标志是
+   *     `setMaxDigits(131)` 加三参数 `RSAKey(e, "", n)`），它把密码字节
+   *     按**小端**当整数用、末尾补 0 到分组长度，然后直接 pow(m, e, n)，
+   *     没有任何随机填充。
+   *     我一开始按标准 PKCS#1（大端 + 随机填充）写，服务器回 PASSERROR
+   *     （密码错）—— 而它分不清「解不开」和「密码不对」，看着就像密码记错了。
+   *     现在的实现和浏览器发出去的密文**逐字节一致**（portal.py 里同一份逻辑）。
+   */
+  function pfRsa(text) {
+    var bytes = utf8Bytes(String(text));
+    if (bytes.length > 126) throw new Error('密码太长了');
+    var m = 0n;
+    for (var i = bytes.length - 1; i >= 0; i--) m = (m << 8n) | BigInt(bytes[i]);
+    var hex = pfModPow(m, BigInt(PF.EXP), pfModulus()).toString(16);
+    while (hex.length < 256) hex = '0' + hex;
+    return hex;
+  }
+
+  function pfState() {
+    try { return JSON.parse(localStorage.getItem(PF.KEY) || '{}') || {}; }
+    catch (e) { return {}; }
+  }
+
+  function pfSaveState(st) {
+    try { localStorage.setItem(PF.KEY, JSON.stringify(st || {})); }
+    catch (e) { /* 存不下就只活这一次，不影响本次使用 */ }
+  }
+
+  /** 门票（JWT）。服务器用 Set-Cookie 下发，JS 自己读不到，只能问原生。 */
+  function pfJwt() {
+    try {
+      if (!window.Android || typeof Android.cookie !== 'function') return '';
+      return String(Android.cookie(PF.RH + '/', 'Authorization') || '');
+    } catch (e) { return ''; }
+  }
+
+  /* ---------------- 门户密码：存本机，过期重登只剩一道验证码 ----------------
+   *
+   * 为什么要存：门户那张 CASTGC（身份证）撑不过 7.2 小时，过期只能重新登录，
+   * 而登录要「密码 + 算术验证码」。密码留在本机之后，人只需要算那道题 ——
+   * 验证码不能自动识别（错 5 次锁号），所以这是能省的最大值。
+   *
+   * 🔴 密码走原生 CredStore（Android Keystore，和教务那份同一套机制），
+   *    **绝不进 localStorage** —— 那里是明文，一个 `localStorage.getItem` 就拿到了。
+   * 🔴 也绝不放进任何 HTTP 响应体（/api/portal/status 只回「存的是哪个学号」）。
+   */
+  function pfCredLoad() {
+    try {
+      if (!window.Android || typeof Android.loadPortalCred !== 'function') return null;
+      var s = String(Android.loadPortalCred() || '');
+      if (!s) return null;
+      var o = JSON.parse(s);
+      return (o && o.u && o.p) ? { u: String(o.u), p: String(o.p) } : null;
+    } catch (e) { return null; }
+  }
+
+  /** 存门户密码。
+   *
+   *  返回：'' = 存好了（Keystore）；'soft' = 存好了但走的是备用加密方式；
+   *        'fail: xxx' = 没存上，xxx 是原因；'none' = 这个壳没有这个能力。
+   *
+   *  🔴 必须把原生给的**原因**带回去。以前这里把返回值丢掉了，存失败时
+   *     界面上一句提示都没有 —— 用户只会觉得「它根本没记住密码」，
+   *     而真正的原因（密钥库不可用 / 写文件失败）永远看不到，也没法自救。
+   */
+  function pfCredSave(u, p) {
+    try {
+      if (!window.Android || typeof Android.savePortalCred !== 'function') return 'none';
+      return String(Android.savePortalCred(String(u || ''), String(p || '')) || '');
+    } catch (e) {
+      return 'fail: 调用原生保存出错（' + ((e && e.message) || e) + '）';
+    }
+  }
+
+  function pfCredClear() {
+    try {
+      if (window.Android && typeof Android.clearPortalCred === 'function') Android.clearPortalCred();
+    } catch (e) { /* 清不掉也只能这样 */ }
+  }
+
+  /** 本机门户密码的状态："none" 没存过 / "ok" 存着且解得开 /
+   *  "broken" 存着但解不开（系统密钥库被重置过）。空串 = 这个壳没这能力。
+   *
+   *  为什么要单独问一次：`saved` 只回答「能不能用」，回答不了
+   *  「是从来没存过，还是存过但坏了」—— 这两种情况给用户的话不一样。 */
+  function pfCredState() {
+    try {
+      if (!window.Android || typeof Android.portalCredState !== 'function') return '';
+      return String(Android.portalCredState() || '');
+    } catch (e) { return ''; }
+  }
+
+  /** 门户错误码（PASSERROR / CODEFALSE / …）。认不出来就是空串 ——
+   *  「不知道」和「不是密码错」必须分开，调用方靠它决定要不要删本机密码。 */
+  function pfCode(j) {
+    if (!j || typeof j !== 'object') return '';
+    var nodes = [j.data, j.meta, j];
+    for (var i = 0; i < nodes.length; i++) {
+      var n = nodes[i];
+      if (!n || typeof n !== 'object') continue;
+      var c = String(n.code || '');
+      if (c) return c;
+    }
+    return '';
+  }
+
+  /** 只有这几种才允许把本机那份密码删掉。CODEFALSE（验证码算错）不在此列 ——
+   *  手滑一次就把密码删了，用户下次还得重输，等于白存。 */
+  var PF_PWD_BAD = ['PASSERROR', 'NOUSER', 'USERLOCK'];
+
+  /** 从 JWT 里取学号。用正则而不是 JSON.parse —— payload 是 base64，
+   *  要先做 UTF-8 解码，而学号是纯数字，正则够用且不会因为编码炸掉。 */
+  function pfSub(jwt) {
+    try {
+      var p = String(jwt).split('.')[1].replace(/-/g, '+').replace(/_/g, '/');
+      while (p.length % 4) p += '=';
+      var m = /"sub"\s*:\s*"([^"]*)"/.exec(atob(p));
+      return m ? m[1] : '';
+    } catch (e) { return ''; }
+  }
+
+  function pfHeaders(jwt, json) {
+    var h = {
+      authorization: jwt || '',
+      accept: 'application/json, text/plain, */*',
+      languagetype: 'zh',
+      'x-requested-with': 'XMLHttpRequest',
+      referer: PF.RH + '/',
+      origin: PF.RH,
+    };
+    if (json) h['content-type'] = 'application/json';
+    return h;
+  }
+
+  /** 门户请求。
+   *
+   *  不走 http()：那个每次要等 POLITE_MS（1.2 秒）—— 那是为了别把脆弱的
+   *  教务系统打疼。门户不脆，而且一卡通要翻 3 页，每页等 1.2 秒就是四秒白等。
+   *  仍然复用同一套 id/回调通道，所以 window.__nativeDone 不用改。
+   */
+  function pfHttp(method, url, body, headers) {
+    return new Promise(function (resolve, reject) {
+      var id = ++seq;
+      waiting[id] = { resolve: resolve, reject: reject };
+      try {
+        if (window.Android && typeof Android.req2 === 'function') {
+          Android.req2(id, method, url, body || '', '',
+                       headers ? JSON.stringify(headers) : '');
+        } else {
+          // 老壳没有 req2（不带自定义头）。门户接口会 401，但不会崩，
+          // 而且 status 那边会如实说「没连上」。
+          Android.req(id, method, url, body || '', '');
+        }
+      } catch (e) {
+        delete waiting[id];
+        reject(new Error('原生请求失败：' + e));
+      }
+    });
+  }
+
+  function pfExpired(msg) {
+    var e = new Error(msg || '门票过期');
+    e.expired = true;
+    return e;
+  }
+
+  /** 用身份证换门票。成功 true；身份证也过期了 false。 */
+  async function pfRenew() {
+    var st = pfState();
+    if (!st.tgt) return false;
+    var r = null;
+    try {
+      r = await pfHttp('POST', PF.SF + '/v1/tickets/' + encodeURIComponent(st.tgt),
+                       form({ service: PF.SERVICE }));
+    } catch (e) { throw new Error('连不上学校门户，请检查网络'); }
+    var ticket = (r && r.status === 200) ? String(r.body || '').trim() : '';
+    if (ticket.indexOf('ST-') !== 0) return false;      // 身份证也过期了
+    await pfHttp('GET', PF.SERVICE + '?ticket=' + encodeURIComponent(ticket));
+    await pfHttp('GET', PF.RH + '/');
+    return !!pfJwt();
+  }
+
+  /** 手上有没有「身份证」（TGT）。两条来源，顺序不能反。
+   *
+   *  ① 本机存的 `st.tgt` —— CAS REST 登录时服务端把 TGT 放在**响应体**里，
+   *     我们一直是把它当字符串存的（见 PF 常量上面那段注释）。
+   *  ② 罐子里的 `CASTGC` cookie —— **只有「在 WebView 里手动登录过一次」才有**。
+   *     CAS 的登录页会把 TGT 写进这张 cookie，它的值就是 TGT，可以直接用。
+   *
+   *  🔴 为什么必须两条都认（2026-10-27 用户真机截图）：
+   *     APK 的登录走 REST，**根本不会产生 CASTGC 这张 cookie**。
+   *     而 `WebActivity` 判断「有没有登录态」看的偏偏就是它 ⇒ 永远判成过期，
+   *     于是每点一个办事入口都弹一句「门户登录已过期」，然后真的落在登录页。
+   *     假话说了太多次，就没人再信那句提示了。
+   */
+  /** 手上所有可能是「身份证」（TGT）的值，**按新鲜度排好序**。
+   *
+   *  三条来源，顺序不能反：
+   *   ① WebView 罐里的 `CASTGC` —— 用户在 App 内的网页里登录过才有，最新鲜
+   *   ② 本机存的 `st.tgt` —— REST 登录时服务端把 TGT 放在**响应体**里
+   *   ③ Java 罐里的 `CASTGC` —— 换过票 / 手动登过之后回灌进来的
+   *
+   *  🔴 为什么返回**列表**而不是一个值（2026-10-28 用户第三次报「还要重登」）：
+   *     以前这里挑第一个「以 `TGT-` 开头」的返回，挑不到就当「本机没凭据」。
+   *     问题是「CASTGC 的值长什么样」是**服务端的实现细节**：
+   *       · Apereo CAS 原版：`TGT-1234-abcd-cas01`，`TGT-` 前缀成立
+   *       · 学校这套 lyuapServer：可能带自己的前缀，或者干脆是另一套编号
+   *     一旦前缀对不上，代码就静默判成「没有凭据」⇒ 不换票 ⇒ 裸开 ⇒
+   *     落回登录页。表现和「真的过期了」一模一样，而用户其实一直登着。
+   *
+   *     ⇒ 现在**不猜格式**：只要 cookie 里有个非空值就当候选，
+   *       拿去换票，换到了就说明它真是 TGT（服务端说了算，不是我们说了算）。
+   *
+   *  ⚠️ 探测路径要给全：`Android.cookie` / `Android.webCookie` 底层是
+   *     `CookieStore.get(uri)` / `CookieManager.getCookie(url)`，**只返回
+   *     Path 是 uri 路径前缀的 cookie**。CASTGC 的 Path 可能是 `/lyuapServer`、
+   *     `/lyuapServer/login`，也可能是 `/`。少写一条就少一次机会，而且不报错。
+   */
+  function pfTgtCands() {
+    var out = [];
+    var st = pfState();
+    var cands = ['https://sfrz.zua.edu.cn/lyuapServer/',
+                 'https://sfrz.zua.edu.cn/lyuapServer/login',
+                 'https://sfrz.zua.edu.cn/'];
+
+    function add(v, from) {
+      v = String(v || '').trim();
+      // 空值不候选：那通常是服务端下发的「删掉这条」
+      if (!v) return;
+      for (var i = 0; i < out.length; i++) {
+        if (out[i].v === v) return;        // 同一个值被两条路径问到，只留一份
+      }
+      out.push({ v: v, from: from });
+    }
+
+    // ---- 1) WebView 罐（最新鲜） ----
+    // 🔴 优先用 `webCookieLike`（按**前缀**取），不是 `webCookie`（精确名字）。
+    //    票 cookie 的名字是服务端实现细节：Apereo 原版叫 CASTGC，学校这套
+    //    lyuapServer 完全可能叫 CASTGC_xxx。精确匹配对不上就返回空串，
+    //    而空串和「确实没登录」长得一模一样 —— 这是最坑的那种失败。
+    try {
+      if (window.Android && typeof Android.webCookieLike === 'function') {
+        for (var wi = 0; wi < cands.length; wi++) {
+          var got = String(Android.webCookieLike(cands[wi], 'CASTGC') || '');
+          if (!got) continue;
+          var lines = got.split('\n');
+          for (var li = 0; li < lines.length; li++) add(lines[li], 'web');
+        }
+      } else if (window.Android && typeof Android.webCookie === 'function') {
+        // 老壳（没有 webCookieLike）退回精确匹配 —— 有总比没有强
+        for (var wj = 0; wj < cands.length; wj++) {
+          add(Android.webCookie(cands[wj], 'CASTGC'), 'web');
+        }
+      }
+    } catch (e) { /* 读不到就往下走 */ }
+
+    // ---- 2) 我们自己存的那张（门户登录成功后写进来的） ----
+    add(st.tgt, 'store');
+
+    // ---- 3) Java 罐 ----
+    try {
+      if (window.Android && typeof Android.cookie === 'function') {
+        for (var ci = 0; ci < cands.length; ci++) {
+          add(Android.cookie(cands[ci], 'CASTGC'), 'java');
+        }
+      }
+    } catch (e) { /* 读不到就当没有，下面会如实说「没有身份证」 */ }
+
+    return out;
+  }
+
+  /** 第一个候选。给只想要「有没有凭据」的调用方用（`pfRenew` 等）。
+   *
+   *  ⚠️ 别拿它做「有没有登录态」的判断 —— 那是 `pfTgtCands().length > 0`。
+   */
+  function pfTgt() {
+    var list = pfTgtCands();
+    if (!list.length) return '';
+    var v = list[0].v;
+    var st = pfState();
+    // 值没变就别重写：pfTgt 每次点功能都会调一次，白写盘没意义
+    if (st.tgt !== v && list[0].from !== 'store') pfSaveState({ tgt: v });
+    return v;
+  }
+
+  /** 保活：把门户会话「摸」一下，别让它闲到过期（2026-10-28）。
+   *
+   * ================================================================
+   * 为什么加这个（用户第三次说「智慧门户还是要重复登录」）
+   * ================================================================
+   * 门户的会话大约 7.2 小时不用就作废（见 app.js 里 loadCampus 上面那段）。
+   * 作废之后**没法自动重登**：学校的登录接口要验证码，而验证码只能人算
+   * （红线：绝不自动识别）。所以「过期」对用户就等于「再输一次密码 + 算一道题」。
+   *
+   * 以前 App 的策略是「尽量不碰门户」（省流量、省得每次进页面都等），
+   * 于是它**永远**是闲到过期的那一个 —— 一天要重登好几次。
+   *
+   * 这里换个思路：**偶尔摸一下**。CAS 的 TGT 通常是滑动过期（每次用就续上），
+   * 只要在窗口内用一次，会话就一直活着。
+   *
+   * ================================================================
+   * 四条纪律
+   * ================================================================
+   * 1. **最多每 2 小时一次**（`PF.TOUCH` 记账）。再多就是拿用户的流量换心安。
+   * 2. **先记账再发请求**。反过来的话，一次网络失败会让它每次进页面都重试，
+   *    等于把「省流量」变成「烧流量」。
+   * 3. **后台跑，不 await、不弹任何提示**。保活失败是**无害**的：
+   *    真过期了，后面 card/apps 会如实说 needLogin，用户照样知道。
+   *    这里弹一句「续期失败」只会让人以为坏了。
+   * 4. **没有身份证就别试**。省一次必然 404 的请求。
+   *
+   * ⚠️ 「学校 CAS 是不是滑动过期」我这边**验不了**（要真机 + 抓包）。
+   *    如果是绝对过期（到点就死，用不用都一样），这个保活不会有坏处，
+   *    只是也没用 —— 那就得换别的办法（比如引导用户去网页登录一次，
+   *    拿到可持久的 CASTGC）。
+   */
+  async function pfKeepAlive() {
+    try {
+      if (!pfTgtCands().length) return;
+      var last = Number(localStorage.getItem(PF.TOUCH) || 0) || 0;
+      if (last && Date.now() - last < 2 * 3600 * 1000) return;
+      try { localStorage.setItem(PF.TOUCH, String(Date.now())); } catch (e) { }
+      var r = await pfServiceTicket(PF.SERVICE);
+      if (!r || !r.ok) return;
+      // 拿到票还不算「用过」—— 拿它把门户自己的会话也续上（和 pfRenew 后半段一致）
+      await pfHttp('GET', PF.SERVICE + '?ticket=' + encodeURIComponent(r.ticket));
+    } catch (e) {
+      // 保活失败不影响任何功能，也不许冒泡成「未处理的 Promise 拒绝」
+    }
+  }
+
+  /** 拿身份证换一张**专门给某个办事系统**的票。
+   *
+   *  为什么要这么干：办事系统（学生信息管理、请假、打印中心…）都接的是
+   *  统一身份认证，进门要一张 CAS 票据。**票拼在地址后面**，系统自己拿去
+   *  CAS 验，验过就是登录态 —— 这条路完全不依赖 cookie，
+   *  所以它不受「两个罐子」那件事的影响。
+   *
+   *  🔴 和 `pfRenew()` 的区别：那个换的是**门户自己的**票（service 写死成
+   *     rhmh），只能让门户认你；办事系统要的是**以它自己地址为 service**
+   *     的票。票和 service 是绑定的，拿门户的票去开别的系统一律 INVALID_TICKET。
+   *
+   *  返回：{ok:true, ticket:'ST-...'}
+   *        {ok:false, why:'no-tgt'|'expired'|'net', error:'人话'}
+   */
+  async function pfServiceTicket(service) {
+    var list = pfTgtCands();
+    if (!list.length) return { ok: false, why: 'no-tgt', error: '还没有登录门户' };
+    var netFail = 0;
+    for (var i = 0; i < list.length; i++) {
+      var r = null;
+      try {
+        r = await pfHttp('POST', PF.SF + '/v1/tickets/'
+                         + encodeURIComponent(list[i].v), form({ service: service }));
+      } catch (e) {
+        netFail++;
+        continue;                       // 这一次网络抖了，换下一个候选再试
+      }
+      var t = (r && r.status === 200) ? String(r.body || '').trim() : '';
+      if (t.indexOf('ST-') === 0) {
+        // 换到了 ⇒ 服务端认这个值就是有效 TGT（不管它长什么样）。
+        // 记下来，下次不用再把三条来源全问一遍。
+        if (pfState().tgt !== list[i].v) pfSaveState({ tgt: list[i].v });
+        return { ok: true, ticket: t };
+      }
+    }
+    // 全部候选都被拒 = 真的都过期了；全部都没连上 = 网络问题。
+    // 这两种对用户是**两个不同的动作**（重新登录 / 换个网再试），不能合并。
+    if (netFail >= list.length) return { ok: false, why: 'net', error: '连不上学校门户' };
+    return { ok: false, why: 'expired', error: '门户登录过期了', tried: list.length };
+  }
+
+  /** 跑一次取数：门票过期就换一张再跑，身份证也过期才报 expired。 */
+  async function pfCall(fn) {    try {
+      return await fn();
+    } catch (e) {
+      if (!e || !e.expired) throw e;
+      if (!(await pfRenew())) {
+        throw pfExpired('门户登录过期，重新输密码和验证码');
+      }
+      return await fn();
+    }
+  }
+
+  /** 取数失败的统一形状。
+   *  🔴 expired 必须单独标出来：前端据此说「重新登录」。
+   *     把「网络抖了一下」说成「登录过期」会让用户白输一次密码和验证码
+   *     （门户错 5 次锁号）；反过来把「真过期了」说成「没读到」，
+   *     他会一直点刷新、一直没反应。 */
+  function pfFailBody(e) {
+    var b = { ok: false, error: String((e && e.message) || e) };
+    if (e && e.expired) b.needLogin = true;
+    return b;
+  }
+
+  async function pfCardPage(startpage) {
+    var jwt = pfJwt();
+    if (!jwt) throw pfExpired('还没有登录门户');
+    var r = await pfHttp('POST', PF.RH + '/api/upp/cardFrontlist/getCard/' + PF.CARD,
+                         JSON.stringify({ startpage: startpage, enablePagging: true }),
+                         pfHeaders(jwt, true));
+    if (!r || r.status !== 200) throw pfExpired();
+    var j = null;
+    try { j = JSON.parse(r.body); } catch (e) {
+      throw new Error('一卡通没读出来，门户可能改版了');
+    }
+    if (!j || !j.meta || !j.meta.success) throw new Error('一卡通本次未返回数据，请稍后再试');
+    var sd = (j.data || {}).serviceData || {};
+    var rows = Array.isArray(sd.data) ? sd.data : [];
+    var total = 0;
+    if (rows.length && rows[0]) total = parseInt(rows[0].pageTotalCount, 10) || 0;
+    return { rows: rows, total: total };
+  }
+
+  /** 一卡通余额 + 明细。
+   *  ⚠️ 字段是拼音缩写，猜不出来：RQ 时间 / XFZD 地点 / DBXF 单笔（本身带负号）
+   *     / ZCLX 类型 / YE 余额（**前面带一串空格**，不 trim 转不了数字）。 */
+  async function pfCard() {
+    return await pfCall(async function () {
+      var first = await pfCardPage(1);
+      var all = first.rows.slice();
+      var page = 2;
+      // 一页 12 条，33 条要 3 页。上限 4 页 —— 更早的历史对「最近花哪了」没意义。
+      while (all.length < first.total && page <= 4) {
+        var more = null;
+        try { more = await pfCardPage(page); } catch (e) { break; }
+        if (!more.rows.length) break;
+        all = all.concat(more.rows);
+        page++;
+      }
+      var out = [];
+      for (var i = 0; i < all.length; i++) {
+        var x = all[i] || {};
+        out.push({
+          time: String(x.RQ || '').trim(),
+          place: String(x.XFZD || '').trim(),
+          amount: pfNum(x.DBXF),
+          kind: String(x.ZCLX || '').trim(),
+        });
+      }
+      return {
+        balance: all.length ? pfNum(all[0].YE) : null,
+        rows: out,
+        total: first.total,
+      };
+    });
+  }
+
+  function pfNum(v) {
+    if (v == null) return null;
+    var n = parseFloat(String(v).replace(/,/g, '').trim());
+    return isNaN(n) ? null : n;
+  }
+
+  async function pfApps() {
+    return await pfCall(async function () {
+      var jwt = pfJwt();
+      if (!jwt) throw pfExpired('还没有登录门户');
+      // pageSize=-1 才是「一次全给」，写 10 或 20 只给第一页
+      var r = await pfHttp('GET', PF.RH + '/api/upp/appStore/queryApp'
+        + '?pageNum=1&pageSize=-1&excludeMobile=1', '', pfHeaders(jwt));
+      if (!r || r.status !== 200) throw pfExpired();
+      var j = null;
+      try { j = JSON.parse(r.body); } catch (e) {
+        throw new Error('应用列表没读出来');
+      }
+      var data = (j || {}).data;
+      if (!Array.isArray(data)) throw new Error('应用列表没读出来，门户可能改版了');
+      var out = [];
+      for (var i = 0; i < data.length; i++) {
+        var a = data[i] || {};
+        var url = String(a.appLink || a.mobileLink || '').trim();
+        var name = String(a.appName || '').trim();
+        if (!url || !name) continue;      // 没地址的入口点了也没反应，不如不显示
+        out.push({ name: name, dept: pfLabel(a), url: url,
+                   cas: String(a.isCas || '') === 'cas' });
+      }
+      return { apps: out };
+    });
+  }
+
+  /** 归属部门。`labelName` 是 `[{zh_CN:{labelName:'日常服务'}}]`，
+   *  但接口在某些应用上给空数组、给 null、或者干脆给个对象 —— 一律挡一遍，
+   *  别让一个畸形字段打断整张列表。 */
+  function pfLabel(a) {
+    var lab = a.labelName;
+    var first = Array.isArray(lab) ? lab[0] : lab;
+    if (!first || typeof first !== 'object') return '';
+    var zh = first.zh_CN;
+    if (!zh || typeof zh !== 'object') return '';
+    return String(zh.labelName || '').trim();
+  }
+
+  /** 拿一张验证码。`uid` 只留在内存里，**不回给页面** ——
+   *  这样它天然和这次会话绑定，也不会被页面上的脚本改掉（改了就等于帮用户答错）。 */
+  async function pfCaptcha() {
+    var r = await pfHttp('GET', PF.SF + '/kaptcha', '',
+                         { referer: PF.SF + '/login?service=' + PF.SERVICE,
+                           'x-requested-with': 'XMLHttpRequest' });
+    if (!r || r.status !== 200) throw new Error('无法获取验证码，请检查网络');
+    var j = null;
+    try { j = JSON.parse(r.body); } catch (e) { j = null; }
+    var uid = j && j.uid ? String(j.uid) : '';
+    var img = j && j.content ? String(j.content) : '';
+    if (!uid || img.indexOf('base64,') < 0) {
+      throw new Error('验证码没拿到，门户可能改版了');
+    }
+    var life = parseInt(j.timeout, 10) || 300;
+    // 留 15 秒余量：算得太慢的话服务端那边其实已经作废了，
+    // 这时候提交必然「验证码错误」，白消耗一次错误次数。
+    pfCap = { uid: uid, at: Date.now() + Math.max(30, life - 15) * 1000 };
+    return { ok: true, img: img, timeout: life };
+  }
+
+  async function pfLogin(user, pass, code) {
+    if (!pfCap || !pfCap.uid) {
+      return { ok: false, error: '验证码过期了，换一张重新算', needCaptcha: true };
+    }
+    if (Date.now() > pfCap.at) {
+      pfCap = null;
+      return { ok: false, error: '验证码过期了，换一张重新算', needCaptcha: true };
+    }
+    var uid = pfCap.uid;
+    pfCap = null;      // 🔴 一次性：不管成没成，这张都不能再用
+    var r = null;
+    try {
+      r = await pfHttp('POST', PF.SF + '/v1/tickets', form({
+        username: user,
+        password: pfRsa(pass),
+        service: PF.SERVICE,
+        loginType: '',
+        id: uid,
+        code: code,
+        otpcode: '',
+      }), { referer: PF.SF + '/login?service=' + PF.SERVICE,
+            origin: 'https://sfrz.zua.edu.cn',
+            'x-requested-with': 'XMLHttpRequest',
+            accept: 'application/json, text/plain, */*' });
+    } catch (e) {
+      return { ok: false, error: '连不上学校门户，请检查网络', needCaptcha: true };
+    }
+
+    var body = String((r && r.body) || '');
+    var j = null;
+    try { j = JSON.parse(body); } catch (e) { j = null; }
+    var tgt = pfFind(j, 'TGT-');
+    var ticket = pfFind(j, 'ST-');
+
+    if (tgt) pfSaveState({ tgt: tgt, user: user });
+    if (ticket) {
+      await pfHttp('GET', PF.SERVICE + '?ticket=' + encodeURIComponent(ticket));
+      await pfHttp('GET', PF.RH + '/');
+    }
+    if (!pfJwt()) {
+      // code 一并带出去：调用方要据此判断「是不是本机存的密码已经不对了」。
+      // 中文文案不能拿来做判断（改一句话就崩，而且不报错）。
+      return { ok: false, error: pfWhy(j, r), needCaptcha: true, code: pfCode(j) };
+    }
+    var who = pfSub(pfJwt()) || user;
+    pfSaveState({ tgt: tgt || (pfState().tgt || ''), user: who });
+    return { ok: true, user: who };
+  }
+
+  /** 在返回的 JSON 里递归找以某个前缀开头的字符串。
+   *  CAS 不同版本把票据放在 ticket / data.ticket / tgt 上，写死一层就是赌版本。 */
+  function pfFind(o, prefix, depth) {
+    depth = depth || 0;
+    if (depth > 6 || o == null) return '';
+    if (typeof o === 'string') return o.indexOf(prefix) === 0 ? o : '';
+    if (Array.isArray(o)) {
+      for (var i = 0; i < o.length; i++) {
+        var g = pfFind(o[i], prefix, depth + 1);
+        if (g) return g;
+      }
+      return '';
+    }
+    if (typeof o === 'object') {
+      if (typeof o.ticket === 'string' && o.ticket.indexOf(prefix) === 0) return o.ticket;
+      if (typeof o.tgt === 'string' && o.tgt.indexOf(prefix) === 0) return o.tgt;
+      for (var k in o) {
+        if (!Object.prototype.hasOwnProperty.call(o, k)) continue;
+        var v = pfFind(o[k], prefix, depth + 1);
+        if (v) return v;
+      }
+    }
+    return '';
+  }
+
+  /** 把服务端的拒绝理由翻成人话。**不猜** —— 认不出来就带上状态码，
+   *  别编一个「密码错误」去误导用户（他可能只是验证码算错了）。 */
+  function pfWhy(j, r) {
+    var MAP = {
+      CODEFALSE: '验证码算错了，换一张重算',
+      PASSERROR: '账号或密码不对',
+      NOUSER: '没有这个账号',
+      USERLOCK: '账号已锁定，请到网页版查看',
+      NOREGISTER: '这个账号还没开通门户',
+      NOAUTHORIZATION: '这个账号没有门户的使用权限',
+      ISMODIFYPASS: '门户要求先改密码，请去网页版改完再来',
+      NETWORKCOMMITMENT: '需先同意网络使用承诺书，请到网页版操作',
+    };
+    if (j && typeof j === 'object') {
+      var nodes = [j.data, j.meta, j];
+      for (var i = 0; i < nodes.length; i++) {
+        var n = nodes[i];
+        if (!n || typeof n !== 'object') continue;
+        if (MAP[n.code]) return MAP[n.code];
+        var m = String(n.message || '').trim();
+        if (m && m.toLowerCase() !== 'ok' && m.toLowerCase() !== 'success') {
+          return '门户拒绝了这次登录：' + m.slice(0, 60);
+        }
+      }
+    }
+    return '门户没给出登录凭据，可能是账号密码不对';
+  }
+
+  /* ==================================================================
+   * 学习通 · 作业待办（只读）
+   *
+   * 这份是 mobile/chaoxing.py 的手机端实现，逻辑一一对应。两套必须
+   * 拿同一份 HTML 对拍（_lab/cx/check_cx_js.py），否则手机上看到的
+   * 作业条数和电脑版不一样，而且不报错。
+   *
+   * 🔴 四条硬规矩（和 Python 那份完全一样）
+   *   1. 只读。不签到、不刷课、不自动答题、不代交。
+   *   2. 失败不重试。重试会把 needVcode 撞成 1，之后要人做滑块。
+   *   3. 「没读到」≠「没有作业」。拿不到的课记进 failed，不变成 0 条。
+   *   4. 不认识的作业状态不许兜底成「已完成」或「待办」。
+   *
+   * 🔴 两个 enc 必须来自同一次课程页加载：
+   *      stuenc  —— 藏在 302 之后的 URL 里，**每次进课程页都变**
+   *      workEnc —— 藏在 HTML 的 <input id="workEnc"> 里，课程级固定
+   *    混用旧的和新的 → 回「无权限的操作」，而 HTTP 状态码还是 200。
+   * ================================================================== */
+
+  var CXS = {
+    LOGIN_PAGE: 'https://passport2.chaoxing.com/login?fid=&refer=',
+    LOGIN_API: 'https://passport2.chaoxing.com/fanyalogin',
+    COURSE_API: 'https://mooc1-api.chaoxing.com/mycourse/backclazzdata?view=json&rss=1',
+    COURSE_REF: 'https://mooc2-ans.chaoxing.com/mooc2-ans/visit/interaction',
+    COURSE_PAGE: 'https://mooc1.chaoxing.com/visit/stucoursemiddle',
+    WORK_LIST: 'https://mooc1.chaoxing.com/mooc2/work/list',
+    // 考试列表。参数照抄 course-stu.js 点导航时的拼法 —— 缺一个就回
+    // 「参数传递不正确」，而 HTTP 状态码还是 200。
+    EXAM_LIST: 'https://mooc1.chaoxing.com/exam-ans/mooc2/exam/exam-list',
+    // 课程活动（签到/讨论/通知）。返回 JSON，比抓 HTML 稳得多。
+    // 🔴 fid 是**学校 id**（course.schoolId），不是课程页隐藏字段那个 id="fid"。
+    ACTIVE_LIST: 'https://mobilelearn.chaoxing.com/v2/apis/active/student/activelist',
+    CACHE: 'cx.cache',
+    USERKEY: 'cx.user',
+    // 自动续期的节流记录（见 cxAutoRelink）：{at: 上次试的毫秒, off: 停到几时}
+    RELINK: 'cx.relink'
+  };
+
+  // 🔴 「待互评」是**要我去评别人** ⇒ 算 todo。以前两边都不在，落到「其他」并被
+  //    排除在待办之外，等于把一件该做的事藏了。
+  // 🔴 「待批阅 / 已批阅」是**我已经交了**、等老师 ⇒ 算 done。全算「要交」会让人
+  //    一进门看到 76，滑三屏才发现只有 7 条真没交（2026-10-23 南师侧实测）。
+  //    改这里必须同步 chaoxing.py 的 TODO_STATES / DONE_STATES。
+  var CX_TODO = ['未交', '未开始', '待互评'];
+  var CX_DONE = ['已完成', '待批阅', '已批阅', '已互评'];
+
+  /** 精确匹配之外，再按**包含**认一遍（0.53.0，和 chaoxing.py 的
+   *  TODO_WORDS / DONE_WORDS 逐条对齐）。
+   *
+   *  🔴 2026-11-15 用户：「很多已经完成的作业还是不会自动变成已完成」。
+   *     根子在**这里**：APK 走的是本文件的扫描，而它一直只做精确匹配。
+   *     Python 那份 2026-11-09 就补过包含匹配，这边漏了 —— 于是同一份数据，
+   *     电脑上看是「已完成」，手机上还是「未完成」。两边必须一模一样，
+   *     对拍见 _lab/out/check_cx_js.py。
+   *
+   *  🔴 否定词必须先判：中文的「未完成」「未提交」都**包含**「完成」「提交」，
+   *     先判肯定词会把没做的说成做完了 —— 那比认不出来坏得多。
+   */
+  var CX_TODO_WORDS = ['未交', '未完成', '未提交', '未开始', '待提交', '待完成',
+                       '进行中', '未批阅'];
+  var CX_DONE_WORDS = ['已完成', '已提交', '已交', '已批阅', '待批阅', '已通过',
+                       '已互评', '已作答', '已参加'];
+
+  /** 考试：只有**明确表示已经考完/考过**的才算做完。
+   *  没见过的取值一律留在待办里 —— 宁可多显示一条，
+   *  也不能把一场还没考的考试藏起来。
+   *
+   *  🔴 0.46.0 补「待批阅」，和 chaoxing.py 的 DONE_EXAM_STATES 同步。
+   *     作业那边早就算 done（见上面 CX_DONE），考试这边漏了同一个词 ——
+   *     结果「2023级开学测试 · 待批阅」「2024-9-12课堂笔记提交 · 待批阅」
+   *     这种两年前的卷子天天挂在「2 条考试」里（用户 2026-11-06 截图）。
+   *     交卷后学习通给的就是「待批阅」，它和「我已经交了」是同义的。 */
+  var CX_DONE_EXAM = ['已完成', '已结束', '已交卷', '已参加', '待批阅', '已批阅', '已过期'];
+
+  /** activeType → 分类。表和 mobile/chaoxing.py 的 KIND_BUCKET 一致，
+   *  来源是学习通任务列表页的 Vue 模板（_lab/cx/ml/active_page.html）。 */
+  var CX_KIND_BUCKET = {
+    sign: ['2', '74'],      // 签到 / 签退
+    topic: ['5', '50'],     // 主题讨论
+    work: ['19'],           // 作业
+    notice: ['34', '45'],   // 通知。34 老版本 / 45 新版本，同一件事的两种 type。
+                            // 🔴 45 是南师侧拿原始响应实测的（content 里是老师名、
+                            //    extraInfo 里是 noticeId），不是猜的。只认 34 会让新版
+                            //    通知全落进「其他」。改这里必须同步 chaoxing.py。
+    // 随堂练习 / 互动练习（0.39.0）。用户 2026-11-01：「还很容易错过…还有随堂练习」。
+    // 以前落到 other，和「白板 / 教案 / PDF 文档」挤在同一格 —— 那格是垃圾桶，
+    // 真正的任务淹在里面等于没提示。单独一类，排在做作业后面。
+    quiz: ['42', '68']
+  };
+
+  /** activeType → 中文名。30 种，从模板里的 aria-label 逐条抄的。 */
+  var CX_ACTIVE_KIND = {
+    '2': '签到', '4': '抢答', '5': '主题讨论', '11': '选人', '14': '问卷',
+    '17': '直播', '19': '作业', '23': '评分', '34': '通知', '35': '分组任务',
+    '42': '随堂练习', '43': '投票', '45': '通知', '46': '群聊', '47': '计时器', '48': '课程章节',
+    '49': '白板', '50': '主题讨论', '51': '同步课堂', '56': '泛雅课堂',
+    '57': 'PPT文档', '58': '教案', '59': '抽签', '60': '教案', '61': 'WORD文档',
+    '62': 'PDF文档', '63': '阅读任务', '68': '互动练习', '74': '签退',
+    '75': '思政资源库', '77': 'AI实践'
+  };
+
+  var CX_KIND_ORDER = ['work', 'exam', 'quiz', 'sign', 'topic', 'notice', 'other'];
+
+  /** 活动详情页地址：按 activeType 分。
+   *  🔴 不是猜的，是从学习通活动列表页模板的 activeRowClick() 那个 switch 里抄的
+   *  （_lab/cx/ml/active_page.html）。参数只用课程对象里现成的
+   *  courseId / classId / fid（= schoolId）。和 chaoxing.py 的 ACTIVE_PAGE 一致。 */
+  var CX_BASE = 'https://mobilelearn.chaoxing.com';
+  var CX_ACTIVE_PAGE = {
+    '2': '/page/sign/signIn',                              // 签到
+    '74': '/page/sign/signIn',                             // 签退
+    '50': '/page/topicDiscuss/student/stu_reply_discuss',  // 主题讨论
+    '42': '/page/quiz/stu/answerQuestion2',                // 随堂练习
+    '14': '/page/quiz/stu/answerQuestion',                 // 问卷
+    '43': '/page/qvote/stu/answerQvote',                   // 投票
+    '68': '/page/interactivepractice/stu/answerQu'         // 互动练习
+  };
+
+  /** 每门课之间的间隔。加抖动，别让请求节奏整齐得像机器。
+   *
+   *  🔴 0.44.1：0.9 秒 → 1.8 秒。用户原话「点重新检查显示检查的太频繁了，
+   *     你把频率降低些」。
+   *
+   *     原来的算法有个自己骗自己的地方：这门课 4 个请求（课程页 / 作业 /
+   *     考试 / 活动）是**连发**的，中间不等，然后才 sleep。所以「间隔 0.9 秒」
+   *     真实节奏是「4 个请求挤在一瞬间，再停 1 秒」—— 30 门课就是 120 个请求
+   *     在四十来秒里砸过去，学习通那边直接 202。
+   *
+   *     现在两头都放缓：请求之间也隔一下（CX_REQ_GAP），课与课之间 1.8 秒。
+   *     一轮从约 45 秒变成约 2 分钟 —— 慢，但查得成比查得快重要。
+   */
+  var CX_GAP = 1800;
+  var CX_JITTER = 600;
+
+  /** 同一个学习通会话里，两个请求之间至少隔这么久（毫秒）。
+   *
+   *  为什么要在 cxHttp 里统一做，而不是在每个调用点加 sleep：
+   *  一门课 4 个请求分散在 cxScanAll / cxCourseMeta / cxWorkList / cxExamList /
+   *  cxActiveList 五个函数里，逐个加迟早漏一个；漏掉的那个正好就是「连发」
+   *  的那一发。节流放在唯一的出口上，谁都绕不过去。
+   *
+   *  ⚠️ 别调到 0：学习通认的就是请求频率，0 等于退回改之前的样子。
+   */
+  var CX_REQ_GAP = 450;
+  var cxLastReqAt = 0;          // cxHttp 的节流水位（毫秒时间戳）
+
+  /** 被 202 拦下之后的冷静期（秒）。
+   *
+   *  🔴 为什么不是「过几分钟再试」这种口头建议：学习通的风控窗口是分钟级的，
+   *     而 app.js 那边手点的冷却只有 90 秒。用户在窗口里点一次、失败一次，
+   *     每失败一次还会把窗口续上 —— 他越试，好得越慢。
+   *     所以撞一次就把「几点之前别再试」记下来，期间一个请求都不发。 */
+  var CX_BUSY_COOL = 15 * 60;
+  var CX_BUSY_KEY = 'cx.busyUntil';
+
+  function cxBusyUntil() {
+    try {
+      return Number(localStorage.getItem(CX_BUSY_KEY) || 0) || 0;
+    } catch (e) { return 0; }
+  }
+
+  function cxBusyMark() {
+    try {
+      localStorage.setItem(CX_BUSY_KEY,
+        String(Math.floor(Date.now() / 1000) + CX_BUSY_COOL));
+    } catch (e) { /* 存不下就只在这一次有效，不影响功能 */ }
+  }
+
+  function cxBusyClear() {
+    try { localStorage.removeItem(CX_BUSY_KEY); } catch (e) { /* 同上 */ }
+  }
+
+  // ---- 结课判定 -----------------------------------------------------
+  // 🔴 必须和 chaoxing.py 的 REST_STREAK / REST_SPAN / REST_GAP 完全一致。
+  //    APK 里没有 Python，这两份是各写一遍的 —— 只改一边不报错，
+  //    只是手机上和网页上「哪些课算结课」会得出不同答案。
+  //
+  // 判据：四个请求全成功 + 三个列表全空，连续 REST_STREAK 次，且跨度 >= REST_SPAN。
+  // 之后每 REST_GAP 才扫一次。
+  //
+  // 🔴 为什么不能「首次扫到空就判」：开学第一周课都还没发作业，
+  //    实测 32 门里 13 门是空的，其中「线性代数」「高等数学」是本学期的课。
+  //    首次就判会把整个学期的课全判死。
+  // 🔴 为什么是降频不是永不扫：判据一定会错，永不扫就永远发现不了。
+  var CX_REST_STREAK = 3;
+  var CX_REST_SPAN = 7 * 86400;
+  var CX_REST_GAP = 7 * 86400;
+
+  // ---- 冷课判定（0.39.0）----
+  // 上面那条要求「三个列表全空」—— 但历史学期的课**不空**：上学期的作业还挂着。
+  // 于是 37 门里 22 门一个学期都判不出结课，每次刷新仍然全量扫。
+  // 换证据：**有内容，但最新那条已经是 CX_COLD_DAY 之前的事**。
+  // 🔴 冷课「一次就降频」，空课要攒 3 次 + 7 天：
+  //    空 = 没有证据（老师可能还没发作业）；冷 = 有证据（东西都在，都很旧）。
+  var CX_COLD_DAY = 90 * 86400;
+
+  // 0.44.0：**没有教务课表**时用的冷课门槛，比上面那条更狠。
+  // 有课表时「这门课不在本学期名单里」本身就是证据，90 天够了；没课表时
+  // 只剩内容时间这一条证据，那就得多要一点：一学期通常 20 周，上学期的课
+  // 到 11 月，最新一条内容至少也是 5 个月前的事；而本学期还在上的课，
+  // 哪怕老师只在开学第一周发过东西，也在 150 天以内。
+  // ⚠️ 过了这道线只是**每 7 天扫一次**（CX_REST_GAP），不是永远不扫。
+  var CX_COLD_NO_WHITE = 150 * 86400;
+
+  // ---- 0.47.0：只看本学期的课 ----
+  // 用户 2026-11-06：「听学长说教务系统可以直接看本学期课程……现在我每次都
+  // 还是需要扫 37 个课程，但我这个学期只有十几个课程」。
+  // 判据换成**教务系统里本学期在修的课表**：
+  //   课表里有的 → 每轮全扫（4 个请求）
+  //   课表里没有 → 判结课，只花 1 个请求看活动列表（签到在里面）
+  // 为什么结课的课还留那 1 个请求：签到的时效是「几分钟」，漏了就没了；
+  // 而「点名专用」这类课教务课表里根本没有、唯一的内容恰恰就是签到。
+  var CX_ACT_PROBE_GAP = 7 * 86400;   // 结课的课多久探一次活动列表
+  var CX_WARM_ACT = 30 * 86400;       // 探到这么久以内还有活动 ⇒ 下轮恢复全扫
+  var CX_STALE_END = 7 * 86400;       // 早已结束的作业/考试，不再列进待办
+
+  // 连续几门课都「跳到登录页」才算会话真的没了。见 cxScanAll 里 authN 的说明。
+  // 取 3：真掉线时课程列表那一步就已经失败了，走到这里基本都是个别课的问题；
+  // 3 门足够挡住「真的掉线」，又不会为了 1 门归档课把整页判成过期。
+  var CX_AUTH_STREAK = 3;
+
+  /** 会话到底还在不在：`true` 活着 / `false` 确实掉了 / `null` 问不出来。
+   *
+   *  🔴 2026-11-15（用户第七次说「明明已经正常登录学习通了，还是显示登录过期」）：
+   *     这是一道**证伪**，不是又一次调阈值。
+   *
+   *     `authStop` 的每一条证据全是**字符串特征**：页面上出现「用户登录」、
+   *     出现 `login`、返回不是 JSON、或者 401。而学习通的维护页、云防护页、
+   *     某门课被归档后的空壳页，都可能同时骗过连续三门课 —— 阈值调到几都是
+   *     在猜。反过来，会话真掉了的时候，最便宜的那个认证接口（课程列表）
+   *     一定也回登录页。所以「连续三门像登录页」只是**怀疑**，抛之前必须拿
+   *     一个独立请求去证实；证实不了就不能对用户说「你的登录过期了」。
+   *
+   *  ⚠️ 只在怀疑之后发这一个请求，正常扫描一次都不多花。
+   *  ⚠️ 必须和 chaoxing.py 的 `session_alive()` 逐条对齐（对拍会验）。
+   */
+  async function cxSessionAlive() {
+    try {
+      await cxCourses();
+      return { alive: true, err: null };
+    } catch (e) {
+      if (e && e.kind === 'auth') return { alive: false, err: e };
+      // 网络 / 风控 / 改版：既不能说「活着」，也不能说「掉了」。
+      return { alive: null, err: e || null };
+    }
+  }
+
+  /** 把「疑似登录失效」的失败记录降级成「这一门没读到」。**纯函数**。
+   *
+   *  只在探针证明会话还活着之后调用（见 cxScanAll 末尾）。
+   *  🔴 降成 lookauth 而不是直接删掉：这些课**真的没扫到**，界面上要照实
+   *     算进「没查到」。删掉的话 scanned 会把它们算成「查过了」，
+   *     用户看到的是「都查了、都没作业」—— 那正是最不能犯的错。
+   *  ⚠️ 必须和 chaoxing.py 的 `downgrade_auth()` 逐条对齐（对拍会验）。
+   */
+  function cxDowngradeAuth(rows) {
+    var out = [];
+    var src = rows || [];
+    for (var i = 0; i < src.length; i++) {
+      var f = src[i];
+      if (!f) continue;
+      var why = String(f.why || '');
+      if (String(f.part || '') === 'auth') {
+        out.push({ course: f.course, why: '这一门没读到（疑似跳了登录页）',
+                   part: 'lookauth', code: 'lookauth' });
+        continue;
+      }
+      // 个别课的失败记录（part 是 work / exam / course）抄的多半是 CxError 原文，
+      // 里面可能就写着「登录态过期」。探针刚证明会话是好的，这句话就不是事实。
+      if (why.indexOf('过期') >= 0 || why.indexOf('失效') >= 0 ||
+          why.indexOf('重新登录') >= 0) {
+        var g = {};
+        for (var k in f) { if (Object.prototype.hasOwnProperty.call(f, k)) g[k] = f[k]; }
+        g.why = '这一门没读到';
+        out.push(g);
+        continue;
+      }
+      out.push(f);
+    }
+    return out;
+  }
+
+  /** 这条是不是「早就结束了」—— 不再往界面上摆。
+   *  用户 2026-11-06：「已经结束一段时间了的就别显示了，除非是需要互评的作业」。
+   *  🔴 必须要求 endAt 存在：实测真有「未交但没写截止时间」的作业，
+   *     那是「不知道什么时候结束」，不是「早就结束」，不能藏。
+   *  🔴 要回去互评的不算：截止之后还得评别人的作业，藏起来就是漏了一件事。
+   *  ⚠️ 和 chaoxing.py 的 is_stale 逐条对齐。 */
+  function cxIsStale(it, nowSec) {
+    if (!it) return false;
+    if (it.kind !== 'work' && it.kind !== 'exam') return false;
+    if (String(it.status || '').indexOf('互评') >= 0) return false;
+    if (!it.endAt) return false;
+    var n = nowSec == null ? Math.floor(Date.now() / 1000) : nowSec;
+    return (n - it.endAt) >= CX_STALE_END;
+  }
+
+  /** 已经做完的那批（作业 / 考试 / 练习），最近做完的排前面。**纯函数**。
+   *
+   *  🔴 和 chaoxing.py 的 done_items_of 逐条对齐（对拍见 check_cx_js.py）。
+   *     两边不一致时，手机上和电脑上「已完成 N 条」会是两个数，而且不报错。
+   *  🔴 早就结束的不算「做完了」：那批是「没做也没戏了」，混进来会让用户
+   *     以为那些也交过。判据复用 cxIsStale，和 is_stale 同一套。
+   */
+  function cxDoneItems(items, nowSec, limit) {
+    var lim = limit == null ? 60 : limit;
+    var out = [];
+    var rows = items || [];
+    for (var i = 0; i < rows.length; i++) {
+      var x = rows[i];
+      if (!x || x.state !== 'done') continue;
+      if (x.kind !== 'work' && x.kind !== 'exam' && x.kind !== 'quiz') continue;
+      if (cxIsStale(x, nowSec)) continue;
+      out.push(x);
+    }
+    out.sort(function (a, b) {
+      return (b.endAt || b.startAt || 0) - (a.endAt || a.startAt || 0);
+    });
+    return out.slice(0, lim);
+  }
+
+  /** 结课状态的 key：`<courseId>:<classId>`。和 `chaoxing.rest_key` 逐字对齐。
+   *  🔴 必须带 classId：同一个 courseId 下可能挂着不同学期的教学班，
+   *     只按 courseId 存会让本学期的班被上学期的班判成「已结课」。 */
+  function cxRestKey(courseId, classId) {
+    return String(courseId) + ':' + (classId == null ? '' : String(classId));
+  }
+
+  /** 按 (courseId, classId) 去重。和 `chaoxing.unique_courses` 逐条对齐。
+   *  🔴 0.39.0 之前只按 courseId 去重，注释写着「不同 classId 的作业/考试/活动
+   *     都是同一套」—— 那句是错的。同一个 courseId 下面可能挂着**不同学期**的
+   *     教学班，压成一个就只查了其中一个班，顺序一换本学期作业全没了。 */
+  function cxUniqueCourses(courses) {
+    var seen = {}, out = [];
+    if (!Array.isArray(courses)) return out;
+    for (var i = 0; i < courses.length; i++) {
+      var c = courses[i];
+      if (!c || typeof c !== 'object') continue;
+      var k = cxRestKey(c.courseId, c.classId);
+      if (seen[k]) continue;
+      seen[k] = 1;
+      out.push(c);
+    }
+    return out;
+  }
+
+  // ---- 教务课表白名单（和 chaoxing.py 的 _norm_name / _in_white 逐字对齐）----
+  var CX_ROMAN = { 'Ⅰ': 'I', 'Ⅱ': 'II', 'Ⅲ': 'III', 'Ⅳ': 'IV',
+                   'Ⅴ': 'V', 'Ⅵ': 'VI', 'Ⅶ': 'VII', 'Ⅷ': 'VIII' };
+
+  /** 课名归一化：全角转半角、罗马数字统一、去掉空白和标点、转大写。 */
+  function cxNormName(s) {
+    var t = String(s == null ? '' : s);
+    // 全角 → 半角
+    t = t.replace(/[\uFF01-\uFF5E]/g, function (ch) {
+      return String.fromCharCode(ch.charCodeAt(0) - 0xFEE0);
+    }).replace(/\u3000/g, ' ');
+    for (var k in CX_ROMAN) {
+      if (CX_ROMAN.hasOwnProperty(k)) t = t.split(k).join(CX_ROMAN[k]);
+    }
+    t = t.replace(/[\s\u3000·・,，。、;；:：!！?？'"“”‘’()（）\[\]【】<>《》/\\|+*#\-]/g, '');
+    return t.toUpperCase();
+  }
+
+  /** 教务课表 → [{n: 归一化课名, t: 归一化老师名}]。
+   *  0.47.0 起前端把老师名一起传下来 —— 光靠课名分不清哪一门是本学期的：
+   *  实测「高等数学（理工类）」同时挂着 25-26-1 / 25-26-2 / 非当前 三个班。
+   *  兼容老格式：纯字符串、{name,teacher}、{n,t} 都认。
+   *  ⚠️ 和 chaoxing.py 的 _norm_white 逐条对齐。 */
+  function cxNormWhite(names) {
+    if (!Array.isArray(names)) return [];
+    var out = [];
+    for (var i = 0; i < names.length; i++) {
+      var x = names[i], n = '', t = '';
+      if (x && typeof x === 'object') {
+        n = cxNormName(x.name || x.n || '');
+        t = cxNormName(x.teacher || x.t || '');
+      } else {
+        n = cxNormName(x);
+      }
+      if (n.length >= 2 || t.length >= 2) out.push({ n: n, t: t });
+    }
+    return out;
+  }
+
+  /**「2026-2027 学年第 1 学期」→ [26, 27, 1]。认不出返回 null。
+   *  ⚠️ 和 chaoxing.py 的 cur_term 逐条对齐。 */
+  function cxCurTerm(semester) {
+    var s = String(semester == null ? '' : semester);
+    var m = /(20\d{2})\s*[-—–~至]\s*(20\d{2})/.exec(s);
+    if (!m) return null;
+    var y1 = parseInt(m[1], 10);
+    var n = /第\s*([12一二])\s*学期/.exec(s);
+    var k = n ? ({ '一': 1, '二': 2, '1': 1, '2': 2 }[n[1]] || 1) : 1;
+    return [y1 % 100, (y1 + 1) % 100, k];
+  }
+
+  /** 从课名 / 班级名里认「这是哪个学期」。认不出返回 null。
+   *  三种实测写法：25-26-2 / 26年秋 / 2026.9。
+   *  ⚠️ 和 chaoxing.py 的 course_term 逐条对齐 —— 认不出就必须返回 null，
+   *  绝不当成「不是本学期」，那是把不知道说成知道。 */
+  function cxCourseTerm(text) {
+    var s = String(text == null ? '' : text);
+    var m = /(?<!\d)(?:20)?(\d{2})\s*[-–—]\s*(?:20)?(\d{2})\s*[-–—]\s*([12])(?!\d)/.exec(s);
+    if (m) return [parseInt(m[1], 10), parseInt(m[2], 10), parseInt(m[3], 10)];
+    m = /(?<!\d)(?:20)?(\d{2})\s*(?:级|年)?\s*([春秋])/.exec(s);
+    if (m) {
+      var y = parseInt(m[1], 10);
+      return [y, (y + 1) % 100, m[2] === '秋' ? 1 : 2];
+    }
+    m = /(?<!\d)(20\d{2})\.(\d{1,2})(?!\d)/.exec(s);
+    if (m) {
+      var yy = parseInt(m[1], 10), mo = parseInt(m[2], 10);
+      var kk = (mo >= 8 && mo <= 12) ? 1 : 2;
+      var y1 = kk === 1 ? yy : yy - 1;
+      return [y1 % 100, (y1 + 1) % 100, kk];
+    }
+    return null;
+  }
+
+  function cxTermEq(a, b) {
+    return !!a && !!b && a[0] === b[0] && a[1] === b[1] && a[2] === b[2];
+  }
+
+  /** 这门课是不是「本学期教务课表里在修」。**故意宽松** ——
+   *  误放行只是多扫一门，漏放行等于把真的作业档住。
+   *  唯一的反向证据：课名/班级名里写着学期，而且不是当前学期。
+   *  ⚠️ 和 chaoxing.py 的 is_active_course 逐条对齐。 */
+  function cxIsActiveCourse(course, white, term) {
+    if (!white || !white.length) return false;
+    var title = (course && course.title) || '';
+    var alias = (course && course.alias) || '';
+    var t = cxNormName(title);
+    var a = cxNormName(alias);
+    if (term) {
+      var t1 = cxCourseTerm(title), t2 = cxCourseTerm(alias);
+      if ((t1 && !cxTermEq(t1, term)) || (t2 && !cxTermEq(t2, term))) return false;
+    }
+    for (var i = 0; i < white.length; i++) {
+      var w = white[i] || {}, n = w.n || '', tea = w.t || '';
+      if (n && t) {
+        if (n === t || t.indexOf(n) >= 0 || n.indexOf(t) >= 0) return true;
+        if (n.length >= 4 && t.length >= 4 && n.slice(0, 4) === t.slice(0, 4)) return true;
+      }
+      if (tea.length >= 2 && a && a.indexOf(tea) >= 0) return true;
+      if (n.length >= 4 && a && a.indexOf(n) >= 0) return true;
+    }
+    return false;
+  }
+
+  /** 扫描进度。和 bridge.py 的 _CX_SCAN 同构，前端只认这几个键。 */
+  var CX_SCAN = { state: 'idle', at: 0, i: 0, n: 0, course: '', phase: '',
+                  err: '', kind: '' };
+  var CX_RESTORED = false;      // cookie 只还原一次
+  var CX_USER = '';
+
+  function cxErr(msg, kind) {
+    var e = new Error(msg);
+    e.kind = kind || 'net';
+    return e;
+  }
+
+  function cxSleep(ms) {
+    return cxWait(ms);
+  }
+
+  /* ---------------- 等待（后台这一路不许用 setTimeout） ----------------
+   *
+   * 🔴 2026-11-16：用户第 N 次报「学习通还是反复无法后台检查」，面板上每次都是
+   *    「未连上：没查完（等太久），下一轮再试」。查下来不是网络，是等待本身：
+   *    后台那个 WebView 不挂在窗口上，Chromium 当它是隐藏页面 ⇒ `setTimeout`
+   *    被节流（1 秒/次，隐藏久了 1 分钟/次）。而扫描的节奏**全在网页里**：
+   *    课与课之间 1.8 秒、请求与请求之间 0.45 秒。三十多门课一轮，光等待就能
+   *    被拉成几十分钟，必撞 AutoJob 的硬超时 —— 超时被记成失败，第二天再来一遍。
+   *    以前只把「推进一步」搬到原生（AutoJob.poll），等待还留在网页里，所以没修好。
+   *
+   * 现在等待也交给原生：`Android.wake(id, ms)` 到点在原生 Handler 上回调
+   * `window.__bgWake(id)`，网页藏起来照样准点。没有这个方法（老 APK / 鸿蒙 /
+   * 浏览器）就退回 setTimeout —— 前台本来就不节流，那条路不受影响。
+   */
+  var bgWakeSeq = 0;
+  var bgWaiters = {};
+  window.__bgWake = function (id) {
+    var f = bgWaiters[id];
+    delete bgWaiters[id];
+    if (f) f();
+  };
+
+  function cxWait(ms) {
+    var n = Math.max(0, Number(ms) || 0);
+    if (window.Android && typeof Android.wake === 'function') {
+      return new Promise(function (resolve) {
+        var id = ++bgWakeSeq;
+        bgWaiters[id] = resolve;
+        try {
+          Android.wake(id, Math.round(n));
+        } catch (e) {
+          delete bgWaiters[id];
+          setTimeout(resolve, n);
+        }
+      });
+    }
+    return new Promise(function (resolve) { setTimeout(resolve, n); });
+  }
+
+  /** 学习通请求。不走 http()：那个每次要等 POLITE_MS（1.2 秒），
+   *  32 门课就是 77 秒白等。节奏由 cxScan 自己按 CX_GAP 控制。
+   *
+   *  🔴 0.44.1：这里加了 CX_REQ_GAP 的全局限流。以前所有请求都是**立刻**发，
+   *     连发的那几发（一门课的课程页 / 作业 / 考试 / 活动）在服务端看起来
+   *     就是「同一个会话每秒问四次」，这是 202 的主要来源。
+   *     现在每个请求都排在上一个之后至少 0.45 秒 —— 一门课约 1.4 秒，
+   *     加上课间 1.8 秒，30 门课约 1 分 40 秒。 */
+  function cxHttp(method, url, body, referer, headers) {
+    return new Promise(function (resolve, reject) {
+      var wait = CX_REQ_GAP - (Date.now() - cxLastReqAt);
+      if (wait < 0) wait = 0;
+      // 🔴 用 cxWait 而不是 setTimeout：后台那个 WebView 是隐藏页面，
+      //    setTimeout 被节流，0.45 秒会变成 1 秒甚至 1 分钟（见 cxWait）。
+      cxWait(wait).then(function () {
+        var id = ++seq;
+        cxLastReqAt = Date.now();
+        waiting[id] = { resolve: resolve, reject: reject };
+        try {
+          if (window.Android && typeof Android.req2 === 'function') {
+            Android.req2(id, method, url, body || '', referer || '',
+                         headers ? JSON.stringify(headers) : '');
+          } else {
+            Android.req(id, method, url, body || '', referer || '');
+          }
+        } catch (e) {
+          delete waiting[id];
+          reject(new Error('原生请求失败：' + e));
+        }
+      });
+    });
+  }
+
+  // ---------------------------------------------------------- 中国大学 MOOC
+  //
+  // 🔴 登录**不由我们做**。2026-11-04 实测：MOOC 走网易通行证，
+  //    点「获取验证码」之前要过 captcha.reg.163.com/v2 的滑块，
+  //    脚本过不去、也不该去过（硬破某次能用、下次失效，还会把账号弄得更麻烦）。
+  //    改成用户在 App 内嵌的官方网页里自己登录，登录态就是 WebView 罐里的
+  //    cookie —— 这里只负责读它、带着它请求。
+  //
+  // ⚠️ 网页版（bridge.py）拿不到这个 cookie：它属于 icourse163.org 这个域，
+  //    电脑上的 Python 读不到浏览器的另一个域。所以 MOOC 只有 APK 能连。
+
+  var MOOC_HOST = 'https://www.icourse163.org/';
+  var MOOC_GAP = 1200;                       // 两次请求之间至少隔这么久
+  var moocLastAt = 0;
+  var moocCache = { at: 0, data: null };     // 上次扫的结果（进程内）
+
+  function moocErr(msg, kind) {
+    var e = new Error(msg);
+    e.kind = kind || 'net';
+    return e;
+  }
+
+  /** 整串 cookie（`a=1; b=2`），直接能当 Cookie 请求头用。取不到返回空串。 */
+  function moocCookieHeader() {
+    try {
+      if (window.Android && typeof Android.webCookieAll === 'function') {
+        return String(Android.webCookieAll(MOOC_HOST) || '');
+      }
+    } catch (e) { /* 读不到就当没登录 */ }
+    return '';
+  }
+
+  /** 从整串里取一条。名字不存在返回空串（不兜底成别的值）。 */
+  function moocCookieValue(hdr, name) {
+    if (!hdr) return '';
+    var parts = String(hdr).split(';');
+    for (var i = 0; i < parts.length; i++) {
+      var s = parts[i].replace(/^\s+|\s+$/g, '');
+      var eq = s.indexOf('=');
+      if (eq <= 0) continue;
+      if (s.slice(0, eq).replace(/^\s+|\s+$/g, '') === name) {
+        return s.slice(eq + 1).replace(/^\s+|\s+$/g, '');
+      }
+    }
+    return '';
+  }
+
+  /** memberId。STUDY_INFO 的形态是 `邮箱|渠道|memberId|时间戳`。
+   *
+   *  🔴 段数不对就返回空串，**不猜** —— 拿邮箱或时间戳当 memberId 使，
+   *     接口会安静地返回空列表，看起来像「你这学期没课」。 */
+  function moocMember(hdr) {
+    var v = moocCookieValue(hdr, 'STUDY_INFO');
+    if (!v) return '';
+    var parts = v.split('|');
+    if (parts.length < 3) return '';
+    return /^\d+$/.test(parts[2]) ? parts[2] : '';
+  }
+
+  /** 登没登：看 `STUDY_SESS`。
+   *
+   *  🔴 2026-11-04 实测：登录成功后罐子里写的是 **STUDY_SESS**，
+   *     老文档说的 `NTES_SESS` 根本没有。按名字判本来就是弱判据，
+   *     真正的判据是 `userInfo` 接口返回 code 0（见 moocScan）。 */
+  function moocLinked(hdr) {
+    var h = (hdr === undefined) ? moocCookieHeader() : hdr;
+    return !!moocCookieValue(h, 'STUDY_SESS');
+  }
+
+  /** POST 一个 rpc。参数走表单体，csrfKey 走查询串（两点都是实测的）。 */
+  function moocRpc(hdr, path, body) {
+    return new Promise(function (resolve, reject) {
+      var csrf = moocCookieValue(hdr, 'NTESSTUDYSI');
+      if (!csrf) {
+        reject(moocErr('登录状态读不到了，请重新登录中国大学 MOOC', 'auth'));
+        return;
+      }
+      var wait = MOOC_GAP - (Date.now() - moocLastAt);
+      if (wait < 0) wait = 0;
+      setTimeout(function () {
+        var id = ++seq;
+        moocLastAt = Date.now();
+        waiting[id] = {
+          resolve: function (r) {
+            var j = null;
+            try { j = JSON.parse(String((r && r.body) || '')); }
+            catch (e) {
+              reject(moocErr('中国大学 MOOC 返回的不是能读的内容', 'data'));
+              return;
+            }
+            if (j && j.code === 0) { resolve(j); return; }
+            if (j && j.code === -1002) {
+              reject(moocErr('登录状态过期了，请重新登录中国大学 MOOC', 'auth'));
+              return;
+            }
+            var mm = moocErr((j && j.message) ||
+                             '中国大学 MOOC 这次没读到，请稍后再试', 'data');
+            // 错误码不进人话（「返回了错误码 -1002」对用户没有任何用处），
+            // 但要留在 detail 里 —— 和教务那条（见 EamsError 那段）同一个规矩。
+            if (j && typeof j.code !== 'undefined') mm.detail = 'code=' + j.code;
+            reject(mm);
+          },
+          reject: reject
+        };
+        try {
+          Android.req2(id, 'POST',
+            'https://www.icourse163.org' + path + '?csrfKey=' + encodeURIComponent(csrf),
+            body || '', MOOC_HOST,
+            JSON.stringify({
+              'Cookie': hdr,
+              'Content-Type': 'application/x-www-form-urlencoded'
+            }));
+        } catch (e) {
+          delete waiting[id];
+          // 和教务那条一样：message 只放人话，异常原文进 detail。
+          // 用户该看到「连不上」，不是「java.net.SocketTimeoutException」。
+          var me = moocErr('连不上中国大学 MOOC，请检查网络后重试', 'net');
+          me.detail = '原生请求失败：' + e;
+          reject(me);
+        }
+      }, wait);
+    });
+  }
+
+  /** 毫秒时间戳 → 秒。0 / 空 / 不认识的都返回 null。
+   *  🔴 不兜底成「现在」：编一个截止时间会让待办表里平白多出一条假任务。 */
+  function moocMs(v) {
+    var n = parseInt(v, 10);
+    if (!isFinite(n) || n <= 0) return null;
+    return n > 1e11 ? Math.floor(n / 1000) : n;
+  }
+
+  /** 课程列表 → [{courseId, termId, name}]。
+   *  🔴 `termPanel.id` 才是 termId，外层 `id` 是 courseId，弄反就查不到作业。 */
+  function moocParseCourses(j) {
+    var out = [];
+    var res = (j && j.result) || {};
+    var rows = (res && res.result) || [];
+    for (var i = 0; i < rows.length; i++) {
+      var c = rows[i] || {};
+      var tp = c.termPanel || {};
+      if (!tp.id) continue;
+      out.push({
+        courseId: c.id, termId: tp.id,
+        name: String(c.name || '').replace(/^\s+|\s+$/g, ''),
+        startAt: moocMs(tp.startTime), endAt: moocMs(tp.endTime)
+      });
+    }
+    return out;
+  }
+
+  /** 一条作业/测验的状态。
+   *  1) 交过（用掉次数 ≥1 或已有分数）⇒ done
+   *  2) 截止时间已过 ⇒ expired
+   *  3) 其余 ⇒ todo */
+  function moocItemState(t, now) {
+    now = (now == null) ? Date.now() / 1000 : now;
+    var tried = parseInt((t && t.usedTryCount) || 0, 10);
+    if (!isFinite(tried)) tried = 0;
+    if (tried >= 1 || (t && t.userScore != null)) return 'done';
+    var end = moocMs(t && t.deadline);
+    if (end && end < now) return 'expired';
+    return 'todo';
+  }
+
+  var MOOC_KIND_KEY = { 1: 'exam', 2: 'quiz', 3: 'work' };
+  var MOOC_KIND_NAME = { 1: '考试', 2: '测验', 3: '作业' };
+
+  /** 整门课 → 条目列表。章节下有 homeworks / quizs / exam 三个数组。 */
+  function moocParseTerm(j, course) {
+    course = course || {};
+    var term = ((j && j.result) || {}).mocTermDto || {};
+    var cname = course.name || String(term.courseName || '');
+    var cid = course.courseId || term.courseId;
+    var tid = course.termId || term.id;
+    var url = 'https://www.icourse163.org/learn/icourse-' + cid +
+              '?tid=' + tid + '#/learn/testlist';
+    var now = Date.now() / 1000;
+    var out = [];
+    var chs = term.chapters || [];
+    for (var i = 0; i < chs.length; i++) {
+      var ch = chs[i] || {};
+      var chname = String(ch.name || '');
+      var groups = [
+        [ch.homeworks || [], 'work'],
+        [ch.quizs || [], 'quiz'],
+        [ch.exam ? [ch.exam] : [], 'exam']
+      ];
+      for (var g = 0; g < groups.length; g++) {
+        var rows = groups[g][0];
+        var fallback = groups[g][1];
+        for (var k = 0; k < rows.length; k++) {
+          var row = rows[k] || {};
+          var t = row.test || {};
+          var title = String(t.name || row.name || '').replace(/^\s+|\s+$/g, '');
+          if (!title) continue;
+          out.push({
+            kind: MOOC_KIND_KEY[t.type] || fallback,
+            kindName: MOOC_KIND_NAME[t.type] || '作业',
+            title: title,
+            course: cname, courseId: cid, termId: tid, chapter: chname,
+            state: moocItemState(t, now),
+            endAt: moocMs(t.deadline),
+            score: (t.userScore == null ? null : Number(t.userScore)),
+            total: t.totalScore,
+            url: url
+          });
+        }
+      }
+    }
+    out.sort(function (a, b) {
+      var x = a.endAt || 1e12, y = b.endAt || 1e12;
+      if (x !== y) return x - y;
+      return a.title < b.title ? -1 : (a.title > b.title ? 1 : 0);
+    });
+    return out;
+  }
+
+  /** 扫一遍：先验登录态（userInfo），再逐课取详情。 */
+  function moocScan() {
+    var hdr = moocCookieHeader();
+    if (!moocLinked(hdr)) {
+      return Promise.reject(moocErr('还没登录中国大学 MOOC', 'auth'));
+    }
+    var user = '';
+    return moocRpc(hdr, '/web/j/mocMemberFollowBean.userInfo.rpc', '')
+      .then(function (j) {
+        var u = (j && j.result) || {};
+        user = String(u.nickName || '');
+        return moocRpc(hdr, '/web/j/learnerCourseRpcBean.getMyLearnedCoursePanelList.rpc',
+                       'type=30&p=1&psize=50&courseType=1');
+      })
+      .then(function (j) {
+        var courses = moocParseCourses(j);
+        var items = [];
+        var failed = [];
+        // 串行：一门课一个请求，不并发。学校出口是同一个 IP，别当压测工具。
+        var chain = Promise.resolve();
+        courses.forEach(function (c) {
+          chain = chain.then(function () {
+            return moocRpc(hdr, '/web/j/courseBean.getLastLearnedMocTermDto.rpc',
+                           'termId=' + encodeURIComponent(c.termId))
+              .then(function (t) { items = items.concat(moocParseTerm(t, c)); })
+              .catch(function (e) {
+                // 单门课失败不能让整轮作废；登录态没了才整体中断
+                if (e && e.kind === 'auth') throw e;
+                failed.push({ course: c.name, why: String((e && e.message) || e) });
+              });
+          });
+        });
+        return chain.then(function () {
+          var n = { todo: 0, expired: 0, done: 0 };
+          for (var i = 0; i < items.length; i++) {
+            var s = items[i].state || 'todo';
+            n[s] = (n[s] || 0) + 1;
+          }
+          var data = {
+            at: Math.floor(Date.now() / 1000),
+            user: user, courses: courses, items: items, failed: failed, count: n
+          };
+          moocCache = { at: data.at, data: data };
+          return data;
+        });
+      });
+  }
+
+  function moocCached() { return moocCache.data; }
+  function moocAge() {
+    return moocCache.at
+      ? Math.max(0, Math.floor(Date.now() / 1000) - moocCache.at) : -1;
+  }
+
+  // ---------------------------------------------------------- 纯函数（可对拍）
+
+  /** 「还剩 2 小时 10 分钟」→ 绝对截止时间（unix 秒）。
+   *  列表页只给倒计时、不给绝对时间，只能在解析这一刻换算。
+   *  和 chaoxing.py 的 _end_from_left 是同一条规则（对拍脚本会验）。
+   *
+   *  🔴 判断「没传」只能用 `== null`，不能用 `> 0` 兜底 —— Python 那边写的是
+   *     `now is None`，传 0 就是字面的 0。两边不一致的话，同一个输入会算出
+   *     相差二十多年的截止时间，而且**不报错**。 */
+  function cxEndFromLeft(leftMin, nowSec) {
+    if (leftMin == null) return null;
+    var now = (nowSec == null) ? Date.now() / 1000 : nowSec;
+    return Math.floor(now + leftMin * 60);
+  }
+
+  /** 「剩余32小时54分钟」→ 1974（分钟）。认不出来返回 null。
+   *
+   *  🔴 不兜底成 0：0 分钟意味着「已经到期」，那是完全相反的意思。 */
+  function cxLeft(text) {
+    if (!text) return null;
+    var s = String(text);
+    if (s.indexOf('剩余') < 0) return null;
+    var d = /(\d+)\s*天/.exec(s);
+    var h = /(\d+)\s*小时/.exec(s);
+    var m = /(\d+)\s*分/.exec(s);
+    if (!d && !h && !m) return null;
+    return (d ? parseInt(d[1], 10) * 1440 : 0)
+         + (h ? parseInt(h[1], 10) * 60 : 0)
+         + (m ? parseInt(m[1], 10) : 0);
+  }
+
+  /** 「结束时间：10-20 15:00」→ unix 秒。认不出返回 null。
+   *  作业 / 考试列表在**有绝对时间**时会写这一行；倒计时那行过期以后就没了。
+   *  只认「2026-10-20 15:00」和「10-20 15:00」（跨年自己猜）。
+   *  ⚠️ 和 chaoxing.py 的 parse_due 逐条对齐。 */
+  function cxParseDue(text, nowSec) {
+    if (!text) return null;
+    var str = String(text);
+    // 考试页的 .time 也可能是「开始时间：…」。那是开始，不是截止。
+    if (str.indexOf('开始') >= 0 && str.indexOf('结束') < 0 &&
+        str.indexOf('截止') < 0) return null;
+    // 两行并在一个格子里时只认结束那一半（和 chaoxing.py 的 parse_due 一致）。
+    var kws = ['结束时间', '截止时间', '结束', '截止'];
+    for (var kwi = 0; kwi < kws.length; kwi++) {
+      var ki = str.indexOf(kws[kwi]);
+      if (ki >= 0) { str = str.slice(ki); break; }
+    }
+    var now = (nowSec == null) ? Date.now() / 1000 : nowSec;
+    var m = /(\d{4})-(\d{1,2})-(\d{1,2})[\sT]+(\d{1,2}):(\d{2})/.exec(str);
+    if (m) {
+      var t1 = new Date(parseInt(m[1], 10), parseInt(m[2], 10) - 1,
+                        parseInt(m[3], 10), parseInt(m[4], 10),
+                        parseInt(m[5], 10), 0);
+      if (isNaN(t1.getTime())) return null;
+      return Math.floor(t1.getTime() / 1000);
+    }
+    m = /(\d{1,2})-(\d{1,2})\s+(\d{1,2}):(\d{2})/.exec(str);
+    if (!m) return null;
+    var mo = parseInt(m[1], 10), dd = parseInt(m[2], 10);
+    var hh = parseInt(m[3], 10), mi = parseInt(m[4], 10);
+    var yr = new Date(now * 1000).getFullYear();
+    var d0 = new Date(yr, mo - 1, dd, hh, mi, 0);
+    if (isNaN(d0.getTime())) return null;
+    var t = Math.floor(d0.getTime() / 1000);
+    // 差半年以上就归到相邻的那一年：1 月看到「12-31」是去年，反之是明年。
+    if (t > now + 180 * 86400 || t < now - 180 * 86400) {
+      var y2 = t > now ? yr - 1 : yr + 1;
+      var d1 = new Date(y2, mo - 1, dd, hh, mi, 0);
+      if (isNaN(d1.getTime())) return null;
+      t = Math.floor(d1.getTime() / 1000);
+    }
+    return t;
+  }
+
+  /** 一条作业/考试的「截止时间 + 剩余分钟」。
+   *  有绝对时间就以它为准（倒计时那行会随读取时刻漂移，过期以后还没有）；
+   *  只有倒计时时才拿它换算。
+   *  ⚠️ 和 chaoxing.py 里 parse_work / parse_exam 的这两行逐条对齐。 */
+  function cxDue(raw, nowSec) {
+    var left = cxLeft(raw);
+    var end = cxParseDue(raw, nowSec);
+    if (end == null) return { leftMin: left, endAt: cxEndFromLeft(left, nowSec) };
+    if (left == null) {
+      var now = (nowSec == null) ? Date.now() / 1000 : nowSec;
+      left = Math.floor((end - now) / 60);
+    }
+    return { leftMin: left, endAt: end };
+  }
+
+  /** 状态归三档。不认识的返回 'other' —— 不往任何一边凑。
+   *  ⚠️ 判定顺序和 chaoxing.py 的 bucket() 完全相同：精确 → 包含（否定词先判）。 */
+  function cxBucket(status) {
+    var s = String(status || '').replace(/^\s+|\s+$/g, '');
+    if (!s) return 'other';
+    var i;
+    for (i = 0; i < CX_TODO.length; i++) if (CX_TODO[i] === s) return 'todo';
+    for (i = 0; i < CX_DONE.length; i++) if (CX_DONE[i] === s) return 'done';
+    for (i = 0; i < CX_TODO_WORDS.length; i++) if (s.indexOf(CX_TODO_WORDS[i]) >= 0) return 'todo';
+    for (i = 0; i < CX_DONE_WORDS.length; i++) if (s.indexOf(CX_DONE_WORDS[i]) >= 0) return 'done';
+    return 'other';
+  }
+
+  /** backclazzdata 的 JSON → 课程列表。字段位置是实测出来的：
+   *    courseId = content.course.data[0].id
+   *    classId  = content.id
+   *    cpi      = channel.cpi
+   *    title    = data[0].name（干净课名）
+   *    alias    = content.name（带老师/周次，不能当课名用）
+   *    schoolId = data[0].belongSchoolId（学校 id，活动列表接口要这个；郑航是 1286） */
+  function cxParseCourses(j) {
+    var out = [];
+    var chs = (j && j.channelList) || [];
+    for (var i = 0; i < chs.length; i++) {
+      var ch = chs[i] || {};
+      var ct = ch.content || {};
+      var rows = (ct.course && ct.course.data) || [];
+      if (!rows.length) continue;
+      var d = rows[0] || {};
+      out.push({
+        courseId: d.id,
+        classId: ct.id,
+        cpi: ch.cpi || ct.cpi,
+        title: d.name || ct.name || '',
+        alias: ct.name || '',
+        schoolId: d.belongSchoolId || ''
+      });
+    }
+    return out;
+  }
+
+  /** activeType → 分类。认不出来归 'other'，不往任何一类里凑。 */
+  function cxKindOf(activeType) {
+    var t = String(activeType == null ? '' : activeType).replace(/^\s+|\s+$/g, '');
+    if (/\.0$/.test(t)) t = t.slice(0, -2);      // 万一给了 5.0
+    for (var k in CX_KIND_BUCKET) {
+      if (!CX_KIND_BUCKET.hasOwnProperty(k)) continue;
+      if (CX_KIND_BUCKET[k].indexOf(t) >= 0) return k;
+    }
+    return 'other';
+  }
+
+  /** 签到的「我到底签了没」→ true / false / null。
+   *
+   *  🔴 认不出来就返回 null，**绝不兜底成 false**。兜成「没签」等于凭空
+   *     告诉用户「你漏签了」—— 那是会让人白跑一趟教务处的错。
+   *     ⚠️ 这份判定必须和 chaoxing.py 的 sign_state() 一模一样：
+   *        网页版走 Python，APK 走这里，两边不一致的话同一份数据
+   *        会算出两种「漏签次数」，而且不报错。 */
+  function cxSignState(text) {
+    var t = String(text == null ? '' : text).replace(/^\s+|\s+$/g, '');
+    if (!t) return null;
+    if (t.indexOf('已签') >= 0) return true;              // 已签到 / 已签退
+    if (t.indexOf('未签') >= 0 || t.indexOf('缺勤') >= 0) return false;
+    return null;
+  }
+
+  /** 毫秒时间戳 → 秒。空/0/非数字返回 null。
+   *  🔴 学习通的 0 表示「没有这个时间」，不是 1970 年。当成 0 会算出一个
+   *     五十多年前的倒计时，然后被当成「早就过期」悄悄丢掉。 */
+  function cxMsToSec(v) {
+    var n = parseInt(v, 10);
+    if (!isFinite(n) || n <= 0) return null;
+    return Math.floor(n / 1000);
+  }
+
+  /** 补全协议。学习通给的多半是 `//mobilelearn.chaoxing.com/...`。 */
+  function cxAbsUrl(u) {
+    u = String(u == null ? '' : u).trim();
+    if (!u) return '';
+    if (u.indexOf('//') === 0) return 'https:' + u;
+    if (u.indexOf('http://') === 0 || u.indexOf('https://') === 0) return u;
+    return '';                                  // 相对路径 / javascript: 一律不要
+  }
+
+  /** 活动 JSON 的 content 里带的 stuUrl（学习通自己用的兜底地址）。
+   *  🔴 content 有时是对象、有时是 JSON 字符串 —— 两种都认。 */
+  function cxContentStuUrl(a) {
+    var c = a ? a.content : null;
+    if (typeof c === 'string') {
+      try { c = JSON.parse(c); } catch (e) { return ''; }
+    }
+    if (!c || typeof c !== 'object') return '';
+    return cxAbsUrl(c.stuUrl);
+  }
+
+  /** 一条活动 → 详情页地址。拼不出来返回空串（界面就不显示小箭头）。
+   *  只做「上面这些参数就够」的类型：直播(17)/分组任务(35)/在线课堂(56)
+   *  要先调别的接口拿 liveId / uuid，宁可**不给链接**，也别给个点开就报错的。 */
+  function cxActiveUrl(a, course) {
+    var u = cxContentStuUrl(a);
+    if (u) return u;
+    var path = CX_ACTIVE_PAGE[String(a && a.activeType != null ? a.activeType : '').trim()];
+    if (!path) return '';
+    var c = course || {};
+    var cid = String(c.courseId == null ? '' : c.courseId).trim();
+    var clid = String(c.classId == null ? '' : c.classId).trim();
+    var fid = String(c.schoolId == null ? '' : c.schoolId).trim();
+    var aid = String(a.id == null ? '' : a.id).trim();
+    if (!(cid && clid && fid && aid)) return '';
+    var q = 'courseId=' + cid + '&classId=' + clid + '&activeId=' + aid + '&fid=' + fid;
+    if (path.indexOf('stu_reply_discuss') >= 0) {
+      var cpi = String(c.cpi == null ? '' : c.cpi).trim();
+      if (cpi) q += '&cpi=' + cpi;
+      q += '&showOnScreenShare=true';
+    }
+    return CX_BASE + path + '?' + q;
+  }
+
+  /** 活动列表 JSON → 条目（签到 / 主题讨论 / 通知 / 作业提醒 …）。
+   *
+   *  字段名不是猜的，是从学习通自己的任务列表页模板里逐条抄的
+   *  （_lab/cx/ml/active_page.html，191 KB 真实抓取）：
+   *      nameOne   标题
+   *      nameTwo   状态文字（可能为空）
+   *      nameFour  倒计时文字，🔴 只有 status=='1' 才渲染
+   *      startTime / endTime  毫秒时间戳
+   *      status    '1' 进行中 / '2' 已结束 / 其他 未开始
+   *
+   *  🔴 result != 1 必须抛，不能返回空数组 —— 空数组会被前端显示成
+   *     「这门课没有活动」，而真相是「没读到」。 */
+  function cxParseActive(j, nowSec, course) {
+    if (!j || typeof j !== 'object') return [];
+    var res = j.result;
+    if (!(res === 1 || res === '1' || res === true)) {
+      throw cxErr(String(j.errorMsg || j.msg || '活动列表返回失败'), 'deny');
+    }
+    var rows = (j.data && j.data.activeList) || [];
+    // nowSec 只是给对拍脚本固定时间用的（不传就是当前时间）——
+    // 不然「从 endTime 算倒计时」那几条，JS 和 Python 会差个几十秒。
+    var now = (typeof nowSec === 'number' && nowSec > 0) ? nowSec : Date.now() / 1000;
+    var out = [];
+    for (var i = 0; i < rows.length; i++) {
+      var a = rows[i];
+      if (!a || typeof a !== 'object') continue;
+      var title = String(a.nameOne == null ? '' : a.nameOne).trim();
+      if (!title) continue;
+      var st = String(a.status == null ? '' : a.status).trim();
+      var name4 = String(a.nameFour == null ? '' : a.nameFour).trim();
+      var end = cxMsToSec(a.endTime);
+      var start = cxMsToSec(a.startTime);
+
+      var leftMin = null;
+      if (st === '1') {
+        leftMin = cxLeft(name4);
+        // 🔴 不夹 0：过点但 status 还是 1 的活动，留负数让排序把它归到「已过期」，
+        //    夹成 0 会写成「还剩 不到 1 分钟」。改这里必须同步 chaoxing.py。
+        if (leftMin == null && end) leftMin = Math.floor((end - now) / 60);
+      }
+      var state = st === '1' ? 'live' : (st === '2' ? 'ended' : 'pending');
+
+      var kd = cxKindOf(a.activeType);
+      // 🔴 作业 / 练习的「做完没」不在 status 里：status=2 只说明这场活动结束了，
+      //    做没做要看 nameTwo（「已完成」/「未完成」）。以前只认 quiz、后来 quiz
+      //    也漏在了这一版之前 —— 于是做过的练习和没做的长得一模一样，都进不了
+      //    「已完成」那批。作业同样：老师发的作业活动结束了、我早就交了，
+      //    却还挂在待办里被天天催。
+      //    ⚠️ 改这里必须同步 chaoxing.py 的 parse_active。
+      var stText = String(a.nameTwo == null ? '' : a.nameTwo).trim();
+      if ((kd === 'quiz' || kd === 'work') && cxBucket(stText) === 'done') {
+        state = 'done';
+        leftMin = null;                 // 做完了就不再喊还剩几分钟
+      }
+      // 🔴 通知的 endTime 是**活动自己的生命周期终点**，不是待办截止时间。
+      //    拿它渲染「截止 X」，一条公告会显示成「已截止 2025-09-30」，像漏了件事。
+      //    改这里必须同步 chaoxing.py 的 parse_active。
+      if (kd === 'notice') { end = null; leftMin = null; }
+
+      out.push({
+        kind: kd,
+        kindName: CX_ACTIVE_KIND[String(a.activeType)] || '活动',
+        title: title,
+        status: String(a.nameTwo == null ? '' : a.nameTwo).trim(),
+        state: state,
+        left: name4,
+        leftMin: leftMin,
+        startAt: start,
+        endAt: end,
+        // 只有签到/签退才有；别的活动一律 null（不是 false）。
+        signed: kd === 'sign' ? cxSignState(a.nameTwo) : null,
+        url: cxActiveUrl(a, course),
+        // 活动 id。老版讨论（activeType=5）拼不出静态地址，要靠它现问一次接口
+        // （见 cxDiscussUrl）；别的类型用不上。和 chaoxing.py 的 parse_active 对齐。
+        aid: String(a.id == null ? '' : a.id).trim()
+      });
+    }
+    return out;
+  }
+
+  /** 老版讨论（activeType=5）→ 详情页地址；问不出来返回空串。
+   *
+   *  地址不是猜的：学习通活动列表页点讨论走 `openDiscuss(activeId, topicId)`
+   *  （_lab/cx/ml/active_page.html，190 KB 真实抓取）—— 先问
+   *  `/v2/apis/discuss/getTopicDiscussInfo?activeId=`，再按
+   *  `buildStuDiscussUrl()` 的非 V3 那一支拼。和 chaoxing.py 的 discuss_url 一致。
+   *
+   *  🔴 不补这一步，那些「讨论」在界面里就是**点不开的死行** —— 用户
+   *     2026-11-16 报的正是这个：「学习通的讨论，学习界面没法点击打开」。
+   *     活动类型 50（新版主题讨论）有静态地址，5（老版）没有，两套并存。
+   *  🔴 一次扫描最多问 8 条：讨论一学期十几场，每条一次请求会把请求次数
+   *     顶上去（风控按次数认，见 CX_GAP）。超了就维持「没有地址」。
+   */
+  var cxDiscussCache = {};
+  async function cxDiscussUrl(c, aid) {
+    aid = String(aid == null ? '' : aid).trim();
+    if (!aid) return '';
+    if (Object.prototype.hasOwnProperty.call(cxDiscussCache, aid)) {
+      return cxDiscussCache[aid];
+    }
+    var n = Object.keys(cxDiscussCache).length;
+    if (n >= 8) return '';
+    cxDiscussCache[aid] = '';
+    var out = '';
+    try {
+      var r = await cxHttp('GET',
+        CX_BASE + '/v2/apis/discuss/getTopicDiscussInfo?activeId=' + encodeURIComponent(aid),
+        '', 'https://mooc1.chaoxing.com/', { 'X-Requested-With': 'XMLHttpRequest' });
+      var j = {};
+      try { j = JSON.parse(String((r && r.body) || '')); } catch (e) { j = {}; }
+      if (String(j.result) === '1' || j.result === 1 || j.result === true) {
+        var d = j.data || {};
+        var uuid = String(d.uuid == null ? '' : d.uuid).trim();
+        if (uuid) {
+          var dom = String(d.groupwebDomain == null ? '' : d.groupwebDomain).trim()
+            .replace(/\/+$/, '') || 'https://groupweb.chaoxing.com';
+          out = dom + '/course/topicDiscuss/info?uuid=' + uuid
+            + '&activeId=' + String(d.activeId == null ? aid : d.activeId)
+            + '&startTime=' + String(d.startTime == null ? '' : d.startTime)
+            + '&timeLong=' + String(d.timeLong == null ? '' : d.timeLong)
+            + '&activeStatus=' + String(d.activeStatus == null ? '' : d.activeStatus)
+            + '&courseId=' + String((c && c.courseId) == null ? '' : c.courseId);
+        }
+      }
+    } catch (e) {
+      out = '';                 // 问不到就是没有地址，别把这门课整条列表拖红
+    }
+    cxDiscussCache[aid] = out;
+    return out;
+  }
+
+  /** 考试列表页 → 条目。
+   *
+   *  结构从这一页自己的样式表反推（_lab/cx/ml/exam-list.css，127 个类名），
+   *  和作业列表页**同构**：
+   *      li > .tag + .right-content > p.overHidden2（标题）+ p.status（状态）
+   *         + .time / .time.notOver（倒计时）
+   *
+   *  🔴 有 aria-label 就用（作业页就是这条路），没有就退回读文字。
+   *     两条路都留着 —— 页面改版时至少有一条能撑住，而不是静默返回 0 条。 */
+  function cxParseExam(html, nowSec) {
+    var doc = new DOMParser().parseFromString(String(html || ''), 'text/html');
+    var lis = doc.querySelectorAll('li');
+    var out = [];
+    for (var i = 0; i < lis.length; i++) {
+      var li = lis[i];
+      // 筛选栏、翻页那些 li 没有 .right-content，不是任务
+      var right = li.querySelector('.right-content');
+      if (!right) continue;
+
+      var title = '', status = '';
+      var lab = li.getAttribute('aria-label');
+      if (lab) {
+        var cut = lab.lastIndexOf(';');
+        title = (cut >= 0 ? lab.slice(0, cut) : lab).replace(/^\s+|\s+$/g, '');
+        status = cut >= 0 ? lab.slice(cut + 1).replace(/^\s+|\s+$/g, '') : '';
+      }
+      if (!title) {
+        var tEl = right.querySelector('.overHidden2');
+        if (tEl) title = String(tEl.textContent || '').replace(/\s+/g, ' ').trim();
+      }
+      if (!status) {
+        var sEl = right.querySelector('.status');
+        if (sEl) status = String(sEl.textContent || '').replace(/\s+/g, ' ').trim();
+      }
+      if (!title) continue;
+
+      var wEl = li.querySelector('.time');
+      var raw = wEl ? String(wEl.textContent || '').replace(/\s+/g, ' ').trim() : '';
+
+      var done = false;
+      for (var d = 0; d < CX_DONE_EXAM.length; d++) {
+        if (status.indexOf(CX_DONE_EXAM[d]) >= 0) { done = true; break; }
+      }
+      var de = cxDue(raw, nowSec);
+      out.push({
+        kind: 'exam',
+        kindName: '考试',
+        title: title,
+        status: status,
+        state: done ? 'done' : 'todo',
+        left: raw,
+        leftMin: de.leftMin,
+        startAt: null,
+        endAt: de.endAt,
+        url: li.getAttribute('data') || ''
+      });
+    }
+    return out;
+  }
+
+  /** 这条还值不值得摆到人面前。 */
+  function cxIsOpen(it) {
+    return it && (it.state === 'todo' || it.state === 'live' || it.state === 'pending');
+  }
+
+  /** 作业列表页 → 作业数组。
+   *
+   *  每条 li：
+   *    aria-label = "标题 ; 状态"   ← 最干净的来源（标题和状态一次拿全）
+   *    .time                       ← 「剩余32小时54分钟」，没有就没有倒计时
+   *    data="..."                  ← 详情页地址
+   *
+   *  🔴 用 lastIndexOf(';') 而不是 indexOf：万一标题里带分号，
+   *     状态仍然是最后一段。
+   *
+   *  🔴 2026-11-16：**aria-label 不再是唯一的路**（和 chaoxing.py 同步）。
+   *     用户报「很多学习通作业都读取错误了」。考试那边（`cxParseExam`）一直
+   *     有「没有 aria-label 就读 .overHidden2 / .status 文字」的兜底，作业
+   *     这边却只有 `if (lab == null) continue` —— 学习通一改版，整页作业
+   *     一条都读不出来，而这门课拿到的是一份 200 的正常 HTML：不报错，
+   *     界面就显示「没有作业」。
+   *     ⚠️ 两份实现必须逐条对齐（`_lab/cx/check_cx_js.py` 会对拍）。 */
+  function cxParseWork(html, nowSec) {
+    var doc = new DOMParser().parseFromString(String(html || ''), 'text/html');
+    var ul = doc.querySelector('ul');
+    if (!ul) return [];
+    var lis = ul.querySelectorAll('li');
+    var out = [];
+    for (var i = 0; i < lis.length; i++) {
+      var li = lis[i];
+      // 只收「任务条目」：要么带 aria-label，要么有 right-content 那一块。
+      // 页面里还有导航、筛选、翻页的 <li>，它们没有这两样。
+      if (!li.hasAttribute('aria-label') && !li.querySelector('.right-content')) continue;
+
+      var lab = li.getAttribute('aria-label');
+      var title = '', status = '';
+      if (lab != null) {
+        var cut = lab.lastIndexOf(';');
+        title = (cut >= 0 ? lab.slice(0, cut) : lab).replace(/^\s+|\s+$/g, '');
+        status = cut >= 0 ? lab.slice(cut + 1).replace(/^\s+|\s+$/g, '') : '';
+      }
+      // aria-label 没有 / 拆出来是空的 ⇒ 读页面上的字（和 cxParseExam 一致）。
+      if (!title) {
+        var tEl0 = li.querySelector('.overHidden2');
+        if (tEl0) title = String(tEl0.textContent || '').replace(/\s+/g, ' ').trim();
+      }
+      if (!status) {
+        var sEl0 = li.querySelector('.status');
+        if (sEl0) status = String(sEl0.textContent || '').replace(/\s+/g, ' ').trim();
+      }
+      if (!title) continue;
+
+      var tEl = li.querySelector('.time');
+      var raw = tEl ? String(tEl.textContent || '').replace(/\s+/g, ' ').trim() : '';
+
+      var dw = cxDue(raw, nowSec);
+      out.push({
+        kind: 'work',
+        kindName: '作业',
+        title: title,
+        status: status,
+        state: cxBucket(status),
+        left: raw,
+        leftMin: dw.leftMin,
+        startAt: null,
+        endAt: dw.endAt,
+        url: li.getAttribute('data') || ''
+      });
+    }
+    return out;
+  }
+
+  // ---------------------------------------------------------- cookie 持久化
+
+  /** App 一退出，java.net 的 cookie 罐子就空了。第一次用到时从本机还原。 */
+  function cxRestore() {
+    if (CX_RESTORED) return;
+    CX_RESTORED = true;
+    // 学号先读回来 —— 别放在下面那个 early-return 后面，
+    // 否则「cookie 还在」这条路上 CX_USER 永远是空的。
+    try { CX_USER = String(localStorage.getItem(CXS.USERKEY) || ''); }
+    catch (e0) { CX_USER = ''; }
+    try {
+      if (Android.cxHasLogin()) return;
+      var blob = String(Android.cxLoad() || '');
+      if (blob) Android.cxLoadCookies(blob);
+    } catch (e) { /* 还原不了就当没登录，让用户重登一次 */ }
+  }
+
+  function cxPersist() {
+    try {
+      if (!Android.cxHasLogin()) return;
+      Android.cxSave(String(Android.cxDumpCookies() || '[]'));
+    } catch (e) { /* 存不上只是下次要重登，不影响本次 */ }
+  }
+
+  function cxHasLogin() {
+    try { return !!Android.cxHasLogin(); } catch (e) { return false; }
+  }
+
+  // ---- 学习通账号密码（加密存本机）----
+  //
+  // 为什么也存密码：cookie 会过期，一过期就得重新翻密码，用户明确说不要这样。
+  // 但**绝不后台自动去撞** —— 只在用户点「重新连接」时用一次。
+  // 服务端明确说账号密码不对时立刻删掉这份，不拿错的密码反复试。
+
+  function cxPwdLoad() {
+    try {
+      if (!window.Android || typeof Android.loadCxPwd !== 'function') return null;
+      var s = String(Android.loadCxPwd() || '');
+      if (!s) return null;
+      var o = JSON.parse(s);
+      return (o && o.u && o.p) ? { u: String(o.u), p: String(o.p) } : null;
+    } catch (e) { return null; }
+  }
+
+  function cxPwdSave(u, p) {
+    try {
+      if (!window.Android || typeof Android.saveCxPwd !== 'function') return 'none';
+      return String(Android.saveCxPwd(String(u || ''), String(p || '')) || '');
+    } catch (e) {
+      return 'fail: 调用原生保存出错（' + ((e && e.message) || e) + '）';
+    }
+  }
+
+  function cxPwdClear() {
+    try {
+      if (window.Android && typeof Android.clearCxPwd === 'function') Android.clearCxPwd();
+    } catch (e) { /* 清不掉也只能这样 */ }
+  }
+
+  // ---- 自动续期（2026-11-15）----
+  //
+  // 用户这一条说了七遍：「明明已经正常登录学习通了，还是显示登录过期」。
+  // 前几次都在改**判定**（连续几门才算掉线、401 要不要判 auth……），
+  // 但真掉了的时候判定得再准，结果也还是「请点重连」——
+  // 而本机明明存着账号密码，用户每次都是点一下就上去了。
+  //
+  // 所以现在：**确认真掉了、本机有密码，就自己登一次**，然后接着扫。
+  // 这不是「拿旧密码反复去撞」，撞的次数被下面两条卡死：
+  //   · 30 分钟最多一次（cxRelinkState 里的 at）；
+  //   · 撞上验证码 / 账号密码被拒 ⇒ 停一天（off），期间一次都不试，
+  //     界面照旧给「重连」按钮，让人自己处理。
+  var CX_RELINK_GAP = 30 * 60 * 1000;
+  var CX_RELINK_OFF = 24 * 3600 * 1000;
+
+  function cxRelinkState() {
+    try {
+      var s = localStorage.getItem(CXS.RELINK);
+      var o = s ? JSON.parse(s) : null;
+      return (o && typeof o === 'object') ? o : {};
+    } catch (e) { return {}; }
+  }
+
+  function cxRelinkSave(o) {
+    try { localStorage.setItem(CXS.RELINK, JSON.stringify(o || {})); }
+    catch (e) { /* 存不上只是下次可能多试一次 */ }
+  }
+
+  /** 自己重登一次。**只在确认登录态真过期时调用。**
+   *  @return true = 登上了，可以重扫；false = 没登 / 不该登（调用方照原样报错） */
+  async function cxAutoRelink() {
+    var sp = cxPwdLoad();
+    if (!sp || !sp.u || !sp.p) return false;              // 没存密码，只能人工
+    // 存的是别人的密码（换过账号）⇒ 不许拿去撞：学习通会把 needVcode 撞成 1
+    if (CX_USER && String(CX_USER) !== String(sp.u)) return false;
+    var st = cxRelinkState();
+    var now = Date.now();
+    if (st.off && now < Number(st.off)) return false;      // 撞过验证码，停着呢
+    if (st.at && (now - Number(st.at)) < CX_RELINK_GAP) return false;
+    cxRelinkSave({ at: now, off: Number(st.off) || 0 });
+    try {
+      await cxLogin(sp.u, sp.p);
+    } catch (e) {
+      // 要验证码 / 密码被拒：不是网络抖动，再试只会更糟。停一天，交给人。
+      cxRelinkSave({ at: now, off: now + CX_RELINK_OFF });
+      return false;
+    }
+    // 登上了 ⇒ 立刻把新 cookie 落盘，否则一重启又回到「过期」。
+    try { Android.cxSave(String(Android.cxDumpCookies() || '[]')); } catch (e2) { /* 下次再存 */ }
+    CX_USER = sp.u;
+    try { localStorage.setItem(CXS.USERKEY, sp.u); } catch (e3) { /* 无所谓 */ }
+    cxRelinkSave({ at: now, off: 0 });
+    return true;
+  }
+
+  // ---------------------------------------------------------- 缓存
+
+  function cxCacheGet() {
+    try {
+      var s = localStorage.getItem(CXS.CACHE);
+      if (!s) return null;
+      var o = JSON.parse(s);
+      return (o && o.data) ? o.data : null;
+    } catch (e) { return null; }
+  }
+
+  function cxCacheSet(d) {
+    try {
+      localStorage.setItem(CXS.CACHE,
+        JSON.stringify({ at: Math.floor(Date.now() / 1000), data: d }));
+    } catch (e) { /* 存不下就只活这一次 */ }
+  }
+
+  function cxCacheClear() {
+    try { localStorage.removeItem(CXS.CACHE); } catch (e) { /* 无所谓 */ }
+  }
+
+  function cxCacheAge() {
+    try {
+      var s = localStorage.getItem(CXS.CACHE);
+      if (!s) return -1;
+      var o = JSON.parse(s);
+      var at = o && o.at;
+      if (!at) return -1;
+      return Math.max(0, Math.floor(Date.now() / 1000) - at);
+    } catch (e) { return -1; }
+  }
+
+  // ---------------------------------------------------------- 登录 / 取数
+
+  /** 账号密码登录。🔴 失败直接抛，**绝不重试**。
+   *
+   *  重试的代价：学习通会把 needVcode 置 1，之后每次登录都要人做滑块；
+   *  再撞下去是冻结 24 小时，然后是灰名单人工申诉。 */
+  async function cxLogin(user, pwd) {
+    var enc = '';
+    try { enc = String(Android.cxAes(String(pwd)) || ''); } catch (e) { enc = ''; }
+    // 🔴 加密失败**不能**拿明文顶上：学习通只认密文，发明文等于拿错的密码去撞
+    if (!enc) throw cxErr('密码加密失败，手机系统的加密模块不可用', 'parse');
+
+    // 先开一次登录页，拿到 passport2 域的 JSESSIONID / route
+    //
+    // 🔴 这一步失败时以前直接把底层那句「原生请求失败：…」抛上去，
+    //    用户读到的是机器的语言。网络没通和校园网没认证在现象上一样
+    //    （请求根本出不去），但在**该做什么**上完全一样：先看网络。
+    try {
+      await cxHttp('GET', CXS.LOGIN_PAGE, '', '');
+    } catch (e) {
+      throw cxErr('连不上学习通：网络没通，或者校园网还没登录', 'net');
+    }
+
+    var body = form({
+      fid: '-1',
+      uname: user,
+      password: enc,
+      // 这个值本身已经是 URL 编码过的，form() 会再编一次 —— 和 Python 版
+      // 用 requests 发出去的结果一致（服务端认的就是这个双重编码）。
+      refer: 'http%3A%2F%2Fi.mooc.chaoxing.com',
+      t: 'true',                 // 🔴 只有 true 时前端才加密密码
+      forbidotherlogin: '0',
+      validate: '',              // 首次登录不需要验证码
+      _blank: '1',
+      retainlogin: '2',
+      pcxxtpage: '0',
+      needVcode: ''
+    });
+
+    var r;
+    try {
+      r = await cxHttp('POST', CXS.LOGIN_API, body, CXS.LOGIN_PAGE,
+                       { 'X-Requested-With': 'XMLHttpRequest' });
+    } catch (e) {
+      throw cxErr('连不上学习通：网络没通，或者校园网还没登录', 'net');
+    }
+
+    var j = null;
+    try { j = JSON.parse(String((r && r.body) || '')); }
+    catch (e) {
+      // 校园网没认证时，网关会拿一个登录页当成功响应塞回来（200 + HTML）。
+      // 那既不是「改版」也不是「密码错」，是网络被拦了 —— 说成改版，
+      // 用户只能干等更新。
+      if (/<html/i.test(String((r && r.body) || ''))) {
+        throw cxErr('连不上学习通：网络被拦，校园网需先登录', 'net');
+      }
+      throw cxErr('登录没成功，学校系统可能改版了', 'parse');
+    }
+
+    var ok = !!(j && j.status) || String((j && j.status)).toLowerCase() === 'true';
+    if (!ok) {
+      var mes = String((j && j.mes) || '').replace(/^\s+|\s+$/g, '');
+      if (mes.indexOf('验证码') >= 0 || (j && j.needVcode)) {
+        throw cxErr('学习通这次要验证码了，得在电脑上手动登录一次', 'auth');
+      }
+      throw cxErr(mes || '账号或密码不对', 'auth');
+    }
+    return true;
+  }
+
+  async function cxCourses() {
+    var r = await cxHttp('GET', CXS.COURSE_API, '', CXS.COURSE_REF);
+    cxStatusOk(r, '课程列表');
+    var t = String((r && r.body) || '');
+    if (!t.replace(/\s+/g, '')) throw cxErr('课程列表是空的 —— 登录态可能失效了', 'auth');
+    // 🔴 登录页要单独认出来。不认的话会掉进下面 JSON.parse 失败那条，
+    //    报「课程列表不是 JSON，接口可能变了」—— 那是**假话**：
+    //    接口没变，只是没登录，服务器把我们 302 到登录页了。
+    //    用户按「接口变了」去理解，唯一能做的事是等更新，而真正该做的是重连。
+    if (cxLooksLoggedOut(t)) {
+      throw cxErr('学习通的登录态过期了，点「重新连接」再试一次', 'auth');
+    }
+    var j;
+    try { j = JSON.parse(t); }
+    catch (e) { throw cxErr('课程列表没读出来，学校系统可能改版了', 'parse'); }
+    // 🔴 2026-11-12 补：没登录时学习通回的是**合法 JSON**（见 cxJsonLoggedOut），
+    //    不判这一条就会把它说成「改版了」，而且归成 parse ⇒ 不停扫描、不提示重连。
+    if (cxJsonLoggedOut(j)) {
+      throw cxErr('学习通的登录态过期了，点「重新连接」再试一次', 'auth');
+    }
+    var rows = cxParseCourses(j);
+    if (!rows.length && !(j && j.channelList)) {
+      throw cxErr('课程列表没读出来，学校系统可能改版了', 'parse');
+    }
+    return rows;
+  }
+
+  // ---------------------------------------------------------- 收件箱（通知中心）
+  //
+  // 学习通网页端右上角那个「通知中心」——不是私信，也不是群聊。
+  //
+  // 🔴 这是全项目唯一一个**纯逆向**的接口（没有官方文档，参数和字段都可能
+  //    随改版变）。所以规矩和别处相反：别的接口「读不到就报错」，这里
+  //    「读不到就少几条」。一条脏数据不该让整个收件箱变红 ——
+  //    那会把「有一条真消息」说成「什么都没有」。
+  // 🔴 必须和 chaoxing.py 的 notices() 逐条对齐：同样的表单、同样的字段、
+  //    同样只翻两页。两份实现不一致时，网页版和 APK 会给出不同的未读数。
+  var CXS_NOTICE = 'https://notice.chaoxing.com/pc/notice/getNoticeList';
+
+  // 收件箱上一次的结果。5 分钟缓存 —— 学习页每次重画都会来问一次，
+  // 没有缓存的话一个下午就能问出上百次，这是我们最不该浪费的那种请求。
+  // 🔴 和 bridge.py 的 _CX_MAIL 同一份口径（连 TTL 都一样），
+  //    两边不一致时会出现「电脑上 5 分钟、手机上每次都拉」这种诡异的差别。
+  var CX_MAIL_TTL = 300000;
+  var cxMail = { at: 0, list: [], err: '', kind: '' };
+
+  /** HTML 片段 → 一行能读的纯文本。`&amp;` 必须最后换，否则会二次解码。 */
+  function cxPlain(s, limit) {
+    var t = String(s == null ? '' : s);
+    t = t.replace(/<(script|style)\b[\s\S]*?<\/\1>/gi, ' ');
+    t = t.replace(/<br\s*\/?>|<\/p>|<\/div>/gi, '\n');
+    t = t.replace(/<[^>]+>/g, '');
+    t = t.replace(/&nbsp;/g, ' ').replace(/&lt;/g, '<').replace(/&gt;/g, '>')
+         .replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&amp;/g, '&');
+    t = t.replace(/[ \t\r\f\v\u3000]+/g, ' ');
+    t = t.replace(/\n[ \t]*(\n[ \t]*)+/g, '\n\n');
+    t = t.replace(/^[\s]+|[\s]+$/g, '');
+    return t.slice(0, limit || 400);
+  }
+
+  /** 毫秒/秒时间戳或 `2026-11-13 10:22:31` → unix 秒。解析不出就是 0。 */
+  function cxNoticeTime(v) {
+    var s = String(v == null ? '' : v).replace(/^\s+|\s+$/g, '');
+    if (!s) return 0;
+    if (/^\d+$/.test(s)) {
+      var n = Number(s);
+      if (n > 1e12) n = Math.floor(n / 1000);
+      return n > 1e9 ? n : 0;
+    }
+    var m = /^(\d{4})-(\d{1,2})-(\d{1,2})[ T](\d{1,2}):(\d{2})/.exec(s);
+    if (!m) return 0;
+    var d = new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]),
+                     Number(m[4]), Number(m[5]), 0);
+    var t = Math.floor(d.getTime() / 1000);
+    return isNaN(t) ? 0 : t;
+  }
+
+  /** 这个地址是不是学习通自己的。
+   *
+   *  🔴 消息正文是**老师发的、别人写的 HTML** —— 里面塞一个外部地址
+   *     就是一条钓鱼链接。我们只负责把学习通自己的地址还给它：
+   *     认不出来就不给按钮。少一颗按钮不会让人漏做，点错一次才会。
+   *     2026-11-14 用户：「很多随堂练习只有几分钟持续时间」——
+   *     这条链路的另一端是本人的账号，宁缺毋滥。 */
+  function cxIsCx(u) {
+    var m = /^https?:\/\/([^\/:?#]+)/i.exec(String(u || ''));
+    if (!m) return false;
+    var h = m[1].toLowerCase();
+    return h === 'chaoxing.com' || h.slice(-13) === '.chaoxing.com';
+  }
+
+  /** 一条消息里那条任务自己的地址 —— 有就返回，没有就是空串。
+   *
+   *  用户 2026-11-14：「收件箱也有对应作业的链接，你能不能把这个对应作业和
+   *  随堂练习的跳转链接也放进收件箱对应消息」。
+   *
+   *  🔴 这个接口是纯逆向的，字段名各版本叫法不一。所以**只做加法**：
+   *     挨个名字试，正文里再兜一次 href / 裸地址；全认不出来就当没有。
+   *     反过来（写死一个字段名）在改版那天会让所有消息一起没按钮。
+   *  🔴 顺序：attachment → 顶层字段 → 正文。`attachment` 是 2026-11-14 用真号
+   *     抓回来验证过的（80 条里 73 条作业/考试都带 `att_web.url`），
+   *     那才是学习通自己算出来的跳转；正文里的 `<a>` 是老师写的，多数时候对
+   *     但没有（真数据里 `content` 是纯文本，一个链接都没有）。
+   *  🔴 不认 `javascript:` / 相对路径 —— 交给 cxAbsUrl 一刀切掉。
+   *     改这里必须同步 chaoxing.py 的 `_notice_url`。
+   *
+   *  ⚠️ 字段名那张表**写在函数里面**：对拍脚本是按花括号抠函数的，
+   *     抠不到外面的 `var` —— 放外面会让 node 里一跑就 ReferenceError，
+   *     而它长得像「对拍失败」，查半天。 */
+  function cxNoticeUrl(x) {
+    if (!x || typeof x !== 'object') return '';
+    // ① attachment —— 真实接口里地址就在这里（2026-11-14 用真号抓了 80 条：
+    //    73 条作业/考试，每条都带这个字段）。它是一段**JSON 字符串**，形如
+    //    [{"attachmentType":25,"att_web":{"examOrWork":"work",…,
+    //      "url":"https://mooc1-api.chaoxing.com/examApi/intoexamorwork?…&enc=…"}}]
+    //    🔴 只认子对象里的 `url`：att_web 里还有一个 `logo`（图片），
+    //       拿「任意字符串字段」当地址会把课件的图标当成作业页。
+    //    🔴 解析失败就当没有 —— 这个字段是服务端拼的，改版时可能不是 JSON。
+    var raw = x.attachment, arr = null;
+    if (typeof raw === 'string' && raw) {
+      try { arr = JSON.parse(raw); } catch (e) { arr = null; }
+    } else if (Object.prototype.toString.call(raw) === '[object Array]') {
+      arr = raw;
+    }
+    if (Object.prototype.toString.call(arr) === '[object Array]') {
+      for (var i = 0; i < arr.length; i++) {
+        var a = arr[i];
+        if (!a || typeof a !== 'object') continue;
+        for (var k in a) {
+          if (!Object.prototype.hasOwnProperty.call(a, k)) continue;
+          var sub = a[k];
+          if (!sub || typeof sub !== 'object') continue;
+          if (Object.prototype.toString.call(sub) === '[object Array]') continue;
+          var au = cxAbsUrl(sub.url);
+          if (au && cxIsCx(au)) return au;
+        }
+      }
+    }
+    // ② 顶层字段（真实接口里没有，留着是为了别的通知形态）
+    var keys = ['url', 'linkUrl', 'link', 'jumpUrl', 'jumpLink',
+                'targetUrl', 'href'];
+    for (var j = 0; j < keys.length; j++) {
+      var u = cxAbsUrl(x[keys[j]]);
+      if (u && cxIsCx(u)) return u;
+    }
+    var c = String(x.content || x.body || '');
+    if (!c) return '';
+    // 正文里的第一颗可点链接。属性可能用单引号、可能夹空格（模板拼出来的）。
+    var a = /href\s*=\s*["']([^"']+)["']/i.exec(c);
+    if (a) {
+      var hu = cxAbsUrl(a[1]);
+      if (hu && cxIsCx(hu)) return hu;
+    }
+    // 有的通知把地址直接贴成文字（没有 <a>）。跟着标签一起扒会把图片、
+    // 样式表也算进来，所以先去掉标签再找。
+    var txt = c.replace(/<[^>]*>/g, ' ');
+    var all = /(?:https?:)?\/\/[^\s"'<>()]+/gi;
+    var m;
+    while ((m = all.exec(txt))) {
+      var tu = cxAbsUrl(m[0]);
+      if (tu && cxIsCx(tu)) return tu;
+    }
+    return '';
+  }
+
+  /** 通知中心一页 → { list, last, done }。
+   *  🔴 `isread` 是字符串 `'0'`（未读）/`'1'`（已读）。裸真值判断会把
+   *     未读的 `'0'` 当真值 —— 结果是「永远 0 条未读」。
+   */
+  function cxParseNoticePage(j) {
+    var body = (j && j.notices && typeof j.notices === 'object') ? j.notices : null;
+    if (!body && j && Object.prototype.toString.call(j.list) === '[object Array]') body = j;
+    var rows = (body && Object.prototype.toString.call(body.list) === '[object Array]')
+      ? body.list : [];
+    var out = [];
+    for (var i = 0; i < rows.length; i++) {
+      var x = rows[i];
+      if (!x || typeof x !== 'object') continue;
+      var title = cxPlain(x.title || x.subject, 80);
+      var raw = x.completeTime || x.createTime || x.time || '';
+      out.push({
+        kind: 'notice', kindName: '消息',
+        id: String(x.id || x.noticeId || x.nid || ''),
+        t: title || '（无标题）',
+        c: cxPlain(x.content || x.body, 400),
+        w: cxPlain(x.createrName || x.senderName || x.createName || x.sender, 30),
+        at: cxNoticeTime(raw),
+        when: String(raw || ''),
+        // 这条消息指向的任务（作业 / 随堂练习）。空串 = 这一条没有可去的页面，
+        // 界面上就不长按钮 —— 不做「猜一个地址」这种事。
+        u: cxNoticeUrl(x),
+        r: String(x.isread == null ? '1' : x.isread) !== '0'
+      });
+    }
+    return {
+      list: out,
+      last: body ? String(body.lastGetId || '') : '',
+      done: !!(body && body.lastPage)
+    };
+  }
+
+  /** 收件箱列表。只翻两页（约 20 条）——再往下是去年的通知，
+   *  对「有没有新消息」没有帮助，只是白打服务器。 */
+  async function cxNotices(limit, pages) {
+    limit = limit || 20;
+    pages = pages || 2;
+    var out = [], seen = {}, last = '';
+    for (var p = 0; p < Math.min(pages, 5); p++) {
+      var form = 'type=0&notice_type=0&lastValue=' + encodeURIComponent(last) +
+        '&sort=0&folderUUID=&kw=&startTime=&endTime=&gKw=&gName=&year=&tag=' +
+        '&fidsCode=&filterSenderPuids=&filterTags=';
+      var r = await cxHttp('POST', CXS_NOTICE, form,
+        'https://notice.chaoxing.com/pc/notice/index',
+        { 'X-Requested-With': 'XMLHttpRequest',
+          'Content-Type': 'application/x-www-form-urlencoded' });
+      cxStatusOk(r, '收件箱');
+      var t = String((r && r.body) || '');
+      // 没登录时这里会 302 到登录页，跟随后是一段 HTML —— 先认出来，
+      // 否则会掉进「不是 JSON」那条报假话。
+      if (cxLooksLoggedOut(t)) {
+        throw cxErr('学习通的登录态过期了，点「重新连接」再试一次', 'auth');
+      }
+      if (!t.replace(/\s+/g, '')) {
+        throw cxErr('收件箱返回是空的 —— 登录态可能失效了', 'auth');
+      }
+      var j;
+      try { j = JSON.parse(t); }
+      catch (e) { throw cxErr('收件箱没读出来，接口可能变了', 'parse'); }
+      var page = cxParseNoticePage(j);
+      for (var i = 0; i < page.list.length; i++) {
+        var it = page.list[i];
+        var k = it.id || (it.t + '|' + it.when);
+        if (seen[k]) continue;
+        seen[k] = 1;
+        out.push(it);
+      }
+      last = page.last;
+      if (page.done || !last || out.length >= limit) break;
+    }
+    return out.slice(0, limit);
+  }
+
+  /** 这段内容是不是「登录页」而不是接口数据。
+   *
+   *  ⚠️ 必须和 chaoxing.py 的 `_looks_logged_out()` 逐字对齐（对拍脚本会验）。
+   *
+   *  🔴 先判「像不像 JSON」再判关键字：正常响应里 courseName 之类的字段
+   *     完全可能带「用户登录」四个字（比如一门叫《用户登录与鉴权》的课），
+   *     只看关键字会把正常数据判成没登录 —— 那比反过来更糟，
+   *     因为它会让人白白重连一次。
+   */
+  function cxLooksLoggedOut(text) {
+    var s = String(text == null ? '' : text);
+    if (!s) return false;
+    var head = s.replace(/^\s+/, '').charAt(0);
+    if (head === '{' || head === '[') return false;      // 是 JSON 就不可能是登录页
+    return s.indexOf('passport2.chaoxing.com') >= 0 || s.indexOf('用户登录') >= 0;
+  }
+
+  /** 解析出来的 JSON 是不是「没登录」。
+   *
+   *  🔴 2026-11-12 实测（匿名请求一次 `backclazzdata`，不带任何账号）：
+   *     学习通对**没登录的请求**回的是 **200 + 合法 JSON**：
+   *       {"result":0,"msg":"请重新登录","status":false,"errorMsg":"请重新登录"}
+   *     而上面那个 `cxLooksLoggedOut` 只认 HTML 登录页（见到 `{` 就返回 false）。
+   *     于是这条掉进「没有 channelList」那个分支，报成
+   *     「课程列表没读出来，学校系统可能改版了」—— **这是假话**：
+   *     接口一个字都没变，是我们没登录。用户照着「等更新」去做，
+   *     等一辈子也等不到；而且它被归成 `parse` 不是 `auth`，
+   *     扫描不会停、也不会提示重连，后台每隔一两小时再撞一次，
+   *     表现就是「后台一直检查失败」。
+   *
+   *  ⚠️ 判定必须**同时**满足「失败态」和「文案里有登录」两条：
+   *     `result:0` 也可能表示别的业务失败（比如课程被归档），
+   *     只看 `result` 会把那种情况说成「登录过期」，用户白重连一次。
+   *  ⚠️ 必须和 chaoxing.py 的 `_json_logged_out()` 逐字对齐（对拍会验）。
+   */
+  function cxJsonLoggedOut(j) {
+    if (!j || typeof j !== 'object') return false;
+    var bad = (j.status === false) || (j.result === 0) || (j.result === '0');
+    if (!bad) return false;
+    var s = String(j.msg || j.errorMsg || j.message || '');
+    return s.indexOf('登录') >= 0 || /login/i.test(s);
+  }
+
+  /** 非 200 一律当服务端/网络错误。
+   *
+   *  🔴 必须显式判：Java 那边只把响应体交回来，502 的 HTML 和「真的没作业」
+   *     在解析层长得一模一样（`cxParseWork` 找不到 <ul> 就返回 []），
+   *     于是「服务器挂了」会被静默当成「这门课没有作业」。
+   *
+   *  实测（`_lab/cx/probe_502.py`，两门课全部 502）修之前的样子：
+   *      work   → code=noentry「没给作业入口」      ← 假话
+   *      exam   → code=noentry「没给考试入口」      ← 假话
+   *      active → code=auth    「登录态可能失效了」  ← 假话，而且更糟：
+   *                扫描见到 auth 就停，**第二门课根本不查、也不记录**。
+   *
+   *  ⚠️ 这个函数必须和 `chaoxing.py` 的 `_status_ok()` 逐字对齐 ——
+   *     APK 没有 Python，两边是各写一份。只改一边不报错。
+   */
+  function cxStatusOk(r, what) {
+    var code = (r && r.status) || 0;
+    // 🔴 2026-10-25 补：401 是「未授权」，不是「服务器出错」。
+    //    以前 401 走下面那条「学习通服务器出错了，不是你的问题」——
+    //    那句话会让用户干等着，而他真正该做的是点「重新连接」。
+    //    而且 401 判成 net 之后扫描不会停，剩下几十门课各发一次注定 401 的请求。
+    //    ⚠️ 403 仍然算 net：学习通的 403 多半是风控拦的，不是账号问题。
+    //    ⚠️ 必须和 `chaoxing.py` 的 `_status_ok()` 逐字一致（对拍会验）。
+    if (code === 401) {
+      throw cxErr(what + '打不开，登录过期了，点「重新连接」再试一次', 'auth');
+    }
+    // 🔴 202 = Accepted：请求收到了但没给内容，学习通那边通常是风控在排队。
+    //    和 chaoxing.py 的 _status_ok 逐字一致（对拍会比对文案本身）。
+    //    说「服务器出错了」会让用户以为没事、接着点，越点越封。
+    if (code === 202) {      // 0.44.1：把「过几分钟」改成具体的 15 分钟，和下面的冷静期一致 ——
+      // 说「过几分钟」的话，用户三分钟后又点，撞上同一堵墙，还以为我们
+      // 在随便打发他。
+      var e202 = cxErr(what + '查得太频繁了，等 15 分钟再试', 'net');
+      // 🔴 0.44.0：给错误打个标记，让扫描知道「这是被拦了」而不是「这一门课
+      //    恰好没读到」。两者在文案上一模一样，但处理方式相反：
+      //    前者要**立刻停手**（再问下去只会被封得更久），后者继续下一门。
+      //    不加这个标记的话，31 门课会各撞一次墙，最后界面上写着
+      //    「31 门课没查到」—— 用户读到的是「31 门都没查」，而事实是
+      //    「查到第 4 门就被拦了，剩下 27 门一个请求都没发」。
+      e202.busy = true;
+      throw e202;
+    }
+    // 🔴 status 0 = 请求**根本没发出去**（断网、DNS、被网关拦、超时）。
+    //    以前它和真的 500 走同一句「学习通服务器出错了，不是你的问题」——
+    //    那句会让人什么都不做地等着。真正该做的是先看网络。
+    if (!code) {
+      throw cxErr('连不上学习通：网络没通，或者校园网还没登录', 'net');
+    }
+    if (code !== 200) {
+      throw cxErr(what + '返回 ' + code + '（学习通服务器出错，非本机问题）', 'net');
+    }
+  }
+
+  /** 进课程页，拿 stuenc + workEnc。两个必须来自同一次加载。 */
+  async function cxCourseMeta(c) {
+    var url = CXS.COURSE_PAGE + '?courseid=' + c.courseId + '&clazzid=' + c.classId
+            + '&cpi=' + c.cpi + '&ismooc2=1&v=2';
+    var r = await cxHttp('GET', url, '', '');
+    cxStatusOk(r, '课程页');
+    // 原生层已经把重定向跟完并把**最终地址**带回来了，stuenc 就在里面
+    var u = String((r && r.url) || '') || url;
+    var stu = /[?&]enc=([0-9a-fA-F]{32})/.exec(u);
+    var work = /id="workEnc"[^>]*value="([0-9a-fA-F]{32})"/.exec(String((r && r.body) || ''));
+    return {
+      stuenc: stu ? stu[1] : '',
+      workEnc: work ? work[1] : '',
+      referer: u
+    };
+  }
+
+  async function cxWorkList(c, meta) {
+    // 🔴 kind 用 'noentry' 而不是 'deny'：界面上这是**完全不同**的两句话。
+    //    deny = 被拒绝（账号可能有问题），noentry = 这门课的页面里压根没这个
+    //    入口（多半已结课归档）。混成一种，用户只能看到「拿不到入口」。
+    if (!meta.stuenc || !meta.workEnc) throw cxErr('没给作业入口', 'noentry');
+    var url = CXS.WORK_LIST + '?courseId=' + c.courseId + '&classId=' + c.classId
+            + '&cpi=' + c.cpi + '&ut=s&t=' + Date.now()
+            + '&stuenc=' + meta.stuenc + '&enc=' + meta.workEnc;
+    var r = await cxHttp('GET', url, '', meta.referer);
+    cxStatusOk(r, '作业列表');
+    var t = String((r && r.body) || '');
+    if (t.indexOf('无权限的操作') >= 0 || t.indexOf('无效的用户') >= 0) {
+      throw cxErr('作业列表读不了，重新连接一次再试', 'deny');
+    }
+    return cxParseWork(t);
+  }
+
+  /** 一门课的活动列表。🔴 不需要 stuenc，所以不用先进课程页 —— 省一次请求。 */
+  async function cxActiveList(c) {
+    if (!c.schoolId) throw cxErr('这门课没带学校 id，活动查不了', 'parse');
+    var url = CXS.ACTIVE_LIST + '?fid=' + c.schoolId
+            + '&courseId=' + c.courseId + '&classId=' + c.classId
+            + '&showNotStartedActive=0&_=' + Date.now();
+    var referer = CXS.COURSE_PAGE + '?courseid=' + c.courseId
+                + '&clazzid=' + c.classId + '&cpi=' + c.cpi;
+    var r = await cxHttp('GET', url, '', referer, { 'X-Requested-With': 'XMLHttpRequest' });
+    cxStatusOk(r, '活动列表');
+    var t = String((r && r.body) || '');
+    // 没登录时会 302 到登录页，回来的是一大坨 HTML 而不是 JSON
+    var head = t.replace(/^\s+/, '').slice(0, 1);
+    if (head !== '{' && head !== '[') {
+      // 🔴 非 JSON **不再一律判 auth**。原来只要不是 JSON 就说「登录态可能失效了」，
+      //    可 auth 会让扫描直接停下 —— 一个维护页 / 接口改版，就能让后面
+      //    所有课**一门都不查**，而用户看到的是「登录失效」。
+      //    现在只有真的看到登录页特征才判 auth，其余判 parse（照常往下查）。
+      var hs = t.slice(0, 4000);
+      if (hs.indexOf('用户登录') >= 0 || hs.indexOf('passport2') >= 0
+          || hs.toLowerCase().indexOf('login') >= 0) {
+        throw cxErr('活动列表跳到登录页了（登录态失效）', 'auth');
+      }
+      throw cxErr('活动列表没读出来，学校系统可能改版了', 'parse');
+    }
+    var j;
+    try { j = JSON.parse(t); }
+    catch (e) { throw cxErr('活动列表没读出来，学校系统可能改版了', 'parse'); }
+    // 详情页地址要 courseId / classId / fid，而接口**不回**这三个
+    // （它本来就是按课查的），所以把课程对象带进去自己拼。
+    var items = cxParseActive(j, null, c);
+    // 老版讨论（activeType=5）拼不出静态地址 —— 学习通自己点它时也是先问一次
+    // 接口。不补这一步，那些「讨论」在界面上是点不开的死行。
+    for (var i = 0; i < items.length; i++) {
+      var it = items[i];
+      if (it && it.kind === 'topic' && !it.url && it.aid) {
+        it.url = await cxDiscussUrl(c, it.aid);
+      }
+    }
+    return items;
+  }
+
+  /** 一门课的考试列表。需要 stuenc，必须在 cxCourseMeta 之后调。 */
+  async function cxExamList(c, meta) {
+    if (!meta.stuenc) throw cxErr('没给考试入口', 'noentry');
+    var url = CXS.EXAM_LIST + '?courseid=' + c.courseId + '&clazzid=' + c.classId
+            + '&cpi=' + c.cpi + '&ut=s&t=' + Date.now() + '&stuenc=' + meta.stuenc;
+    var r = await cxHttp('GET', url, '', meta.referer);
+    cxStatusOk(r, '考试列表');
+    var t = String((r && r.body) || '');
+    if (t.indexOf('这次操作没成功，重试一次') >= 0) {
+      throw cxErr('考试读不出来，学习通可能改版了', 'parse');
+    }
+    if (t.indexOf('无权限的操作') >= 0 || t.indexOf('无效的用户') >= 0) {
+      throw cxErr('考试列表被拒（登录态失效）', 'deny');
+    }
+    if (t.slice(0, 3000).indexOf('用户登录') >= 0) {
+      throw cxErr('考试页跳到登录了（登录态失效）', 'auth');
+    }
+    return cxParseExam(t);
+  }
+
+  /** 把每门课的**作业 + 考试 + 课堂活动**都读一遍。
+   *  返回结构与 bridge.py 的 scan() 完全一致（前端只写一套分支）。 */
+  /** 算一门课这一轮扫描之后的「结课判定」状态。**纯函数**。
+   *
+   * st       上一轮的状态（可能没有）
+   * okAll    这一轮四个请求是不是全部成功（课程页 + 作业 + 考试 + 活动）
+   * isEmpty  三个列表是不是都为空
+   * now      现在（unix 秒）
+   * newest   这门课最新一条内容的时间（unix 秒）。None/null = 有内容但没给时间。
+   *           **0.39.0 新增**，见 CX_COLD_DAY。
+   *
+   * 🔴 这是 `chaoxing.py` 的 `rest_next` 的**第二份实现**（APK 里没有 Python）。
+   *    两份靠 `_lab/cx/check_cx_js.py` 逐条对拍 —— 只改一边不报错，
+   *    只是手机上和网页上「哪些课算结课」会得出不同答案，用户看不出来。
+   *
+   * 🔴 okAll=false 时**原样返回**：既不加次数（那是拿「没读到」当「没有」），
+   *    也不清零（那会让好不容易攒的次数白费）。这是整个判据里最要紧的一条。
+   */
+  function cxRestNext(st, okAll, isEmpty, now, newest) {
+    st = (st && typeof st === 'object') ? st : {};
+    if (!okAll) return st;
+    if (isEmpty) {
+      var streak = (st.streak || 0) + 1;
+      var since = st.since || now;
+      return {
+        streak: streak, since: since, lastAt: now,
+        // 次数够 + 跨度够 才真的停扫。只满足一条不算：一天点三次刷新
+        // 也能凑够 3 次，但那才过了半天，分不清「结课」和「今天还没发作业」。
+        resting: !!(streak >= CX_REST_STREAK && now - since >= CX_REST_SPAN)
+      };
+    }
+    // 有内容，但最新那条已经很旧 ⇒ 冷课，这一轮就降频。
+    // 🔴 newest 不是数字时**不判冷**：那是「不知道多旧」，不是「很旧」。
+    // 🔴 只认数字和数字字符串。**不能直接 Number(newest)**：
+    //    `Number([]) === 0`、`Number(null) === 0`、`Number('') === 0` ——
+    //    空数组会被当成「1970 年」，`now - 0` 是个天文数字 ⇒ 直接判成冷课，
+    //    一门课就这么被永久降频了。对拍时 `newest=[]` 就是这么红的。
+    var cold = false;
+    var nv = NaN;
+    if (typeof newest === 'number') nv = newest;
+    else if (typeof newest === 'string' && newest !== '') nv = Number(newest);
+    if (isFinite(nv)) cold = (now - nv) >= CX_COLD_DAY;
+    if (cold) {
+      return {
+        streak: (st.streak || 0) + 1,
+        since: st.since || now, lastAt: now,
+        resting: true
+      };
+    }
+    // 有内容且是新的 ⇒ 立刻恢复。这是判错时的自我纠错。
+    return { streak: 0, since: now, lastAt: now, resting: false };
+  }
+
+  async function cxScanAll(prevRest, force, preCourses, activeNames, semester) {
+    // preCourses 由 /api/cx/scan 在没有 UID 时先探一次拿到（见那里的注释）。
+    // ⚠️ 只在「真的是个数组」时采信：`cxCourses()` 拿不到会抛，不会返回空数组，
+    //    所以走到这里还拿到空数组 = 上游传错了，重取一次更稳。
+    var courses = (Array.isArray(preCourses) && preCourses.length)
+      ? preCourses : await cxCourses();
+
+    // 🔴 0.39.0：按 (courseId, classId) 去重，不再只按 courseId。
+    //    以前那句「不同 classId 的作业/考试/活动都是同一套」是错的：
+    //    同一个 courseId 下可能挂着**不同学期**的教学班 —— 实测这个账号的
+    //    「大学物理实验」同时有 26-27-1 和 25-26-2 两个班。压成一个 ⇒
+    //    只查了其中**一个**班，顺序一换本学期的作业就一条都不在了。
+    var uniq = cxUniqueCourses(courses);
+
+    var items = [], failed = [];
+    var PHASE = '作业 · 考试 · 课堂活动';
+    var nowSec = Math.floor(Date.now() / 1000);
+    prevRest = (prevRest && typeof prevRest === 'object') ? prevRest : {};
+    // 先整体继承上一轮的状态，再逐门覆盖扫过的课。
+    // 🔴 不能只写「这次扫过的课」：中途 auth 失效 break 之后，剩下的课没扫，
+    //    状态丢了它们攒的 streak 就白攒了 —— 等于每次从零数。
+    var rest = {};
+    for (var rk in prevRest) {
+      // ⚠️ 只继承新格式的 key（带 `:`）。0.38 及以前按裸 courseId 存，
+      //    那个口径本身就是错的（一个 courseId 压了多个学期的班）。
+      if (prevRest.hasOwnProperty(rk) && prevRest[rk] &&
+          typeof prevRest[rk] === 'object' && String(rk).indexOf(':') >= 0) {
+        rest[rk] = prevRest[rk];
+      }
+    }
+    var paused = [];              // 这次因为「已结课」而没扫的课
+    var white = cxNormWhite(activeNames);
+    var term = cxCurTerm(semester);
+    // 🔴 0.47.2：进度条的分母按**这学期**算。
+    //    用户 2026-11-06：「仍然是类似于 12/37 这样，后面的总数也改成
+    //    当前学期的」。以前 n 一直是 uniq.length（含历史学期），哪怕只细查
+    //    17 门，进度也写「第 12 / 37 门课」—— 看着就像范围没收窄。
+    //    有课表 ⇒ 分母 = 这学期在修的课数，分子只数全扫过的课；
+    //    没有课表 ⇒ 分母照旧全部（那时确实一门一门全扫）。
+    var scope = white.length ? 'term' : 'all';
+    var deepTotal = uniq.length;
+    if (white.length) {
+      deepTotal = 0;
+      for (var dt = 0; dt < uniq.length; dt++) {
+        if (cxIsActiveCourse(uniq[dt], white, term)) deepTotal++;
+      }
+      if (!deepTotal) { deepTotal = uniq.length; scope = 'all'; }
+    }
+    var deepDone = 0;             // 进度分子：只数「全扫」的课
+    // 0.47.0：全扫了几门 / 只看了签到几门。
+    var deepN = 0, actN = 0;
+    // 0.44.0：这一轮撞上「查得太频繁」就整轮停手（见 cxStatusOk 的 202 分支）。
+    var busyOut = false;
+    // 🔴 0.52.3 v6（用户 2026-11-14：「明明登录着学习通，上面还是显示登录过期」）：
+    //    以前**任何一处** auth 都当场 break，还把剩下的每一门都写成
+    //    「登录态失效，没查」—— 于是一门归档课的活动列表跳了登录页，
+    //    整页就变成「登录态过期了」+ 三十门没查，而会话其实好好的。
+    //    会话还在不在，只有「连续几门都 auth」才说得准：真掉线时
+    //    课程列表那一步（cxScanAll 开头）就已经失败了，根本走不到这里。
+    //    所以个别课 auth 只记成这一门没查到，连续 CX_AUTH_STREAK 门才认。
+    var authN = 0;                // 连续几门课 auth 了
+    var authStop = false;         // 连续够了 ⇒ 认定会话真的没了
+
+    for (var k = 0; k < uniq.length; k++) {
+      var c = uniq[k];
+      var ckey = cxRestKey(c.courseId, c.classId);
+
+      // ---- 这门课要全扫，还是只看一眼签到 ----
+      // 🔴 0.47.0：判据从「三个列表全空攒 3 次 / 最新内容 90 天前」换成
+      //    **教务系统里本学期在修的课表**。老判据对历史学期的课判不动 ——
+      //    它们不空（上学期的作业还挂着），于是 37 门课一个学期都判不出结课，
+      //    每轮全量扫。用户 2026-11-06：「我这个学期只有十几个课程」。
+      //      deep = 全扫（课程页 + 作业 + 考试 + 活动，4 个请求）
+      //      act  = 判它结课了，只查活动列表（1 个请求）—— 签到在里面
+      // 🔴 没有教务课表时**不降级成 act**，退回 0.44 的老口径，其余照旧全扫。
+      //    没有权威名单的时候少查一门就可能漏一门作业，那比慢几十秒严重得多。
+      var st = prevRest[ckey] || {};
+      var tier;
+      // 🔴 2026-11-06：**课表优先于 force**。手动点「重新检查」走 force，
+      //    以前会 37 门全扫 —— 用户点完看到「共 37 门课」，以为收范围没生效。
+      //    「现在去问一遍」≠「把结课的也问一遍」：结课的课再扫 4 个请求
+      //    也多不出一条作业，签到那 1 个请求（act 档）手动刷新照样发。
+      if (white.length) tier = cxIsActiveCourse(c, white, term) ? 'deep' : 'act';
+      else if (force) tier = 'deep';
+      else tier = (st.cold === true) ? 'act' : 'deep';
+
+      // 结课的课也不是每轮都探。探过一次就隔 CX_ACT_PROBE_GAP 再来。
+      // 🔴 认的是 st.act 这个标记（= 已经按新办法探过一次），不是 lastAt：
+      //    从老版本升上来时 rest 里没有这个键，照着 lastAt 直接跳过的话，
+      //    那批课 7 天内一次签到也看不到。
+      if (tier === 'act' && st.act === true && !force &&
+          nowSec - (st.lastAt || 0) < CX_ACT_PROBE_GAP) {
+        // why 是给界面选句子用的：term = 教务课表里这学期没有（有依据）；
+        // cold = 没有课表，只能靠「内容很旧」判（说得软一点）。
+        paused.push({ course: c.title, courseId: c.courseId,
+                      classId: c.classId, lastAt: st.lastAt || 0,
+                      why: white.length ? 'term' : 'cold' });
+        // 进度照报，但**分子不动**：这学期要查的已经查完了，这里只是顺手
+        // 看一眼结课那批的签到。分母是 17，分子就停在 17 ——
+        // 别让它跑到「第 37 / 17 门」这种看着就错的地方。
+        CX_SCAN.i = deepDone;
+        CX_SCAN.n = deepTotal;
+        CX_SCAN.course = c.title;
+        CX_SCAN.phase = '已结课，跳过';
+        continue;
+      }
+
+      // 这门课这一轮读到的条目，用来算「最新内容时间」（冷课判据要）
+      var mine = [];
+      var push = function (rows) {
+        for (var x = 0; x < rows.length; x++) {
+          rows[x].course = c.title;
+          rows[x].courseId = c.courseId;
+          items.push(rows[x]);
+          mine.push(rows[x]);
+        }
+      };
+      // part / code 是给**界面**用的分类键，不是给人看的字（和 chaoxing.py
+      // 的 note() 同一个口径）。界面拿它们把「20 门课各缺作业 + 各缺考试」
+      // 合成一句人话。
+      var note = function (why, part, code) {
+        failed.push({ course: c.title, why: String(why).slice(0, 60),
+                      part: part || 'other', code: String(code || '') });
+      };
+
+      // ---- 结课的课：只看一眼签到 ----
+      // 作业和考试**一个请求都不发** —— 教务课表里没有这门课，判它结课了。
+      // 唯一还可能变的是签到：它是个几分钟的窗口，而「点名专用」这类课
+      // 教务课表里根本没有、唯一的内容就是签到，所以必须留这一眼。
+      if (tier === 'act') {
+        var warm = false;
+        try {
+          var aRows0 = await cxActiveList(c);
+          push(aRows0);
+          var newestAct = null;
+          for (var ai = 0; ai < aRows0.length; ai++) {
+            var at2 = aRows0[ai].startAt || aRows0[ai].endAt;
+            if (at2 && (newestAct === null || at2 > newestAct)) newestAct = at2;
+          }
+          warm = !!newestAct && (nowSec - newestAct) < CX_WARM_ACT;
+        } catch (e0) {
+          note((e0 && e0.message) || e0, 'active', e0 && e0.kind);
+          if (e0 && e0.kind === 'auth') {
+            authN++;
+            // 连续够了才认「会话没了」，见 authN 那段。
+            if (authN >= CX_AUTH_STREAK) {
+              for (var y0 = k + 1; y0 < uniq.length; y0++) {
+                failed.push({ course: uniq[y0].title, why: '登录态失效，没查',
+                              part: 'auth', code: 'auth' });
+              }
+              authStop = true;
+              break;
+            }
+            continue;                       // 只这一门没查到，接着看下一门
+          }
+          if (e0 && e0.busy) { busyOut = true; break; }
+        }
+        // 探到「最近还有活动」⇒ 这门课其实还在动，下一轮恢复全扫。
+        // 不清 resting 的话，它会被自己的结课结论永远锁在 act 档。
+        if (warm) {
+          rest[ckey] = { streak: 0, since: nowSec, lastAt: nowSec,
+                         resting: false, title: c.title, cold: false, act: true };
+        } else {
+          var nx0 = {};
+          for (var pk in st) if (st.hasOwnProperty(pk)) nx0[pk] = st[pk];
+          nx0.lastAt = nowSec; nx0.title = c.title; nx0.act = true;
+          // cold 只在「真的读到过内容且都旧」时才算证据。活动列表一条都没有
+          // ≠ 内容旧 —— 那是「没动静」，和作业页「没读到」是两回事。
+          if (!('cold' in nx0)) nx0.cold = true;
+          rest[ckey] = nx0;
+        }
+        actN++;
+        authN = 0;                       // 这一门读到了 ⇒ 连续计数归零
+        CX_SCAN.i = deepDone;
+        CX_SCAN.n = deepTotal;
+        CX_SCAN.course = c.title;
+        CX_SCAN.phase = '已结课，只看了签到';
+        if (k < uniq.length - 1) {
+          await cxSleep(CX_GAP + Math.random() * CX_JITTER);
+        }
+        continue;
+      }
+
+      var meta = null;
+      // 这一轮三个模块各自「读到了没有、读到几条」。
+      // 🔴 只有三个都 ok 才谈得上「这门课是空的」—— 少一个都不算，
+      //    因为没读到的那块可能正好装着作业。
+      var wOk = false, eOk = false, aOk = false;
+      var wN = 0, eN = 0, aN = 0;
+
+      try {
+        meta = await cxCourseMeta(c);
+      } catch (e) {
+        if (e && e.kind === 'auth') {
+          note((e && e.message) || e, 'course', e.kind);
+          authN++;
+          if (authN >= CX_AUTH_STREAK) {
+            for (var y = k + 1; y < uniq.length; y++) {
+              failed.push({ course: uniq[y].title, why: '登录态失效，没查',
+                            part: 'auth', code: 'auth' });
+            }
+            authStop = true;
+            break;
+          }
+          // 只这一门打不开（归档课常见）⇒ 跳过它，进度照走，接着下一门。
+          deepDone++;
+          CX_SCAN.i = deepDone;
+          CX_SCAN.n = deepTotal;
+          CX_SCAN.course = c.title;
+          if (k < uniq.length - 1) {
+            await cxSleep(CX_GAP + Math.random() * CX_JITTER);
+          }
+          continue;
+        }
+        // 被风控拦下：第一门课就停，不再挨个去撞同一堵墙。
+        if (e && e.busy) { busyOut = true; break; }
+        note((e && e.message) || e, 'course', e && e.kind);
+      }
+
+      // 三个模块各查各的：一个挂了不能连累另外两个。
+      // 🔴 每个失败都要记进 failed —— 否则「没读到」会被当成「没有」。
+      var stop = false;
+      if (meta) {
+        try {
+          var wRows = await cxWorkList(c, meta);
+          wN = wRows.length; wOk = true; push(wRows);
+        } catch (e2) {
+          note((e2 && e2.message) || e2, 'work', e2 && e2.kind);
+          if (e2 && e2.kind === 'auth') { stop = true; authN++; }
+          if (e2 && e2.busy) { busyOut = true; stop = true; }
+        }
+        if (!stop) {
+          try {
+            var eRows = await cxExamList(c, meta);
+            eN = eRows.length; eOk = true; push(eRows);
+          } catch (e3) {
+            note((e3 && e3.message) || e3, 'exam', e3 && e3.kind);
+            if (e3 && e3.kind === 'auth') { stop = true; authN++; }
+            if (e3 && e3.busy) { busyOut = true; stop = true; }
+          }
+        }
+      } else {
+        // 课程页没打开 ⇒ 作业和考试也查不了（两个都要课程页里的 stuenc）。
+        // 🔴 必须**分别**记下来。只写一句「进不了课程页」的话，界面上
+        //    「作业」和「考试」两项就静默消失了，用户会以为这门课没有。
+        //    code=nocourse 是给界面看的：这两条和 course 那条是**同一件事**，
+        //    界面上要并成一句，不能数成「17 门 + 34 门」。
+        //    和 chaoxing.py 的 scan() 逐字对齐。
+        note('课程页没打开，没查', 'work', 'nocourse');
+        note('课程页没打开，没查', 'exam', 'nocourse');
+      }
+
+      // 活动列表不需要 stuenc，课程页挂了也能查
+      if (!stop) {
+        try {
+          var aRows = await cxActiveList(c);
+          aN = aRows.length; aOk = true; push(aRows);
+        } catch (e4) {
+          note((e4 && e4.message) || e4, 'active', e4 && e4.kind);
+          if (e4 && e4.kind === 'auth') { stop = true; authN++; }
+          if (e4 && e4.busy) { busyOut = true; stop = true; }
+        }
+      }
+
+      // 被拦了就到此为止。剩下的课**一个请求都不发** —— 越问封得越久，
+      // 而且它们本来就不该出现在「没查到」的名单里。
+      if (busyOut) break;
+
+      deepN++;
+      deepDone++;
+      authN = 0;                         // 这一门读到了 ⇒ 连续计数归零
+      CX_SCAN.i = deepDone;
+      CX_SCAN.n = deepTotal;
+      CX_SCAN.course = c.title;
+      CX_SCAN.phase = PHASE;
+
+      if (stop) {
+        // 这门课没扫完 ⇒ **不更新它的状态**（rest 里保留继承值）。
+        // 拿「登录失效」当「空」的话，被限流的那一轮会把一批课直接判成结课。
+        authStop = authStop || (authN >= CX_AUTH_STREAK);
+        if (authStop) {
+          for (var y2 = k + 1; y2 < uniq.length; y2++) {
+            failed.push({ course: uniq[y2].title, why: '登录态失效，没查',
+                          part: 'auth', code: 'auth' });
+          }
+          break;
+        }
+        continue;                       // 只这一门没读到，接着下一门
+      }
+
+      // ---- 结课判定 ----
+      // 🔴 只有「课程页打开 + 作业/考试/活动三个列表全部成功返回」才算一次
+      //    有效的观察。失败、noentry、课程页没打开**都不算空** —— 那是「没读到」。
+      //    和 chaoxing.py 的 scan() 逐条对齐。
+      if (meta && wOk && eOk && aOk) {
+        // newest = 这门课最新一条内容的时间。0.39.0 起它是「冷课」的证据：
+        //   历史学期的课**不是空的**（上学期的作业还挂着），只按「全空」
+        //   永远判不出结课，于是每次刷新都全量扫。改成看「最新一条有多旧」。
+        //   只认 endAt / startAt，两者都没有就是 null（= 不知道多旧，不判冷）。
+        var newest = null;
+        for (var mi = 0; mi < mine.length; mi++) {
+          var mt = mine[mi].endAt || mine[mi].startAt;
+          if (mt && (newest === null || mt > newest)) newest = mt;
+        }
+        var nxt = cxRestNext(st, true, wN + eN + aN === 0, nowSec, newest);
+        nxt.title = c.title;
+        // 0.44.0：单独记一份「够冷」的证据，给「没有教务课表」那条路用。
+        // 不放进 cxRestNext 里，是因为那个函数要和 chaoxing.py 逐条对拍，
+        // 动它的返回值就得同时动 Python 那份；这个字段只是扫描器的备注。
+        var nv2 = (typeof newest === 'number') ? newest : NaN;
+        nxt.cold = isFinite(nv2) && (nowSec - nv2) >= CX_COLD_NO_WHITE;
+        rest[ckey] = nxt;
+      }
+      // 没读到 ⇒ streak / since 原地不动：既不加（那是拿失败当空），
+      // 也不清零（那会让好不容易攒的次数白费）。rest 里已经继承了原值。
+
+      if (k < uniq.length - 1) {
+        await cxSleep(CX_GAP + Math.random() * CX_JITTER);
+      }
+    }
+
+    // 🔴 0.44.0：撞上风控就整轮作废，**不返回半份结果**。
+    //    以前的做法是继续往下扫，每门课各记一条「查得太频繁」—— 于是
+    //    「查到第 4 门被拦」在界面上变成「31 门课没查到」，用户以为
+    //    31 门都查过了、都坏了，实际上剩下 27 门一个请求都没发。
+    //    抛出去之后上层不落盘，界面上留着上次那份完整数据 + 一句
+    //    「这次没查成：学习通查得太频繁了，过几分钟再试」—— 这是事实。
+    if (busyOut) {
+      throw cxErr('查得太频繁，等 15 分钟再试',
+                  'busy');
+    }
+
+    // 🔴 0.52.3 v6：连续 CX_AUTH_STREAK 门课都跳到登录页 ⇒ 怀疑会话掉了。
+    //    ⚠️ 只有**连续**才走到这里：个别归档课跳登录页时下面照常出数据，
+    //       那一门记在 failed 里，界面写「没查全」，不再冤枉整个账号。
+    // 🔴 0.53.0 v4（2026-11-15）：怀疑不等于结论 —— 先拿课程列表证一次。
+    //    · 探针说「活着」⇒ 刚才那些是误判（维护页 / 防护页 / 归档课壳页），
+    //      把它们从「登录失效」降级成「这门没读到」，照常返回这份数据；
+    //    · 探针说「掉了」⇒ 真过期，照旧抛，界面给重连按钮；
+    //    · 探针自己也问不出来（断网 / 被拦）⇒ 不能说人家过期，抛探针那个
+    //      错误 —— 是什么就说什么，用户才能做对的事。
+    if (authStop) {
+      var al = await cxSessionAlive();
+      if (al.alive === false) {
+        throw cxErr('学习通的登录态过期了，点「重新连接」再试一次', 'auth');
+      }
+      if (al.alive === null) {
+        throw al.err || cxErr('这次没查成：连不上学习通', 'net');
+      }
+      // 活着 ⇒ 降级。part 换成 lookauth：这些课**确实没扫到**，要照实算进
+      // 「没查到」，只是不能再叫「登录失效」—— 账号是好的。
+      failed = cxDowngradeAuth(failed);
+      authStop = false;
+    }
+
+    // ---- 归类 ----
+    // 签到单独留一份**完整**的（含已结束）：用户问的是「我漏了哪几次」，
+    // 那只有看历史才知道。只留 live 的话，「查看签到」等于什么都没查。
+    // 🔴 仍然只读：这里只是把读到的排出来，不代签、不点任何按钮。
+    var signs = [];
+    for (var s1 = 0; s1 < items.length; s1++) {
+      if (items[s1].kind === 'sign') signs.push(items[s1]);
+    }
+    // 新的排前面。没有 startAt 的垫底，别当 0 —— 那会变成「最老」。
+    signs.sort(function (a, b) { return (b.startAt || 0) - (a.startAt || 0); });
+
+    // 作业里状态认不出来的（比如「已互评」）不往任何一类里凑，单独说清楚。
+    var odd = [];
+    var open = [];
+    var doneN = 0, endedN = 0, staleN = 0;
+    for (var t1 = 0; t1 < items.length; t1++) {
+      var it = items[t1];
+      if (it.kind === 'work' && it.state === 'other') { odd.push(it); continue; }
+      // 🔴 0.53.0：做完的那批要**带出去**（见下面 doneItems）。这里只数个数。
+      if (it.state === 'done') { doneN++; continue; }
+      if (it.state === 'ended') { endedN++; continue; }
+      // 🔴 签到不进待办列表 —— 它在顶部那张签到卡里，单独一个位置。
+      //    签到的时效是「几分钟」，和「还剩 3 天的作业」排一起会被挤到下面；
+      //    而且同一条会同时出现在卡里和列表里，像重复了。
+      if (it.kind === 'sign') continue;
+      // 🔴 0.47.0：**早就结束的**不再列出来。用户 2026-11-06：
+      //    「已经结束一段时间了的就别显示了，除非是需要互评的作业」。
+      //    这类和「已交 / 已结束」不同：那些是**做完了**，这些是
+      //    **没做也没戏了**，一直挂着只会把真正要交的挤下去。
+      if (cxIsStale(it, nowSec)) { staleN++; continue; }
+      if (cxIsOpen(it)) open.push(it);
+    }
+    // 界面上「已完成 N 条」全指着这一份。以前 APK 根本不返回它 ——
+    // 手机上这段永远是空的，用户没法核对「它到底认没认我交了」。
+    var doneItems = cxDoneItems(items, nowSec);
+
+    // 有倒计时的排前面（越少越急），没倒计时的垫底。
+    // 🔴 垫底 ≠ 已过期：实测真有「未交但没写截止时间」的作业。
+    // 🔴 三段排序，不是两段：
+    //      rank 0 还能赶上的（按剩余分钟升序）
+    //      rank 1 没有截止时间的（按标题）
+    //      rank 2 已经过期的（按标题，**绝不能排最前面**）
+    //    以前只有「有/没有」两段：过期那条 endAt 在过去、算出来是负数，
+    //    负数最小 ⇒ 一年前的通知排首屏第一行，真要交的作业掉到第三屏。
+    //    改这里必须同步 chaoxing.py 的 open_items.sort。
+    var nowSort = Math.floor(Date.now() / 1000);
+    function cxSortRank(x) {
+      if (x.leftMin == null) return 1;
+      if (x.endAt && x.endAt < nowSort) return 2;
+      return 0;
+    }
+    open.sort(function (a, b2) {
+      var ra = cxSortRank(a), rb = cxSortRank(b2);
+      if (ra !== rb) return ra - rb;
+      if (ra === 0) return (a.leftMin || 0) - (b2.leftMin || 0);
+      var ta = String(a.title || ''), tb = String(b2.title || '');
+      return ta < tb ? -1 : (ta > tb ? 1 : 0);
+    });
+
+    var counts = { work: 0, exam: 0, sign: 0, topic: 0, notice: 0, other: 0 };
+    for (var t2 = 0; t2 < open.length; t2++) {
+      var kk = open[t2].kind || 'other';
+      counts[kk] = (counts[kk] || 0) + 1;
+    }
+
+    // 🔴 按**课**去重：一门课可能同时缺作业和考试，failed 里会记两条，
+    //    但它是同一门课。以前按 failed 条数减，20 门课能算出 scanned = 12。
+    // ⚠️ lookauth 也算「没扫到」（0.53.0 v4）：那是「像登录页、但账号其实
+    //    是好的」，课没读到就是没读到 —— 不算进来的话 scanned 会把没查的
+    //    那几门一起算成查过了。
+    var authCourses = {};
+    for (var f = 0; f < failed.length; f++) {
+      var pp = String(failed[f].part || '');
+      if (pp === 'auth' || pp === 'lookauth') authCourses[failed[f].course] = 1;
+    }
+    var notScanned = 0;
+    for (var ac in authCourses) {
+      if (authCourses.hasOwnProperty(ac)) notScanned++;
+    }
+
+    return {
+      ok: true,
+      at: Math.floor(Date.now() / 1000),
+      // 🔴 0.47.2：给的是**分母那个数**（有课表时 = 这学期的门数），
+      //    不是学习通里一共有多少教学班。界面靠它说「本学期 N 门」。
+      courses: deepTotal,
+      scanned: deepTotal - notScanned,
+      total: items.length,
+      todo: open.length,
+      counts: counts,
+      // 0.47.0：全扫了几门 / 只看了签到几门。
+      // 0.47.2：`scope` 说明分母是「这学期」还是「全部」。
+      scope: scope,
+      deep: deepN,
+      act: actN,
+      skipped: { done: doneN, ended: endedN, odd: odd.length,
+                 stale: staleN },
+      failed: failed,
+      // 已经做完的那批（作业 / 考试 / 练习）。前端在列表下面折叠成一段，
+      // 每条带「已完成」标 —— 用户就是靠它来对「学习通到底认不认我交了」。
+      // 🔴 字段名必须叫 doneItems：app.js 的 cxPaintTodo 只认这个名字，
+      //    缺了它整段「已完成 N 条」在 APK 里静默消失（这一版之前就是这样）。
+      doneItems: doneItems,
+      items: open,
+      // 每门课的结课判定状态。下一轮扫描要原样传回来（`prevRest`），
+      // 断了就每次都从零数，永远判不出结课。
+      rest: rest,
+      // 这次因为「已结课」而没扫的课。空数组 ≠ 没有结课 ——
+      // 也可能是这一轮全都到点了、全扫了。
+      paused: paused,
+      // 全部签到（含已结束），给「签到」卡用。老前端没有这个字段也能跑。
+      signs: signs,
+      // 老字段，前端 0.12 及以前在用，留着别删
+      other: odd.length,
+      otherItems: odd
+    };
+  }
+
+  function cxScanState() {
+    return {
+      state: CX_SCAN.state, at: CX_SCAN.at, i: CX_SCAN.i,
+      n: CX_SCAN.n, course: CX_SCAN.course, phase: CX_SCAN.phase,
+      err: CX_SCAN.err, kind: CX_SCAN.kind
+    };
+  }
+
+  // ------------------------------------------------- 随堂练习快查（0.52.3 v6）
+  //
+  // 用户 2026-11-14：「很多随堂练习只有几分钟持续时间，当场刷新完全来不及」。
+  //
+  // 全量扫描是 32 门 × 4 个请求、四十秒起步 —— 等它回来这一节已经下课了。
+  // 而随堂练习只可能出现在**今天正在上的那几门课**里：按教务课表筛出来通常
+  // 1~3 门，一门一个请求（activelist），两秒内就有答案。
+  //
+  // 🔴 只发 activelist：它不需要课程页里的 stuenc，是这条链上最便宜的那个请求。
+  // 🔴 最多 4 门。实训周那种「一天十几门」的排法会变成十几个请求，
+  //    那正是学习通风控认的形状 —— 宁可少查，不许把账号撞进冷静期。
+  // 🔴 这不是一次扫描：不写缓存、不动 CX_SCAN、不进 failed 名单。
+  //    查到的只是「此刻正在进行的」，作业的完整列表仍然以全量扫描为准。
+  var cxLive = { at: 0, items: [], signs: [], checked: 0 };
+  var CX_LIVE_TTL = 45000;      // 45 秒内不重复问（用户来回切页时不刷请求）
+  var CX_LIVE_MAX = 4;
+
+  async function cxLiveCheck(names, semester) {
+    var now = Date.now();
+    if (now - cxLive.at < CX_LIVE_TTL) return cxLive;
+    var white = cxNormWhite(names);
+    // 没课表就收窄不了 —— 那就一条都不发，交给全量扫描去查。
+    if (!white.length) return cxLive;
+    var term = cxCurTerm(semester);
+    var all = cxUniqueCourses(await cxCourses());
+    var picked = [];
+    for (var i = 0; i < all.length && picked.length < CX_LIVE_MAX; i++) {
+      if (cxIsActiveCourse(all[i], white, term)) picked.push(all[i]);
+    }
+    var items = [], signs = [];
+    for (var k = 0; k < picked.length; k++) {
+      var rows;
+      try {
+        rows = await cxActiveList(picked[k]);
+      } catch (e) {
+        // auth ⇒ 真的掉线了，交给调用方；其余（改版 / 网络 / 这门课没开）
+        // 都只当这一门没读到，不影响另外几门。
+        if (e && e.kind === 'auth') throw e;
+        continue;
+      }
+      for (var j = 0; j < rows.length; j++) {
+        rows[j].course = picked[k].title;
+        if (rows[j].kind === 'sign') signs.push(rows[j]);
+        else items.push(rows[j]);
+      }
+      if (k < picked.length - 1) await cxSleep(400 + Math.random() * 400);
+    }
+    cxLive = { at: Date.now(), items: items, signs: signs, checked: picked.length };
+    return cxLive;
+  }
+
+  // ------------------------------------------------------ 慧生活798（直饮水）
+  //
+  // 查余额 / 列设备 / 接水 / 停止 / 积分 / 消费记录 / 积分任务 / 签到。
+  //
+  // 🔴 和 water.py 是**同一套规则的两份实现**（APK 没有 Python）。改一边必须
+  //    逐条镜像另一边，`check_water_api.py` 会拿同一批响应喂给两边对拍。
+  //
+  // 🔴 **两套账号是两个账号**（2026-10-30 起）：设备登录（1,1）管接水和设备，
+  //    积分登录（1,5）管积分、任务、签到。两个 token 互不通用，任务列表
+  //    按平台各返回一份 —— 原版是合并后去重再跑的，只登一个就少一半任务。
+  //
+  // 🔴 签名：积分/签到**必须签**（0.26.2 之前写「不带」是错的）。
+  //    md5(adId + 30×桶 + token尾8 + uid尾8 + 盐)，两个盐见下面常量。
+  //    细则见 mobile/water.py 开头那段。
+  var WATER = {
+    BASE: 'https://i.ilife798.com/api/v1',
+    // 官方客户端的 UA。第三方项目用 "WaterWidget/5.5.0" 也能通，说明服务端
+    // 不是硬校验；取官方那个是为了兼容（万一哪天按 UA 分流）。
+    // 🔴 2026-11-08：**必须留在 3.1.9**。11-06 顶到 3.1.10（当时以为平台在挡
+    //    旧客户端），结果真登录直接「验签失败」—— 服务端按这个版本号选一套盐
+    //    来验签，3.1.10 那套盐在加固包里、明文搜不到。3.1.9 配 3.1.9 的盐
+    //    实测 code:0。别再跟着官方发版往上顶。
+    OFFICIAL_VER: '3.1.9',
+    UA: 'Android_ilife798_3.1.9',
+    T_ACCOUNT: '1,5',
+    T_DEVICE: '1,1',
+    // 服务端 API 版本号（**和客户端版本无关**，原版按用途写死不同的值）。
+    // 漏了不会报错，只会拿到「另一个版本」的响应 —— 那种错最难查。
+    V_ACCOUNT: '2.0.83',
+    V_SCORE: '2.0.178',
+    V_DEVICE: '3.1.9',
+    // 积分签名的两个盐（2026-10-30 从官方 Release APK 的 dex 里读出来的，
+    // 见 water.py 开头那段）。它们不是服务端密钥，是**客户端常量**。
+    SALT_APP: 'AbCdEfGhIjKlMnOpQrStUvWxYz12345',
+    SALT_MINI: 'K9xP2QnR5T8wY3fA7cE1gJ4mL6oU0sZ',
+    // ⚠️ 这个 cid 是**广告渠道**编号，不是登录参数 —— 登录 body 里塞它会回
+    //    「请升级最新版应用」。2026-11-08 起登录不再发它，留着给别的接口备用。
+    CID: 'drinkwaterapp123456789',
+    // 平台说「签名不对」时给用户看的那句话。**和 water.py 的 SIGN_MSG
+    // 一字不差**（check_water_api 逐字对拍），四份实现共用这一句。
+    SIGN_MSG: '慧生活没认这次的操作，隔一分钟再试一次',
+    // 登录被拒时的那句话 —— **不能沿用 SIGN_MSG**（和 water.py 的
+    // LOGIN_SIGN_MSG 一字不差）。登录签名里**没有时间桶**，「手机时间不准」
+    // 对登录无从谈起；11-06 就是拿那句话解释「验签失败」，白查两天版本号。
+    LOGIN_SIGN_MSG: '慧生活未认这次登录，先用官方 App 登录一次',
+    // 🔴 下面这些是**查出来的字段名，不是猜的**（2026-10-30 对着原项目
+    //    life-798 5.5.0 源码核对过；细则见 mobile/water.py 那一大段注释）。
+    //    data.missions[i] = {refId, name, score, limit}
+    //      · 响应里叫 refId，请求 body 里才叫 adId —— 两个名字一个东西
+    //      · data.accScoreRsp.limits[j].limit 是**已做次数**（-1=不限次），
+    //        和 missions[i].limit（总次数）同名反义，剩余要自己减
+    //    data.dailyRSP = {adId, score, config:[{rule,score,msg}]}
+    //      · rule 是连签奖励的位掩码；已签掩码在 accScoreRsp.daily.week
+    //    ⇒ 和 water.py 的 missions() **必须逐条对应**（红线：两份实现要对拍）。
+    MISSION_SKIP: ['免费权益', '借贷', '贷款'],
+    // 加分类型码要特殊处理的 adId。原版写死 `"1705776998".equals(adId) ? 2 : 4`。
+    // ⚠️ 这**不是**签到任务（原项目单测里它 name 是 "video"）。
+    SIGN_AD_ID: '1705776998',
+    // 🔴 服务端与本机的时差（毫秒），只对**设备路**的签名有意义。
+    //    签名里有个 30 秒的时间桶，本机时间偏出十几秒就可能差一格 ⇒ 验签失败。
+    //    官方客户端拿响应头里的 Date 校准（life-798 的 appServerTimeOffsetMillis）。
+    //    🔴 2026-11-08：`date` 的单位是**毫秒**（原生 getDate()），按秒再乘
+    //       1000 会算出 1.7e15 ⇒ 设备路每次提交都「验签失败」（真踩过）。
+    //    积分路（1,5）官方本来就用本机时间，别一起改。
+    srvOffsetMs: 0
+  };
+
+  function wErr(msg, kind, code) {
+    var e = new Error(msg);
+    e.kind = kind || 'net';
+    e.code = (code == null ? null : code);
+    return e;
+  }
+
+  /** 图形验证码的会话串。原项目用 10 位随机字母数字，照做。 */
+  function wKey() {
+    var cs = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
+    var s = '';
+    for (var i = 0; i < 10; i++) s += cs.charAt(Math.floor(Math.random() * cs.length));
+    return s;
+  }
+
+  /** 纯 JS 的 MD5（按 **UTF-8 字节**算，和 Python 的 hashlib.md5(s.encode('utf-8')) 一致）。
+   *
+   *  🔴 APK 里没有 Python，签名只能在这儿算；而水.py 那边是 hashlib。
+   *     两份实现算出来**必须逐字节相同**，否则同一次任务在网页版和 APK 里
+   *     一个能跑一个报「签名不对」，而那种错看着像服务端的问题。
+   *     `check_water_api.py` 拿同一批输入对拍两边（红线 54）。
+   *
+   *  ⚠️ 不要图省事用 charCodeAt 直接算：只要有一个非 ASCII 字符（服务端
+   *     将来把 adId 换成中文、或者 token 里带 emoji），两边就会分叉。
+   */
+  function wMd5(str) {
+    function toBytes(s) {
+      var out = [], i, c;
+      for (i = 0; i < s.length; i++) {
+        c = s.charCodeAt(i);
+        if (c < 0x80) {
+          out.push(c);
+        } else if (c < 0x800) {
+          out.push(0xC0 | (c >> 6), 0x80 | (c & 63));
+        } else if (c < 0xD800 || c >= 0xE000) {
+          out.push(0xE0 | (c >> 12), 0x80 | ((c >> 6) & 63), 0x80 | (c & 63));
+        } else {
+          i++;
+          var c2 = s.charCodeAt(i) || 0;
+          var cp = 0x10000 + (((c & 0x3FF) << 10) | (c2 & 0x3FF));
+          out.push(0xF0 | (cp >> 18), 0x80 | ((cp >> 12) & 63),
+                   0x80 | ((cp >> 6) & 63), 0x80 | (cp & 63));
+        }
+      }
+      return out;
+    }
+    var K = [], i;
+    for (i = 0; i < 64; i++) {
+      K[i] = Math.floor(Math.abs(Math.sin(i + 1)) * 4294967296) | 0;
+    }
+    var S = [7, 12, 17, 22, 5, 9, 14, 20, 4, 11, 16, 23, 6, 10, 15, 21];
+
+    var bytes = toBytes(String(str == null ? '' : str));
+    var bitLen = bytes.length * 8;
+    bytes.push(0x80);
+    while (bytes.length % 64 !== 56) bytes.push(0);
+    var lo = bitLen >>> 0, hi = Math.floor(bitLen / 4294967296) >>> 0;
+    bytes.push(lo & 255, (lo >>> 8) & 255, (lo >>> 16) & 255, (lo >>> 24) & 255);
+    bytes.push(hi & 255, (hi >>> 8) & 255, (hi >>> 16) & 255, (hi >>> 24) & 255);
+
+    var a0 = 0x67452301, b0 = 0xEFCDAB89, c0 = 0x98BADCFE, d0 = 0x10325476;
+    for (var off = 0; off < bytes.length; off += 64) {
+      var M = [];
+      for (i = 0; i < 16; i++) {
+        M[i] = (bytes[off + i * 4] | (bytes[off + i * 4 + 1] << 8)
+                | (bytes[off + i * 4 + 2] << 16) | (bytes[off + i * 4 + 3] << 24)) | 0;
+      }
+      var A = a0, B = b0, C = c0, D = d0;
+      for (i = 0; i < 64; i++) {
+        var F, g;
+        if (i < 16) { F = (B & C) | (~B & D); g = i; }
+        else if (i < 32) { F = (D & B) | (~D & C); g = (5 * i + 1) % 16; }
+        else if (i < 48) { F = B ^ C ^ D; g = (3 * i + 5) % 16; }
+        else { F = C ^ (B | ~D); g = (7 * i) % 16; }
+        F = (F + A + K[i] + M[g]) | 0;
+        var sh = S[(i >> 4) * 4 + (i % 4)];
+        A = D; D = C; C = B;
+        B = (B + (((F << sh) | (F >>> (32 - sh))) | 0)) | 0;
+      }
+      a0 = (a0 + A) | 0; b0 = (b0 + B) | 0;
+      c0 = (c0 + C) | 0; d0 = (d0 + D) | 0;
+    }
+    function hex(n) {
+      var s = '';
+      for (var j = 0; j < 4; j++) {
+        s += ('0' + (((n >>> (j * 8)) & 255).toString(16))).slice(-2);
+      }
+      return s;
+    }
+    return hex(a0) + hex(b0) + hex(c0) + hex(d0);
+  }
+
+  async function wReq(method, path, token, body, appType, version) {
+    var at = appType || WATER.T_DEVICE;
+    var headers = {
+      'User-Agent': WATER.UA,
+      'Accept': 'application/json, text/plain, */*',
+      // 官方的 OkHttp 拦截器给**每个**请求都写这两行（GET 也写）。
+      // 平台开始按「像不像官方客户端」挑毛病之后，缺项就不再无关紧要。
+      'Accept-Language': 'zh-Hans-CN;q=1',
+      'Content-Type': 'application/json',
+      'ApplicationType': at,
+      // 原版每个请求都带 VersionCode，服务端按它决定返回哪套结构。
+      'VersionCode': version || (at === WATER.T_DEVICE
+        ? WATER.V_DEVICE : WATER.V_ACCOUNT)
+    };
+    if (token) headers['Authorization'] = token;
+
+    var r;
+    try {
+      r = await pfHttp(method, WATER.BASE + path,
+                       body == null ? '' : JSON.stringify(body), headers);
+    } catch (e) {
+      throw wErr('连不上饮水服务：' + ((e && e.message) || e), 'net');
+    }
+    // 🔴 202 = 限流。和 502 一样，不单独判的话会被当成「服务器挂了」，
+    //    而用户该做的事完全不同（等几分钟 vs 换个网）。
+    if (r && r.status === 202) throw wErr('请求太频繁，等几分钟再试', 'limit');
+    if (!r || r.status !== 200) {
+      throw wErr('饮水服务没响应', 'net');
+    }
+    var js;
+    try { js = JSON.parse(r.body); } catch (e) {
+      throw wErr('饮水服务可能在维护，请稍后再试', 'data');
+    }
+    // 设备路顺手校准时差（签名要用，见 WATER.srvOffsetMs）。积分路不碰。
+    //
+    // 🔴 `date` 的单位要看清楚（2026-11-08 查出来的）：原生层给的是
+    //    `HttpURLConnection.getDate()`，它返回的**已经是毫秒**，不是秒。
+    //    这里原来写死 `r.date * 1000`，于是时差被算成 ~1.7e15 毫秒，
+    //    时间桶跟着飞掉 ⇒ 设备路每个签名都「验签失败」。
+    //    老壳（没有 req2 那批）万一给的是秒，就按量级判断补一次 —— 1e11 毫秒
+    //    是 1973 年，秒级的数永远小于它，两种都能认。
+    if (at === WATER.T_DEVICE && r && r.date > 0) {
+      var dms = Number(r.date) || 0;
+      if (dms > 0 && dms < 1e11) dms *= 1000;
+      var off = dms - Date.now();
+      // 离谱的值宁可不校准：宁可用本机时间，也别拿一个荒唐的偏移去签名。
+      if (dms > 0 && Math.abs(off) < 30 * 86400000) WATER.srvOffsetMs = off;
+    }
+    return js;
+  }
+
+  /** 统一判 code。0 成功；-99 登录过期；其余按服务端 msg 说。 */
+  function wCheck(js, what) {
+    var code = Number(js && js.code);
+    if (code === 0) return (js && js.data);
+    if (code === -99) throw wErr('登录已过期，请重新登录', 'auth', code);
+    var msg = String((js && js.msg) || '');
+    // 签名被拒要单独标出来：任务/签到的签名里有个 30 秒的时间桶，**本机时间
+    // 偏太多**就会被判「验签失败」—— 这是用户自己能动的那一种（另外一种是
+    // 平台改常量，那得我们改）。以前这里只说「可能需要更新 App」，等于没说。
+    // 🔴 平台原话是「**验签**失败」，不含「签名」二字 —— 只认「签名|sign」
+    //    时它掉进最后那条兜底，平台原话就原样蹦到屏幕上。
+    if (/签名|验签|sign/i.test(msg)) {
+      // 登录这条路没有时间桶，「先看看手机时间」在这儿是错的提示，单给一句。
+      throw wErr(what === '登录' ? WATER.LOGIN_SIGN_MSG : WATER.SIGN_MSG, 'sign', code);
+    }
+    if (/频繁|限流/.test(msg)) throw wErr(msg, 'limit', code);
+    // 平台原话「请升级最新版应用」—— 照抄显示，用户会以为**我们**这个 App 该更新。
+    // 说清是慧生活那边的要求，并给出这段时间唯一的办法。
+    if (/升级/.test(msg) && /应用/.test(msg)) {
+      throw wErr('慧生活只认最新版 App，暂时无法接入；'
+                 + '这段时间接水、积分先用官方「慧生活798」App', 'client', code);
+    }
+    throw wErr(msg || '操作没成功', 'biz', code);
+  }
+
+  /** 整数。认字符串，认不出来返回 null（**不兜底成 0**）。 */
+  function wInt(v) {
+    if (v == null || typeof v === 'boolean') return null;
+    if (typeof v === 'number') return isFinite(v) ? Math.trunc(v) : null;
+    var n = parseFloat(String(v).trim());
+    return isFinite(n) ? Math.trunc(n) : null;
+  }
+
+  /** 时间戳统一成毫秒。服务端有的给秒（10 位），有的给毫秒（13 位）。 */
+  function wMs(v) {
+    var n = wInt(v);
+    if (n == null || n <= 0) return 0;
+    return n < 10000000000 ? n * 1000 : n;
+  }
+
+  /** 列表类响应的记录数组。null = 这个键不存在（结构变了）；[] = 确实没有。 */
+  function wRecords(js) {
+    var d = js && js.data;
+    if (Array.isArray(d)) return d;
+    if (!d || typeof d !== 'object') return null;
+    var ks = ['records', 'items', 'list', 'content'];
+    for (var i = 0; i < ks.length; i++) {
+      if (Array.isArray(d[ks[i]])) return d[ks[i]];
+    }
+    return null;
+  }
+
+  /** 从 data 里取出「积分那一坨」。套着 accScoreRsp 就剥一层，没套就用 data 本身。
+   *
+   *  🔴 两种形状都要认，因为两条接口不一样（2026-10-30 查源码确认）：
+   *     GET /acc/score/acc-score   → data 本身就是 {validScore, totalScore, limits, daily}
+   *     GET /acc/score/mission-lst → data.accScoreRsp 才是那一坨
+   *     原版 IlifeApi.taskDataWithToken 干的就是 `missions.data.accScoreRsp = score.data`。
+   *
+   *  返回 null = 这一坨压根不存在（**不是**「0 分」）。
+   *  **和 water.py 的 _score_rsp 逐条对应**。 */
+  function wScoreRsp(data) {
+    if (!data || typeof data !== 'object' || Array.isArray(data)) return null;
+    var inner = data.accScoreRsp;
+    if (inner && typeof inner === 'object' && !Array.isArray(inner)) return inner;
+    if ('validScore' in data || 'totalScore' in data) return data;
+    return null;
+  }
+
+  /** accScoreRsp.limits → {refId: 已做次数}。**-1 表示不限次**。
+   *  **和 water.py 的 _limits 逐条对应**。 */
+  function wLimits(rsp) {
+    var out = {};
+    if (!rsp || typeof rsp !== 'object' || !Array.isArray(rsp.limits)) return out;
+    for (var i = 0; i < rsp.limits.length; i++) {
+      var it = rsp.limits[i];
+      if (!it || typeof it !== 'object') continue;
+      var rid = String(it.refId || '').trim();
+      var n = wInt(it.limit);
+      if (rid && n != null && n >= -1) out[rid] = n;
+    }
+    return out;
+  }
+
+  /** 今天星期几，1=周一 … 7=周日（和原版 Calendar 的换算一致）。
+   *  ⚠️ 只能用本机日期 —— 服务端没给。**和 water.py 的 _today_weekday 对应**。 */
+  function wTodayWeekday() {
+    var d = new Date().getDay();     // 0=周日 … 6=周六
+    return d === 0 ? 7 : d;
+  }
+
+  /** 每日签到状态。返回 {adId, score, week, weekday, signed, rewards}；没有就 null。
+   *  **和 water.py 的 _daily 逐条对应**。
+   *  ⚠️ 星期几只能用本机日期（服务端没给）。**不补签、不自动签**（用户 2026-10-30 定）。 */
+  function wDaily(data) {
+    if (!data || typeof data !== 'object') return null;
+    var rsp = data.dailyRSP;
+    if (!rsp || typeof rsp !== 'object') return null;
+    var adid = String(rsp.adId || '').trim();
+    if (!adid) return null;
+    var week = 0;
+    var sc = data.accScoreRsp;
+    if (sc && typeof sc === 'object' && sc.daily && typeof sc.daily === 'object') {
+      week = wInt(sc.daily.week) || 0;
+    }
+    var wd = wTodayWeekday();
+    var rewards = [];
+    if (Array.isArray(rsp.config)) {
+      for (var i = 0; i < rsp.config.length; i++) {
+        var r = rsp.config[i];
+        if (!r || typeof r !== 'object') continue;
+        var mask = wInt(r.rule), sco = wInt(r.score);
+        if (mask && mask > 0 && sco) {
+          rewards.push({ rule: mask, score: sco, msg: String(r.msg || '').trim() });
+        }
+      }
+    }
+    return {
+      adId: adid,
+      score: wInt(rsp.score),
+      week: week,
+      weekday: wd,
+      signed: !!(week & (1 << (wd - 1))),
+      rewards: rewards
+    };
+  }
+
+  function wNum(v) {
+    if (v == null || typeof v === 'boolean') return null;
+    if (typeof v === 'number') return isFinite(v) ? v : null;
+    var n = parseFloat(String(v).trim());
+    return isFinite(n) ? n : null;
+  }
+
+  function wLoad() {
+    if (!(window.Android && typeof Android.loadWater === 'function')) return null;
+    var s = '';
+    try { s = String(Android.loadWater() || ''); } catch (e) { return null; }
+    if (!s) return null;
+    var d;
+    try { d = JSON.parse(s); } catch (e) { return null; }
+    if (!d || typeof d !== 'object') return null;
+    // 老状态（只有一个顶层 token）就地迁移成 device 那一格 ——
+    // 不迁移的话老用户升级后会被判成「没登录」，而 token 明明还在。
+    if (d.token && (!d.device || typeof d.device !== 'object')) {
+      d.device = { token: String(d.token || ''), uid: String(d.uid || ''),
+                   eid: String(d.eid || ''), phone: String(d.phone || ''),
+                   at: Number(d.at || 0) };
+      delete d.token; delete d.uid; delete d.eid; delete d.phone;
+    }
+    return d;
+  }
+
+  /** 取某一套账号。null = 这个账号没登。**和 bridge.py 的 water_acct 对应**。 */
+  function wAcct(st, kind) {
+    if (!st || typeof st !== 'object') return null;
+    var a = st[kind];
+    if (a && typeof a === 'object' && a.token) return a;
+    return null;
+  }
+
+  /** 设备账号的 token。余额 / 设备 / 接水**只用它**。 */
+  function wDev(st) {
+    var a = wAcct(st, 'device');
+    if (!a) {
+      throw wErr('设备账号未登录，接水与余额要用它',
+                 'auth');
+    }
+    return a.token;
+  }
+
+  /** 积分类接口用哪个账号。优先积分账号（1,5），没登就退设备账号（1,1）——
+   *  原版也是这个优先级（`useApp = !account.hasToken()`）。
+   *  返回 {token, useApp}。**和 bridge.py 的 water_score_lane 对应**。 */
+  function wScoreLane(st) {
+    var s = wAcct(st, 'score');
+    if (s) return { token: s.token, useApp: false };
+    var d = wAcct(st, 'device');
+    if (d) return { token: d.token, useApp: true };
+    throw wErr('还没登录', 'auth');
+  }
+
+  /** 这个操作要哪个账号。返回空串 = 能过，非空 = 该说的话。
+   *
+   *  🔴 **不能统一按 `state === 'ok'` 判**（0.26.2 修的）：两套账号并存以后，
+   *     只登了积分账号时 `state()` 是 `'partial'` —— 按 ok 判会把「明明能做」
+   *     的积分/任务/签到全挡住，还报「还没登录」，用户刚登过。
+   *     所以要按**这个操作实际需要哪个账号**分别判。
+   *  `kind='device'`：接水 / 余额 / 设备列表，只认设备账号（1,1 那一路）；
+   *  `kind='any'`：积分 / 任务 / 签到，有一个就行（water_score_lane 会兜底）。 */
+  function wGate(kind) {
+    var st = wLoad();
+    var dev = wAcct(st, 'device'), sco = wAcct(st, 'score');
+    if (kind === 'device') {
+      if (dev) return '';
+      return sco
+        ? '此功能要用「设备登录」账号'
+        : '还没登录';
+    }
+    return (dev || sco) ? '' : '还没登录';
+  }
+
+  /** 算积分/签到的签名。**两条路都签，没有不签的分支。**
+   *  md5(adId + 30×(毫秒/30000) + token后8位 + uid后8位 + 盐)
+   *  **和 water.py 的 sign_score 逐条对应**（两边算出来必须一模一样）。
+   *  ⚠️ 时间桶：设备路用**服务端时间**（本机 + srvOffsetMs），积分路用本机时间。
+   *     官方就是这两套，别合在一起。 */
+  function wSignScore(adId, token, uid, useApp, nowMs) {
+    var now = (nowMs == null
+      ? Date.now() + (useApp ? (WATER.srvOffsetMs || 0) : 0)
+      : Number(nowMs));
+    var bucket = 30 * Math.floor(now / 30000);
+    var tok = String(token == null ? '' : token);
+    var u = String(uid == null ? '' : uid);
+    return wMd5(String(adId == null ? '' : adId) + String(bucket)
+                + tok.slice(-8) + u.slice(-8)
+                + (useApp ? WATER.SALT_APP : WATER.SALT_MINI));
+  }
+
+  /** 登录签名：md5("authCode=" + 验证码 + "&un=" + 手机号 + 盐)。
+   *  **和 water.py 的 sign_login 一字不差**（两边算出来必须一样）。
+   *  🔴 两条路都要签，盐不一样：设备路 SALT_APP、积分路 SALT_MINI。
+   *  以前这里写「积分路官方不带」是错的 —— 1,5 不带 sign，服务端回
+   *  「请升级最新版应用」，那句话把人骗去查版本号，其实缺的是签名。 */
+  function wSignLogin(phone, sms, salt) {
+    return wMd5('authCode=' + String(sms == null ? '' : sms)
+                + '&un=' + String(phone == null ? '' : phone)
+                + (salt || WATER.SALT_APP));
+  }
+
+  /** 账户信息（含账号编号）。**和 water.py 的 view_info 对应**。
+   *  参考项目（life-798 的 fetchUidSync）在 uid 为空时就是来这里补的：
+   *  `/acc/view-info` 的 `data.id` 才是签名要的那个编号。 */
+  async function wViewInfo(token, useApp) {
+    var js = await wReq('GET', '/acc/view-info', token, null,
+                        useApp ? WATER.T_DEVICE : WATER.T_ACCOUNT,
+                        useApp ? WATER.V_DEVICE : WATER.V_ACCOUNT);
+    var d = wCheck(js);
+    return (d && typeof d === 'object') ? d : {};
+  }
+
+  /** 签名要 uid 的后 8 位。登录没带回 uid 时补一次账户信息。
+   *  **和 water.py 的 ensure_uid 同义**：返回 {uid, why}，why 空 = 拿到了。 */
+  async function wEnsureUid(token, useApp, uid) {
+    var u = String(uid == null ? '' : uid).trim();
+    if (u) return { uid: u, why: '' };
+    var d;
+    try {
+      d = await wViewInfo(token, useApp);
+    } catch (e) {
+      return { uid: '', why: (e && e.message) || String(e) };
+    }
+    var got = String((d && (d.id || d.uid)) || '').trim();
+    return got ? { uid: got, why: '' }
+               : { uid: '', why: '账户信息里也没有账号编号' };
+  }
+
+  /** 存。空串 = 成功，其余是原因（和 CredStore.save 同构）。
+   *  🔴 `'none'` 这个原因是有来历的：0.23.0 的 APK 里**压根没有** saveWater
+   *     （CredStore 写好了、NativeBridge 漏了转发），用户登录成功却看到
+   *     「token 存不进本机（none）」。现在有 check_bridge_methods.py 对账。 */
+  function wSave(obj) {
+    if (!(window.Android && typeof Android.saveWater === 'function')) return 'none';
+    try { return String(Android.saveWater(JSON.stringify(obj)) || ''); }
+    catch (e) { return 'fail: ' + ((e && e.message) || e); }
+  }
+
+  /** 「没登录」和「存着但解不开」必须分开。
+   *  解不开 = 换过手机 / 清过数据 / Keystore 换了密钥 ⇒ 重新登录一次就好；
+   *  混成一句「没登录」，用户只会觉得「怎么又要登」。 */
+  function wBroken() {
+    if (!(window.Android && typeof Android.waterState === 'function')) return false;
+    try { return String(Android.waterState() || '') === 'broken'; }
+    catch (e) { return false; }
+  }
+
+  // ================================================================ 财务处
+  //
+  // 校园统一支付平台（cwcfw.zua.edu.cn）：欠费、房间电费余额。
+  // 和 `mobile/cwcfw.py` 是**同一套规则的两份实现**，字段名与话术必须逐字一致
+  // （对拍见 `_lab/cx/check_cw_js.py`）。
+  //
+  // 🔴 只读。没有充值、没有下单 —— 涉及真钱，一个都不做。
+  //
+  // 🔴 加密是**标准 PKCS#1 v1.5**，和门户那套（pfRsa：小端 + 无填充）**不一样**。
+  //    两边搞混，服务端都只回「账号或密码错误」，看不出是哪一步。
+  //    明文是「密码 + RandomStr」，模数取登录页的 #RSATemp（1024 位），指数 65537。
+  //
+  // 🔴 接口分新旧两套口径（实测，别按直觉猜）：
+  //      旧 /xysf/aAppPage/index.aspx/BaseInfo  {methodName, jsonStr} → {"d":"<json>"}
+  //      旧 /xysf/aAppPage/index.aspx/GetRechargeInfo {rybh, category}
+  //      新 /xysf/api/User/App/Login  {xh,pwd,rsaStr,ltyp} → 裸 JSON
+  //      新 /xysf/api/user/ElecRoomIs/GetOption {key, option} → **要 x-csrfToken**
+  //        （先 POST /xysf/api/Token/Csrf，返回带引号的字符串）
+
+  var CW = {
+    PAGE: 'http://cwcfw.zua.edu.cn/xysf/aAppPage/index.aspx?type=1',
+    OLD: 'http://cwcfw.zua.edu.cn/xysf/aAppPage/index.aspx/',
+    API: 'http://cwcfw.zua.edu.cn/xysf/api/'
+  };
+
+  function cwErr(msg, kind) {
+    var e = new Error(msg);
+    e.kind = kind || 'data';
+    return e;
+  }
+
+  /** 发请求。cookie 由 Java 的全局 CookieManager 自动带，这里不用管。 */
+  function cwHttp(method, url, body, headers) {
+    return new Promise(function (resolve, reject) {
+      var id = ++seq;
+      waiting[id] = { resolve: resolve, reject: reject };
+      try {
+        if (window.Android && typeof Android.req2 === 'function') {
+          Android.req2(id, method, url, body || '', CW.PAGE,
+                       headers ? JSON.stringify(headers) : '');
+        } else {
+          Android.req(id, method, url, body || '', CW.PAGE);
+        }
+      } catch (e) {
+        delete waiting[id];
+        reject(new Error('原生请求失败：' + e));
+      }
+    });
+  }
+
+  function cwPost(url, obj, csrf) {
+    var h = { 'Content-Type': 'application/json; charset=utf-8' };
+    if (csrf) h['x-csrfToken'] = csrf;
+    // 🔴 null 要发**空串**，不能发字面量 'null'（Token/Csrf 会回 500）。
+    return cwHttp('POST', url, (obj === null || obj === undefined)
+                              ? '' : JSON.stringify(obj), h);
+  }
+
+  /** 旧口径：外面包一层 {"d":"<json 字符串>"}，要解析两次。 */
+  async function cwOld(method, payload) {
+    var r = await cwPost(CW.OLD + method, payload);
+    if (!r || r.status !== 200) throw cwErr('平台返回 ' + ((r && r.status) || '空') + '，稍后再试', 'net');
+    var j;
+    try { j = JSON.parse(r.body); } catch (e) {
+      throw cwErr('平台返回看不懂的内容（可能改版了）', 'data');
+    }
+    var d = j && j.d;
+    if (typeof d === 'string') {
+      try { d = JSON.parse(d); } catch (e) { throw cwErr('平台返回看不懂的内容（可能改版了）', 'data'); }
+    }
+    return d || {};
+  }
+
+  function cwB64(bytes) {
+    var s = '';
+    for (var i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]);
+    return btoa(s);
+  }
+
+  /** 密码 + RandomStr → base64 密文（标准 PKCS#1 v1.5，随机填充）。 */
+  function cwRsa(text, modHex) {
+    var n = BigInt('0x' + modHex);
+    var k = Math.ceil(modHex.length / 2);
+    var m = utf8Bytes(String(text));
+    var need = k - m.length - 3;
+    if (need < 8) throw cwErr('密码太长了', 'data');
+    var ps = new Uint8Array(need);
+    if (window.crypto && window.crypto.getRandomValues) {
+      window.crypto.getRandomValues(ps);
+    } else {
+      for (var z = 0; z < need; z++) ps[z] = 1 + Math.floor(Math.random() * 255);
+    }
+    for (var i = 0; i < need; i++) if (!ps[i]) ps[i] = 1;   // 填充字节不许是 00
+    var em = new Uint8Array(k);
+    em[0] = 0; em[1] = 2;
+    em.set(ps, 2);
+    em[2 + need] = 0;
+    em.set(m, 3 + need);
+    var x = 0n;
+    for (var a = 0; a < k; a++) x = (x << 8n) | BigInt(em[a]);
+    var c = pfModPow(x, 65537n, n);
+    var out = new Uint8Array(k);
+    for (var q = k - 1; q >= 0; q--) { out[q] = Number(c & 255n); c >>= 8n; }
+    return cwB64(out);
+  }
+
+  // ---- 本机状态 ----
+  // 存的是整段 JSON：学号、密码、上次查到的欠费、选过的房间。
+  // 密码必须留：会话是 ASP.NET 的，二十分钟不动就过期，只存 cookie 等于每次重输。
+
+  // 🔴 内存里那一份（2026-11-16）。桥存不住的时候（Keystore 被换掉、
+  //    prefs 写失败、老版本没有 saveCw），至少**这次打开**还能用 ——
+  //    不能让人刚登完就被打回登录框。下次打开才需要重登，而且界面会说清楚。
+  var cwMem = null;
+
+  function cwSave(obj) {
+    if (obj) cwMem = obj;
+    if (!(window.Android && typeof Android.saveCw === 'function')) return 'none';
+    try { return String(Android.saveCw(JSON.stringify(obj)) || ''); }
+    catch (e) { return 'fail: ' + ((e && e.message) || e); }
+  }
+
+  /** 读本机那份。读不到（没存 / 解不开 / JSON 坏了）退回这次会话存的内存。
+   *
+   *  🔴 退内存这一步是为了「存不住也先能用」，不是为了掩盖问题：
+   *     存没存住由 `kept`（登录后当场回读）和 `cwState()` 分开说。
+   */
+  function cwLoad() {
+    var d = null;
+    if (window.Android && typeof Android.loadCw === 'function') {
+      try {
+        var s = String(Android.loadCw() || '');
+        if (s) {
+          var j = JSON.parse(s);
+          if (j && j.xh) d = j;
+        }
+      } catch (e) { /* 落到内存那份 */ }
+    }
+    return d || cwMem;
+  }
+
+  function cwState() {
+    if (!(window.Android && typeof Android.cwState === 'function')) return 'none';
+    try { return String(Android.cwState() || 'none'); } catch (e) { return 'none'; }
+  }
+
+  function cwMask(xh) {
+    var s = String(xh || '');
+    return s.length >= 8 ? (s.slice(0, 4) + '****' + s.slice(-2)) : s;
+  }
+
+  function cwSlim(b) {
+    return { total: String((b && b.total) || '0.00'),
+             count: parseInt((b && b.count) || 0, 10) || 0,
+             items: (b && b.items) || [] };
+  }
+
+  /** 金额/电量统一两位小数。拿不到就空串 —— 别编 0（和 cwcfw._num2 一致）。 */
+  function cwNum2(v) {
+    var n = Number(v);
+    return isFinite(n) ? n.toFixed(2) : '';
+  }
+
+  /** 这一发是不是「会话没了」。
+   *
+   *  🔴 2026-11-16 用户原话：「在这无论点什么都会提示取楼栋房间失败，稍后再试」。
+   *     真因是平台的 ASP.NET 会话二十分钟不动就过期，`/xysf/api/` 那几个接口
+   *     回 **401 + `{"Message":"已拒绝为此请求授权。"}`**（实测）。
+   *     `Token/Csrf` 没有会话照样回 200 ⇒ 看着像「令牌拿到了、下一步莫名失败」，
+   *     而这里把它当成网络抖动（kind='net'），既不重登也不说真话，用户点
+   *     一百次都是「稍后再试」。这是 auth，必须能自己续一次。
+   */
+  function cwDead(r) {
+    if (!r) return false;
+    if (r.status === 401 || r.status === 403) return true;
+    var b = String(r.body || '');
+    return b.indexOf('已拒绝为此请求授权') >= 0 || b.indexOf('重新登录') >= 0;
+  }
+
+  /** 带着本机账号跑一次；会话过期就自己登一次再来（**只一次**）。
+   *
+   *  🔴 只重登一次：密码被改过时循环重试等于刷登录，平台会风控。
+   *  🔴 这是**唯一**一处这么做的地方 —— 选楼栋、选房间、看记录、查欠费
+   *     全走它。以前只有查欠费那条路有，其余三条会话一过期就全废。
+   */
+  async function cwAuto(fn) {
+    var st = cwLoad();
+    if (!st) throw cwErr('还没登录', 'auth');
+    try {
+      return await fn(st);
+    } catch (e) {
+      if (!e || e.kind !== 'auth') throw e;
+      if (!st.pwd) throw cwErr('财务处登录过期了，请重新登录', 'auth');
+      try {
+        await CwApi.login(st.xh, st.pwd);
+      } catch (e2) {
+        throw cwErr('财务处登录过期了，请重新登录', 'auth');
+      }
+      return await fn(cwLoad() || st);
+    }
+  }
+
+  function cwOut(st) {
+    if (!st) {
+      var cs = cwState();
+      // 🔴 只有**确实没有那一条**才算 none。`ok` 却读不出来（存着但这次
+      //    解不开 / JSON 坏了 / 被截断）一律报 broken —— 存着就是存着，
+      //    不能说成「没登录」，那是把用户上次做过的事抹掉。
+      return { ok: true, state: cs === 'none' ? 'none' : 'broken' };
+    }
+    return { ok: true, state: 'ok', xh: cwMask(st.xh), name: st.name || '',
+             at: st.at || 0, bill: st.bill || null,
+             billAt: st.billAt || 0, room: st.room || null };
+  }
+
+  var CwApi = {
+    /** 这个壳能不能用（老 APK 没有 saveCw）。 */
+    available: function () {
+      return !!(window.Android && typeof Android.req2 === 'function'
+                && typeof Android.saveCw === 'function');
+    },
+
+    /** 登录 + 顺手查一次欠费。查不到不算登录失败：登录态留着，原因单独说。 */
+    login: async function (xh, pwd) {
+      xh = String(xh || '').trim();
+      if (!xh || !pwd) throw cwErr('学号和密码都要填', 'auth');
+
+      var r = await cwHttp('GET', CW.PAGE, '');
+      if (!r || r.status !== 200) throw cwErr('平台打不开，稍后再试', 'net');
+      var html = String(r.body || '');
+      var mm = /id="RSATemp"[^>]*value="([0-9A-Fa-f]+)"/.exec(html);
+      var mr = /id="RandomStr"[^>]*value="([^"]*)"/.exec(html);
+      if (!mm || !mr) throw cwErr('登录页变了，找不到加密参数（可能改版了）', 'data');
+
+      var lr = await cwPost(CW.API + 'User/App/Login', {
+        xh: xh, pwd: cwRsa(pwd + mr[1], mm[1]), rsaStr: mr[1], ltyp: 'id'
+      });
+      if (!lr || lr.status !== 200) throw cwErr('登录请求失败，稍后再试', 'net');
+      var lj;
+      try { lj = JSON.parse(lr.body); } catch (e) { throw cwErr('登录返回看不懂的内容', 'data'); }
+      if (lj && lj.d && typeof lj.d === 'object') lj = lj.d;
+      // 🔴 成功的码是字符串 "0000"。别写成 `!code` 或 `code != 0`。
+      if (String((lj && lj.code) || '') !== '0000') {
+        throw cwErr(String((lj && lj.msg) || '').trim() || '登录没通过', 'auth');
+      }
+
+      var st = { xh: xh, pwd: pwd, name: '', at: Date.now(), bill: null, billAt: 0, room: null };
+      var warn = '';
+      try {
+        var b = await CwApi._bill();
+        st.name = b.name || '';
+        st.bill = cwSlim(b);
+        st.billAt = Date.now();
+      } catch (e) {
+        warn = (e && e.message) || String(e);
+      }
+      var why = cwSave(st);
+      // 🔴 存不住**不再当登录失败**（2026-11-16）。以前这里直接抛
+      //    「此版本不记住登录（需 0.53.0 以上）」，用户看到的是「版本不对」，
+      //    其实是本机这一格没写进去 —— 而且他刚登成功的账号被这句话一起否了。
+      //    现在照常返回登录态（本次会话可用），只把 `kept` 带上去让界面说清楚。
+      var out = cwOut(st);
+      var back = null;
+      try {
+        if (window.Android && typeof Android.loadCw === 'function') {
+          var bs = String(Android.loadCw() || '');
+          if (bs) { var bj = JSON.parse(bs); if (bj && bj.xh) back = bj; }
+        }
+      } catch (e2) { back = null; }
+      out.kept = !!back;
+      if (!out.kept) out.keptWhy = why || 'none';
+      if (warn) out.warn = warn;
+      return out;
+    },
+
+    logout: function () {
+      try { if (window.Android && typeof Android.clearCw === 'function') Android.clearCw(); }
+      catch (e) { /* 清不掉也只影响下次要不要重登 */ }
+      cwMem = null;
+      return { ok: true };
+    },
+
+    state: function () { return cwOut(cwLoad()); },
+
+    /** 现查欠费。过期就自己重登一次（只一次，别循环）。 */
+    bill: function () {
+      return cwAuto(async function (st) {
+        var b = await CwApi._bill();
+        st.name = b.name || st.name || '';
+        st.bill = cwSlim(b);
+        st.billAt = Date.now();
+        cwSave(st);
+        return cwOut(st);
+      });
+    },
+
+    /** 欠费原始查询（不含本机状态处理）。 */
+    _bill: async function () {
+      var d = await cwOld('BaseInfo', { methodName: 'ht01', jsonStr: '' });
+      if (String(d.code) === '2000') throw cwErr('财务处登录过期了，重新登一次', 'auth');
+      if (String(d.code) !== '0000') throw cwErr(String(d.msg || '查不到欠费'), 'data');
+      var ctx = d.context || [];
+      var row = (ctx && ctx.length) ? ctx[0] : {};
+      var items = [];
+      // 项目名只在 ht02 里。拿不到不影响合计 —— 它是附赠的。
+      try {
+        var d2 = await cwOld('BaseInfo', { methodName: 'ht02', jsonStr: '' });
+        var grps = d2.context || [];
+        for (var i = 0; i < grps.length; i++) {
+          var det = grps[i].detil || [];
+          for (var j = 0; j < det.length; j++) {
+            var due = String(det[j].qfje || '0.00');
+            if (due === '0.00' || due === '0' || due === '') continue;
+            items.push({ period: String(grps[i].sfqjmc || ''),
+                         name: String(det[j].sfxmmc || ''), due: due });
+          }
+        }
+      } catch (e) { /* 明细拿不到就算了 */ }
+      return { total: String(row.qfzje || '0.00'),
+               count: parseInt(row.qfZnumS || 0, 10) || 0,
+               items: items,
+               name: String((d.ExData && d.ExData.xm) || '') };
+    },
+
+    /** 楼栋 / 房间。buildid 空 = 要楼栋列表。 */
+    elecOptions: function (buildid) {
+      return cwAuto(function () { return CwApi._options(buildid); });
+    },
+
+    _options: async function (buildid) {
+      var cr = await cwPost(CW.API + 'Token/Csrf', null);
+      if (!cr || cr.status !== 200) throw cwErr('取令牌失败，稍后再试', 'net');
+      var csrf = String(cr.body || '').trim().replace(/^"|"$/g, '');
+      var option = { areaid: '1', buildid: buildid || '-1', roomid: '-1',
+                     IsLxr: false, IsDefault: false, IsFirst: false, Cxid: '' };
+      var key = buildid ? 'room' : 'build';
+      var r = await cwPost(CW.API + 'user/ElecRoomIs/GetOption',
+                           { key: key, option: option }, csrf);
+      if (cwDead(r)) throw cwErr('财务处登录过期了', 'auth');
+      if (!r || r.status !== 200) throw cwErr('取楼栋房间失败，稍后再试', 'net');
+      var j;
+      try { j = JSON.parse(r.body); } catch (e) { throw cwErr('楼栋房间返回看不懂的内容', 'data'); }
+      if (!j || !j.IsSuccess) throw cwErr(String((j && j.RetMsg) || '取楼栋房间失败'), 'data');
+      var out = [];
+      var cs = j.Content || [];
+      for (var i = 0; i < cs.length; i++) {
+        var v = String(cs[i].value || '');
+        if (v === '-1') continue;
+        // 🔴 标签尾部有一长串空格（平台就是这样给的），折掉，否则撑破格子。
+        out.push({ value: v,
+                   label: String(cs[i].label || '').replace(/\s+/g, ' ').trim() });
+      }
+      return out;
+    },
+
+    /** 某房间的电费余额。读不到就抛 —— 别把「没读到」写成 0.00。 */
+    elec: function (buildid, roomid, label) {
+      return cwAuto(function (st) {
+        return CwApi._elec(st, buildid, roomid, label);
+      });
+    },
+    _elec: async function (st, buildid, roomid, label) {
+      if (!buildid || !roomid) throw cwErr('先选楼栋和房间', 'data');
+      var search = { areaid: '1', buildid: String(buildid), roomid: String(roomid),
+                     IsLxr: false, IsDefault: false, IsFirst: false, Cxid: '' };
+      var d = await cwOld('GetRechargeInfo',
+                          { rybh: JSON.stringify(search), category: 'ElecRoomIs' });
+      if (String(d.RetCode) === 'N') throw cwErr('财务处登录过期了，重新登一次', 'auth');
+      if (String(d.RetCode) !== 'T') {
+        throw cwErr(String(d.RetMsg || '查不到这个房间').trim(), 'data');
+      }
+      var info = ((d.Content && d.Content.CzThirdInfo) || {});
+      if (info.Balance === null || info.Balance === undefined) {
+        throw cwErr('这个房间没有余额数据', 'data');
+      }
+      // `cxid` 一定要存：记录那两个接口只认它（和 bridge.py 逐字段对齐）。
+      var room = { buildid: String(buildid), roomid: String(roomid),
+                   label: String(label || info.Czxm || ''),
+                   balance: Number(info.Balance).toFixed(2),
+                   cxid: String(info.Cxid || ''), at: Date.now() };
+      st.room = room;
+      cwSave(st);
+      return room;
+    },
+
+    /** 缴费（购电）/ 用电记录。只读。
+     *
+     *  kind='pay' → 订单号 Custsn / 购电日期 PayDate / 金额 Tranamt（元）
+     *  kind='use' → 日期 UseDate / 用电量 DeltaUsedAmp（度）
+     *  字段名取自平台自己的模板（ElecRoomIsJfSec.html / ElecRoomIsUse.html），
+     *  🔴 和 cwcfw.records() 必须逐字段对齐。
+     */
+    records: function (cxid, kind) {
+      return cwAuto(function (st) { return CwApi._records(st, cxid, kind); });
+    },
+
+    _records: async function (st, cxid, kind) {
+      cxid = String(cxid || (st.room && st.room.cxid) || '');
+      if (!cxid) throw cwErr('先选好房间、读一次剩余电量，再来看记录', 'data');
+      kind = kind === 'use' ? 'use' : 'pay';
+      var cr = await cwPost(CW.API + 'Token/Csrf', null);
+      if (!cr || cr.status !== 200) throw cwErr('取令牌失败，稍后再试', 'net');
+      var csrf = String(cr.body || '').trim().replace(/^"|"$/g, '');
+      var body = { cxid: cxid, page: 1, startDate: '', endDate: '', dateType: '' };
+      if (kind === 'use') body.type = 0;
+      var r = await cwPost(CW.API + 'user/ElecRoomIs/'
+                           + (kind === 'use' ? 'GetUseRecord' : 'GetPayRecord'),
+                           body, csrf);
+      if (cwDead(r)) throw cwErr('财务处登录过期了', 'auth');
+      if (!r || r.status !== 200) throw cwErr('查记录失败，稍后再试', 'net');
+      var j;
+      try { j = JSON.parse(r.body); } catch (e) { throw cwErr('记录返回看不懂的内容', 'data'); }
+      if (!j) throw cwErr('记录返回看不懂的内容', 'data');
+      if (String(j.RetCode) === 'N' && String(j.RetMsg || '').indexOf('登录') >= 0) {
+        throw cwErr('财务处登录过期了，重新登一次', 'auth');
+      }
+      if (!j.IsSuccess) throw cwErr(String(j.RetMsg || '查不到记录').trim(), 'data');
+      var rows = j.Content || [];
+      var items = [];
+      for (var i = 0; i < rows.length; i++) {
+        var it = rows[i];
+        if (!it || typeof it !== 'object') continue;
+        if (kind === 'use') {
+          items.push({ at: String(it.UseDate || ''), num: cwNum2(it.DeltaUsedAmp) });
+        } else {
+          items.push({ at: String(it.PayDate || ''), num: cwNum2(it.Tranamt),
+                       sn: String(it.Custsn || '') });
+        }
+      }
+      return { items: items, more: rows.length >= 10 };
+    }
+  };
+
+  var WaterApi = {
+    /** 这个壳能不能用（老 APK 没有 req2 / saveWater）。 */
+    available: function () {
+      return !!(window.Android && typeof Android.req2 === 'function'
+                && typeof Android.saveWater === 'function');
+    },
+
+    captchaKey: wKey,
+
+    /** 图形验证码图片地址。给 <img src> 直接用，不经过我们的代码。 */
+    captchaUrl: function (key) {
+      return WATER.BASE + '/captcha/?s=' + encodeURIComponent(key) + '&r=' + Date.now();
+    },
+
+    /** 发短信。`graph` 是用户**自己看图读出来**的 —— 和门户那道一样，绝不自动识别。 */
+    sendSms: async function (phone, key, graph) {
+      var js = await wReq('POST', '/acc/login/code', null,
+                          { un: phone, authCode: graph, s: key }, WATER.T_DEVICE);
+      wCheck(js);
+      return true;
+    },
+
+    /** 短信验证码换 token。`kind` = 'device'（1,1）或 'score'（1,5）。
+     *
+     *  🔴 **只覆盖登录的那一格**，另一格原样留着。整套覆盖的话，登完积分账号
+     *     会把设备账号踢掉 —— 接水立刻不能用了，而用户以为自己只是「补登了一个」。
+     */
+    login: async function (phone, sms, kind) {
+      var k = (kind === 'score') ? 'score' : 'device';
+      var useApp = (k === 'device');
+      var body = { authCode: sms, un: phone };
+      // 🔴 两条路的 body 都是**裸的**，不许带 cid / openCode（2026-11-08 实测）。
+      //    以前积分路往 body 里塞了 openCode + cid，服务端就当「这不是官方客户端」，
+      //    回「请升级最新版应用」—— 那句话是挡请求的，不是让人去应用商店升级。
+      //    两条路都要带 sign，只是盐不同：设备路 SALT_APP、积分路 SALT_MINI。
+      var path = '/acc/login?sign='
+        + (useApp ? wSignLogin(phone, sms) : wSignLogin(phone, sms, WATER.SALT_MINI));
+      var js = await wReq('POST', path, null, body,
+                          useApp ? WATER.T_DEVICE : WATER.T_ACCOUNT,
+                          useApp ? WATER.V_DEVICE : WATER.V_ACCOUNT);
+      var data = wCheck(js, '登录') || {};
+      var al = (data.al && typeof data.al === 'object') ? data.al : data;
+      var token = String((al && al.token) || '').trim();
+      if (!token) throw wErr('登录成功了，但没拿到登录凭据，请重试', 'data');
+      var st = wLoad() || {};
+      st[k] = {
+        token: token, phone: String(phone || ''),
+        uid: String((al && (al.uid || al.id)) || ''),
+        eid: String((al && al.eid) || ''),
+        at: Date.now()
+      };
+      if (!Array.isArray(st.devices)) st.devices = [];
+      var why = wSave(st);
+      // 🔴 `'soft'` 是**存好了**，只是 Keystore 用不了、退到了备用加密方式
+      //    （见 CredStore.savePlain 的第二层）。它和 `'fail: …'` 是两回事。
+      //    0.26.3 及以前这里写的是 `if (why)`，把 `'soft'` 也当失败抛了 ——
+      //    于是明明存上了，用户每次登录都看到「token 存不进本机（soft）」，
+      //    而且因为抛错，调用方走的是失败分支、整页不刷新 ⇒ 出水功能看起来
+      //    **完全不能用**。这两句话是同一件事，别当成两个 bug 修。
+      //    对照 app.js 的 credSaved()：那边一直是 `s === 'soft' → ok:true`。
+      if (why && why !== 'soft') {
+        // 'none' = 这个壳里根本没有 saveWater（0.23.0 就是），不是磁盘满了。
+        // 两种原因要分开说，否则用户只能反复重登。
+        throw wErr(why === 'none'
+          ? '此版本不记住登录（需 0.24.0 以上），'
+            + '现在退出应用就得重新登录'
+          : '登录成功了，但没记住（' + why + '），退出应用就得重新登录',
+          'data');
+      }
+      return { phone: st[k].phone, uid: st[k].uid, kind: k, soft: why === 'soft' };
+    },
+
+    /** 本机状态。**不探网** —— 每次切进这一页都探一次等于白等。
+     *  两套账号**分开报**，缺哪个要能看出来缺哪个。 */
+    state: function () {
+      var st = wLoad();
+      var dev = wAcct(st, 'device'), sco = wAcct(st, 'score');
+      if (!dev && !sco) {
+        // 「存着但解不开」不等于「没登录」—— 前者重登一次就好，后者是第一次用。
+        return { ok: true, state: wBroken() ? 'broken' : 'none', accounts: {} };
+      }
+      function brief(a) {
+        if (!a) return null;
+        return { phone: String(a.phone || ''), uid: String(a.uid || ''),
+                 at: Number(a.at || 0) };
+      }
+      return { ok: true, state: (dev && sco) ? 'ok' : 'partial',
+               accounts: { device: brief(dev), score: brief(sco) },
+               phone: (dev && dev.phone) || '',
+               devices: (st && st.devices) || [], at: (st && st.at) || 0 };
+    },
+
+    /** 退出。给了 kind 只退那一格 —— 退积分账号不该把接水也弄坏。 */
+    logout: function (kind) {
+      var k = (kind === 'device' || kind === 'score') ? kind : '';
+      if (k) {
+        var st = wLoad();
+        if (st) {
+          delete st[k];
+          if (!wAcct(st, 'device') && !wAcct(st, 'score')) {
+            if (window.Android && typeof Android.clearWater === 'function') {
+              try { Android.clearWater(); } catch (e) { /* 清不掉也别崩 */ }
+            }
+          } else {
+            wSave(st);
+          }
+        }
+        return true;
+      }
+      if (window.Android && typeof Android.clearWater === 'function') {
+        try { Android.clearWater(); } catch (e) { /* 清不掉也别崩 */ }
+      }
+      return true;
+    },
+
+    /** 查余额。取不到返回 null —— **不返回 0**（「没读到」≠「钱没了」）。 */
+    balance: async function () {
+      var st = wLoad();
+      var js = await wReq('GET', '/acc/wallet/owner', wDev(st), null, WATER.T_DEVICE);
+      var data = wCheck(js) || {};
+      var cands = [];
+      if (data.aw && typeof data.aw === 'object') cands.push(data.aw);
+      if (Array.isArray(data.eps)) {
+        data.eps.forEach(function (x) { if (x && typeof x === 'object') cands.push(x); });
+      }
+      for (var i = 0; i < cands.length; i++) {
+        var ks = ['total', 'olCash', 'balance'];
+        for (var j = 0; j < ks.length; j++) {
+          var v = wNum(cands[i][ks[j]]);
+          if (v != null) return v;
+        }
+      }
+      return null;
+    },
+
+    /** 列设备。🔴 favos 键不存在 = 响应变了（报错）；存在但是空 = 真没有设备。 */
+    devices: async function () {
+      var st = wLoad();
+      var js = await wReq('GET', '/ui/app/master', wDev(st), null, WATER.T_DEVICE);
+      var data = wCheck(js) || {};
+      if (!('favos' in data)) throw wErr('设备列表没读出来，平台可能改版了', 'data');
+      var favos = data.favos || [];
+      var out = [];
+      for (var i = 0; i < favos.length; i++) {
+        var it = favos[i];
+        if (!it || typeof it !== 'object') continue;
+        var did = String(it.id || '').trim();
+        if (!did) continue;
+        out.push({ id: did, name: String(it.name || '').trim() });
+      }
+      // 顺手记进本机：下次进来先画缓存，不用等网络
+      st.devices = out;
+      st.at = Date.now();
+      wSave(st);
+      return out;
+    },
+
+    /** 启动一台设备。**唯一有副作用的调用**，界面那边必须二次确认。
+     *
+     *  成功返回的是**文案**（不是 true）—— 和 water.py 的 `dev_start`
+     *  返回 `(True, msg)` 是同一个意思。文案只有这一个来源：
+     *  以前 handle() 那边另抄了一句「已经启动了，接完记得点结束」，
+     *  两边各改各的就会分叉，而分叉了**不报错**。 */
+    start: async function (did) {
+      var st = wLoad();
+      if (!wAcct(st, 'device') && !wAcct(st, 'score')) throw wErr('还没登录', 'auth');
+      var path = '/dev/start?did=' + encodeURIComponent(String(did || ''))
+               + '&upgrade=true&ptype=91&rcp=false';
+      var js = await wReq('GET', path, wDev(st), null, WATER.T_DEVICE);
+      var code = Number(js && js.code);
+      if (code === 0) return '已启动，接水完成后请点「结束」';
+      // 这些 code 是协议里定死的业务含义，逐条翻成人话 ——
+      // 统一说「操作失败」等于什么都没说，而每条用户该做的事都不一样。
+      var map = {
+        '-99': ['登录已过期，请重新登录', 'auth'],
+        '-21': ['账号无设备控制权限，先在官方 App 登录设备端', 'biz'],
+        '-88': ['未签约代扣协议，请到慧生活798 签约', 'biz'],
+        '-87': ['代扣签约已过期，请到慧生活798 重新签约', 'biz'],
+        '-52': ['账户欠费了，先充值', 'biz'],
+        '-20': ['还没绑定一卡通，要先去慧生活798 里绑', 'biz'],
+        '-19': ['设备正在准备，等几秒再点一次', 'biz'],
+        '-82': ['需要先支付', 'biz']
+      };
+      var hit = map[String(code)];
+      if (hit) throw wErr(hit[0], hit[1], code);
+      throw wErr(String((js && js.msg) || ('启动失败（code=' + code + '）')), 'biz', code);
+    },
+
+    /* ==============================================================
+       0.24.0 新增：停止接水 / 积分 / 消费记录 / 套餐 / 签到 / 收藏设备
+       --------------------------------------------------------------
+       这一批照 WaterWidget（nocookies111/life-798，MIT）公开的协议**自己
+       重写**，没有复制它的代码。和 water.py 逐条对应（红线 54：两份实现，
+       改一边忘另一边不报错 ⇒ check_water_api.py 拿同一批响应对拍）。
+
+       🔴 充值不下单：原版 /bill/save 建单 + /trans/prepay/21 取支付宝 SDK
+          串。我们是 WebView 壳没有那个 SDK；而且那是真钱交易，金额错了、
+          退款、纠纷都落在用户身上。⇒ 只做 /prd/lst 展示 + 让用户去官方 App。
+       🔴 积分任务只列不批量跑：作者自己 README 写着「积分冻结、任务提示成功
+          但没到账，原因尚未确认」。
+       🔴 签到不带 sign：盐是别人没公开的配置，不挖、不写进公开仓库。
+          先不带 sign 试，失败报 kind='sign'，再和用户商量。
+       ============================================================== */
+
+    /** 停止接水。**第二个有副作用的调用**（结束计费），要二次确认。
+     *  🔴 不自动重试：同一台设备可能不止一个人在用，重试可能停掉别人的水。 */
+    end: async function (did) {
+      var st = wLoad();
+      if (!wAcct(st, 'device') && !wAcct(st, 'score')) throw wErr('还没登录', 'auth');
+      var path = '/dev/end?did=' + encodeURIComponent(String(did || ''))
+               + '&rcp=false';
+      var js = await wReq('GET', path, wDev(st), null, WATER.T_DEVICE);
+      var code = Number(js && js.code);
+      if (code === 0) return '停止请求已发出，等设备结束和账单结算';
+      if (code === -99) throw wErr('登录已过期，请重新登录', 'auth', code);
+      throw wErr(String((js && js.msg) || ('停止失败（code=' + code + '）')), 'biz', code);
+    },
+
+    /** 可用积分。{valid, total}，读不到的项是 null（「没读到」≠「0 分」）。 */
+    score: async function () {
+      var st = wLoad();
+      var lane = wScoreLane(st);
+      var js = await wReq('GET', '/acc/score/acc-score', lane.token, null,
+                          lane.useApp ? WATER.T_DEVICE : WATER.T_ACCOUNT,
+                          lane.useApp ? WATER.V_DEVICE : WATER.V_SCORE);
+      var data = wCheck(js) || {};
+      var rsp = wScoreRsp(data);
+      if (!rsp) return { valid: null, total: null };
+      var valid = wInt(rsp.validScore);
+      var total = wInt(rsp.totalScore);
+      if (total == null) total = valid;
+      return { valid: valid, total: total };
+    },
+
+    /** 钱包列表 —— 积分兑换要的 endpointId 就在这儿。
+     *  [{endpointId, name, ownerId, balance}]
+     *
+     *  🔴 和 water.py 的 wallets() **逐条对应**：`data.aw`（单个）+
+     *     `data.eps[]`（多个端点），`ep.id` 是兑换要的端点 id，
+     *     `owner.id` 是用户 id，余额取 total → olCash → balance。
+     *  ⚠️ 一个钱包都没有 ⇒ 空数组（不是报错）；`data` 整个不是对象才报错 ——
+     *     前者是「你确实没有水卡」，后者是「响应变了」。
+     */
+    wallets: async function () {
+      var st = wLoad();
+      var lane = wScoreLane(st);
+      var js = await wReq('GET', '/acc/wallet/owner', lane.token, null,
+                          lane.useApp ? WATER.T_DEVICE : WATER.T_ACCOUNT,
+                          lane.useApp ? WATER.V_DEVICE : WATER.V_SCORE);
+      // 🔴 不能写 `wCheck(js) || {}`：空数组 / 空字符串都是**假值**，
+      //    那样 `data: []` 会被悄悄换成 `{}` ⇒「响应结构变了」被说成
+      //    「你一个钱包都没有」。两个相反的结论，只差一个 `||`。
+      var data = wCheck(js);
+      if (data == null) data = {};
+      if (typeof data !== 'object' || Array.isArray(data)) {
+        throw wErr('钱包没读出来，平台可能改版了', 'data');
+      }
+      var cands = [];
+      if (data.aw && typeof data.aw === 'object') cands.push(data.aw);
+      if (Array.isArray(data.eps)) {
+        for (var i = 0; i < data.eps.length; i++) {
+          if (data.eps[i] && typeof data.eps[i] === 'object') cands.push(data.eps[i]);
+        }
+      }
+      var out = [], seen = {};
+      for (var j = 0; j < cands.length; j++) {
+        var w = cands[j];
+        var ep = (w.ep && typeof w.ep === 'object') ? w.ep : null;
+        if (!ep) continue;
+        var eid = String(ep.id == null ? '' : ep.id).trim();
+        if (!eid) continue;
+        var ow = (w.owner && typeof w.owner === 'object') ? w.owner : {};
+        var oid = String(ow.id == null ? '' : ow.id).trim();
+        var key = eid + '\u0000' + oid;
+        if (seen[key]) continue;
+        seen[key] = 1;
+        var bal = null;
+        var ks = ['total', 'olCash', 'balance'];
+        for (var k = 0; k < ks.length; k++) {
+          bal = wNum(w[ks[k]]);
+          if (bal != null) break;
+        }
+        out.push({
+          endpointId: eid,
+          name: String(ep.name == null ? '' : ep.name).trim() || eid,
+          ownerId: oid,
+          balance: bal
+        });
+      }
+      return out;
+    },
+
+    /** 积分兑换余额。返回账单号（`data.sn`）。**有副作用，失败不重试。**
+     *
+     *  🔴 协议（原版 `ScoreExchangeParser.requestBody`）：
+     *         POST /acc/score/score-use
+     *         body {"ep":{"id":…},"score":N,"type":1}
+     *     只传**总积分**、不传份数 —— 份数由 app.js 的 `wtExTotalOf` 乘出来
+     *     （网页版和 APK 跑的是同一份 app.js，这条规则只有那一处）。
+     *  ⚠️ 拿到 sn **不等于兑换完成**：要 `exchangeBill()` 查到 status 3 才算。
+     *     网络结果不明确时**绝不自动重试**（重试 = 再扣一次积分）。
+     */
+    scoreExchange: async function (eid, score) {
+      var st = wLoad();
+      var id = String(eid == null ? '' : eid).trim();
+      if (!id) throw wErr('没选兑换到哪个钱包', 'biz');
+      var n = wInt(score);
+      if (n == null) throw wErr('兑换积分不是数字（' + score + '）', 'data');
+      if (n <= 0 || n % 100 !== 0) {
+        throw wErr('兑换积分要是 100 的整数倍（现在是 ' + n + '）', 'data');
+      }
+      var lane = wScoreLane(st);
+      var js = await wReq('POST', '/acc/score/score-use', lane.token,
+                          { ep: { id: id }, score: n, type: 1 },
+                          lane.useApp ? WATER.T_DEVICE : WATER.T_ACCOUNT,
+                          lane.useApp ? WATER.V_DEVICE : WATER.V_SCORE);
+      var data = wCheck(js) || {};
+      if (typeof data !== 'object' || Array.isArray(data)) {
+        throw wErr('兑换结果没读出来，平台可能改版了', 'data');
+      }
+      var sn = String(data.sn == null ? '' : data.sn).trim();
+      if (!sn || sn === 'null') {
+        throw wErr('未确认成功，也未返回账单号（结果未知，不要重复兑换）', 'data');
+      }
+      return sn;
+    },
+
+    /** 查兑换账单。{id, status, done}。`status === 3` 才算完成。 */
+    exchangeBill: async function (bid) {
+      var st = wLoad();
+      var id = String(bid == null ? '' : bid).trim();
+      if (!id) throw wErr('没给账单号', 'biz');
+      var lane = wScoreLane(st);
+      var js = await wReq('GET', '/bill/view-full?id=' + encodeURIComponent(id),
+                          lane.token, null,
+                          lane.useApp ? WATER.T_DEVICE : WATER.T_ACCOUNT,
+                          lane.useApp ? WATER.V_DEVICE : WATER.V_SCORE);
+      var data = wCheck(js) || {};
+      var bill = (data && typeof data === 'object' && !Array.isArray(data)
+                  && data.bill && typeof data.bill === 'object') ? data.bill : null;
+      if (!bill) throw wErr('兑换账单未出（请稍后再看，不要重复兑换）', 'data');
+      var got = String(bill.id == null ? '' : bill.id).trim();
+      if (got && got !== id) {
+        throw wErr('查到的是另一张账单（' + got + ' ≠ ' + id + '）', 'data');
+      }
+      var stt = wInt(bill.status);
+      return { id: id, status: (stt == null ? -1 : stt), done: stt === 3 };
+    },
+
+    /** 消费记录一页。{items:[{id,at,money,did,kind,msg}], more, total}
+     *  🔴 money 取不到是 null，不兜底成 0（显示 ¥0.00 会让人以为这单免费）。 */
+    bills: async function (page, size) {
+      var st = wLoad();
+      if (!wAcct(st, 'device') && !wAcct(st, 'score')) throw wErr('还没登录', 'auth');
+      var pg = (page == null ? 0 : page), sz = (size == null ? 20 : size);
+      var path = '/bill/lst-owner?page=' + pg + '&size=' + sz;
+      var js = await wReq('GET', path, wDev(st), null, WATER.T_DEVICE);
+      wCheck(js);
+      var recs = wRecords(js);
+      if (recs == null) throw wErr('消费记录没读出来，平台可能改版了', 'data');
+      var out = [];
+      for (var i = 0; i < recs.length; i++) {
+        var it = recs[i];
+        if (!it || typeof it !== 'object') continue;
+        var dd = (it.data && typeof it.data === 'object') ? it.data : {};
+        var dv = (it.dev && typeof it.dev === 'object') ? it.dev : {};
+        var did = dv.id || it.did || dd.did || dd.deviceId || '';
+        out.push({
+          id: String(it.id || '').trim(),
+          at: wMs(it.utime || it.ctime),
+          money: wNum(it.payment),
+          did: String(did).trim(),
+          kind: wInt(it.type),
+          msg: String(it.msg || '').trim()
+        });
+      }
+      var total = null;
+      if (js.data && typeof js.data === 'object' && !Array.isArray(js.data)) {
+        total = wInt(js.data.total != null ? js.data.total : js.data.totalCount);
+      }
+      var more = (total != null) ? ((pg + 1) * sz < total) : (out.length >= sz);
+      return { items: out, more: more, total: total };
+    },
+
+    /** 积分任务列表 + 签到状态。
+     *  {items:[{refId,name,score,limit,used,left}], skipped, daily:{…}|null}
+     *
+     *  🔴 和 water.py 的 missions() **逐条对应**（红线：两份实现必须对拍）。
+     *  🔴 字段名是查出来的（原项目 5.5.0 源码），不是猜的：
+     *     missions[i] = {refId, name, score, limit}
+     *     已做次数在 accScoreRsp.limits[j] = {refId, limit}（-1 = 不限次）
+     *     ⇒ left = limit - used，**自己算**，响应里没有现成的剩余。
+     *  🔴 读不到就抛，**绝不返回空数组**冒充「你没有任务」。
+     */
+    /** 任务列表（**一个平台**）。**和 water.py 的 missions() 逐条对应**。 */
+    missions: async function (token, useApp) {
+      var js = await wReq('GET', '/acc/score/mission-lst', token, null,
+                          useApp ? WATER.T_DEVICE : WATER.T_ACCOUNT,
+                          useApp ? WATER.V_DEVICE : WATER.V_SCORE);
+      var data = wCheck(js);
+      // 🔴 报错要说人话，键名进控制台。
+      //    2026-11-02：原来这里只说「平台可能改版了」，拿到截图也无从下手
+      //    （不知道是字段改名还是返回了别的东西）。但把 `foo/bar` 这种键名
+      //    直接印在界面上，用户看不懂 —— 所以分两处：屏幕上说发生了什么，
+      //    控制台里留排查线索。
+      if (!data || typeof data !== 'object' || Array.isArray(data)) {
+        console.warn('[missions] 返回的不是对象：', js);
+        throw wErr('积分平台改了返回格式，这个版本读不出来', 'data');
+      }
+      var recs = data.missions;
+      if (!Array.isArray(recs)) {
+        console.warn('[missions] data 里没有 missions，实际有：',
+                     Object.keys(data).join('/') || '(空)');
+        throw wErr('积分平台改了返回格式，这个版本读不出来', 'data');
+      }
+      var done = wLimits(wScoreRsp(data));
+      var out = [], skipped = 0;
+      for (var i = 0; i < recs.length; i++) {
+        var it = recs[i];
+        if (!it || typeof it !== 'object') { skipped++; continue; }
+        var rid = String(it.refId || '').trim();
+        if (!rid) { skipped++; continue; }
+        var name = String(it.name || it.title || '').trim();
+        var hit = false;
+        for (var k = 0; k < WATER.MISSION_SKIP.length; k++) {
+          if (name && name.indexOf(WATER.MISSION_SKIP[k]) >= 0) { hit = true; break; }
+        }
+        if (hit) { skipped++; continue; }      // 原版也跳这类
+        var limit = wInt(it.limit);
+        var used = (rid in done) ? done[rid] : null;
+        var left = null;
+        if (limit != null && limit > 0 && used !== -1) {
+          left = Math.max(0, limit - (used || 0));
+        }
+        out.push({
+          refId: rid,
+          name: name || rid,
+          score: wInt(it.score),
+          limit: limit,
+          used: used,
+          left: left,
+          // 任务自带签名就带上。**实测响应里没有这个字段**（原版 postScore
+          // 两条路都自己算签名），保留转发只是「服务端哪天给了不用改代码」。
+          sign: String(it.sign || '').trim()
+        });
+      }
+      return { items: out, skipped: skipped, daily: wDaily(data) };
+    },
+
+    /** 两个平台的**任务合并**（原版 TaskMissionPlanner.merge 的行为）。
+     *  **和 water.py 的 missions_all 逐条对应**。
+     *
+     *  🔴 一个平台读失败**不拖垮另一个**，但也不许安静吞掉：失败记在 lanes 里，
+     *     界面要能说出「少的是哪个平台」，否则看起来就像「任务只有这些」。 */
+    missionsAll: async function () {
+      var st = wLoad();
+      if (!wAcct(st, 'device') && !wAcct(st, 'score')) {
+        throw wErr('还没登录', 'auth');
+      }
+      var dev = wAcct(st, 'device'), sco = wAcct(st, 'score');
+      var lanes = {}, errs = {}, items = [], skipped = 0, daily = null;
+      // 顺序：积分平台在前（原版 merge 也是先 main 后 app，同 refId 以 main 为准）
+      var plan = [
+        { lane: 'score', tok: sco ? sco.token : null, useApp: false },
+        { lane: 'device', tok: dev ? dev.token : null, useApp: true }
+      ];
+      for (var i = 0; i < plan.length; i++) {
+        var p = plan[i];
+        if (!p.tok) { lanes[p.lane] = 'missing'; continue; }
+        var got;
+        try {
+          got = await WaterApi.missions(p.tok, p.useApp);
+        } catch (e) {
+          lanes[p.lane] = 'error';
+          errs[p.lane] = (e && e.message) || String(e);
+          continue;
+        }
+        lanes[p.lane] = 'ok';
+        skipped += (got.skipped || 0);
+        if (daily == null && got.daily) daily = got.daily;
+        for (var j = 0; j < got.items.length; j++) {
+          var it = got.items[j];
+          it.platform = p.lane;
+          items.push(it);
+        }
+      }
+      // 按 refId 去重，先到的留下
+      var seen = {}, uniq = [];
+      for (var k = 0; k < items.length; k++) {
+        if (seen[items[k].refId]) continue;
+        seen[items[k].refId] = 1;
+        uniq.push(items[k]);
+      }
+      var anyOk = false, ks = Object.keys(lanes);
+      for (var m = 0; m < ks.length; m++) if (lanes[ks[m]] === 'ok') anyOk = true;
+      if (!uniq.length && !anyOk) {
+        // 一个都没读成功 ⇒ 这是真失败，不是「没有任务」
+        var detail = Object.keys(errs).map(function (x) {
+          return x + '：' + errs[x];
+        }).join('；') || '没有可用的账号';
+        var isAuth = false;
+        Object.keys(errs).forEach(function (x) {
+          if (errs[x].indexOf('登录') >= 0) isAuth = true;
+        });
+        throw wErr('两个平台的任务都没读到（' + detail + '）',
+                   isAuth ? 'auth' : 'data');
+      }
+      return { items: uniq, skipped: skipped, daily: daily,
+               lanes: lanes, errors: errs };
+    },
+
+    /** 执行一个积分任务。**有副作用**，界面二次确认，失败不重试。
+     *
+     *  🔴 签名是必须的（0.26.2 之前这里不带 sign，是错的）：
+     *     md5(adId + 30×桶 + token尾8 + uid尾8 + 盐)，见 wSignScore。
+     *     `platform` 决定用哪个账号、哪套盐和请求头。
+     *  ⚠️ 返回成功**不等于到账**，界面跑完要重新读积分核验。
+     *  addScore 读不到就不发 —— 发一个错的比不发更糟。
+     */
+    missionDone: async function (adId, addScore, platform) {
+      var st = wLoad();
+      var adid = String(adId || '').trim();
+      if (!adid) throw wErr('这个任务做不了，平台没给必要的信息', 'biz');
+      var lane, useApp;
+      if (platform === 'device') {
+        lane = { token: wDev(st), useApp: true };
+        useApp = true;
+      } else {
+        // 🔴 用 `lane.useApp`，别写死 false：wScoreLane 在没登积分账号时会
+        //    退回设备 token 并把 useApp 置 true。写死 false 就是
+        //    「设备 token 配积分盐 + 1,5 头」⇒ 服务端按无效 token 拒掉。
+        //    signIn 一直是跟着回退走的，这里原来跟它不一致。
+        lane = wScoreLane(st);
+        useApp = lane.useApp;
+      }
+      var acct = wAcct(st, useApp ? 'device' : 'score') || wAcct(st, 'device') || {};
+      // 🔴 签名用的是 uid 后 8 位。登录没带回 uid 时，拿空编号去签，服务端一律
+      //    回「验签失败」—— 界面上看就是「任务一直失败」，重登换网都不变。
+      //    补一次账户信息，补到就存回本机（和 water.py / bridge.py 同一套）。
+      var uid = String(acct.uid || '');
+      if (!uid) {
+        var g = await wEnsureUid(lane.token, useApp, uid);
+        if (!g.uid) {
+          throw wErr('没取到账号编号（' + g.why + '），无法计算签名；'
+                     + '请到「我的」重新登录慧生活', 'data');
+        }
+        uid = g.uid;
+        var lk = useApp ? 'device' : 'score';
+        if (st[lk]) { st[lk].uid = uid; wSave(st); }
+      }
+      var sig = wSignScore(adid, lane.token, uid, useApp);
+      var q = '?sign=' + encodeURIComponent(sig);
+      if (useApp) q += '&s=1';
+      var body = { adId: adid, type: 101 };
+      if (useApp && addScore != null && isFinite(addScore)) {
+        body.addScore = Number(addScore);
+        body.addScoreType = (adid === WATER.SIGN_AD_ID) ? 2 : 4;
+      }
+      var js = await wReq('POST', '/acc/score/score-send' + q, lane.token, body,
+                          useApp ? WATER.T_DEVICE : WATER.T_ACCOUNT,
+                          useApp ? WATER.V_DEVICE : WATER.V_SCORE);
+      return wDoneResult(js, '任务');
+    },
+
+    /** 每日签到。**有副作用**，失败不重试。
+     *  body 的键名两条路不一样（原版就这样，不是笔误）：
+     *    App 路 {weekday, addScore, addScoreType:1, adId} / 积分路 {weekDay, adId}
+     *  **和 water.py 的 sign_in 逐条对应**。 */
+    signIn: async function (adId, weekday, score) {
+      var st = wLoad();
+      var adid = String(adId || '').trim();
+      if (!adid) throw wErr('这个签到做不了，平台没给必要的信息', 'biz');
+      var wd = wInt(weekday);
+      if (wd == null || wd < 1 || wd > 7) {
+        throw wErr('星期几算错了（' + weekday + '），不敢签', 'data');
+      }
+      var lane = wScoreLane(st);
+      var useApp = lane.useApp;
+      var acct = wAcct(st, useApp ? 'device' : 'score') || wAcct(st, 'device') || {};
+      var uid = String(acct.uid || '');
+      if (!uid) {
+        var g = await wEnsureUid(lane.token, useApp, uid);
+        if (!g.uid) {
+          throw wErr('没取到账号编号（' + g.why + '），无法计算签名；'
+                     + '请到「我的」重新登录慧生活', 'data');
+        }
+        uid = g.uid;
+        var lk = useApp ? 'device' : 'score';
+        if (st[lk]) { st[lk].uid = uid; wSave(st); }
+      }
+      var sig = wSignScore(adid, lane.token, uid, useApp);
+      var q = '?sign=' + encodeURIComponent(sig);
+      if (useApp) q += '&s=1';
+      var body = useApp
+        ? { weekday: wd, addScore: (wInt(score) || 0), addScoreType: 1, adId: adid }
+        : { weekDay: wd, adId: adid };
+      var js = await wReq('POST', '/acc/score/score-send' + q, lane.token, body,
+                          useApp ? WATER.T_DEVICE : WATER.T_ACCOUNT,
+                          useApp ? WATER.V_DEVICE : WATER.V_SCORE);
+      return wDoneResult(js, '签到');
+    }
+  };
+
+  /** score-send 的公共收尾：0 = 提交成功（**不等于到账**），其余按 code 说话。
+   *  **和 water.py 的 _done_result 逐条对应**。 */
+  function wDoneResult(js, what) {
+    var code = Number(js && js.code);
+    if (code === 0) {
+      return String((js && js.msg) || '').trim() || (what + '已提交');
+    }
+    if (code === -99) throw wErr('登录已过期，请重新登录', 'auth', code);
+    var msg = String((js && js.msg) || '').trim();
+    if (/签名|验签|sign/i.test(msg)) throw wErr(WATER.SIGN_MSG, 'sign', code);
+    if (/频繁|限流/.test(msg)) throw wErr(msg, 'limit', code);
+    throw wErr(msg || (what + '没成功'), 'biz', code);
+  }
+
+  var NativeApi = {
+    /** 把一场考试交给系统日历（Java 侧见 NativeBridge.addCalendar）。
+     *
+     *  返回：'' = 已经拉起日历的新建事件界面；
+     *        'none' = 这个壳没有日历能力（网页版 / 老 APK）—— 调用方退回去下载 .ics；
+     *        其余 = 打不开的原因。
+     *
+     *  🔴 这里不判断「该不该加进日历」（有没有日期、是不是过去场次），
+     *     那是 app.js 的事：网页版和 APK 得用同一套判断，别分成两份。
+     */
+    addCalendar: function (title, desc, loc, begin, end, allDay) {
+      if (!(window.Android && typeof window.Android.addCalendar === 'function')) return 'none';
+      try {
+        return String(window.Android.addCalendar(
+          String(title || ''), String(desc || ''), String(loc || ''),
+          Number(begin) || 0, Number(end) || 0, !!allDay) || '');
+      } catch (e) {
+        return 'fail: ' + ((e && e.message) || e);
+      }
+    },
+
+    /** 把一份 `.ics` 交给系统「分享到」（Java 侧见 NativeBridge.shareFile）。
+     *
+     *  返回：'' = 已经拉起分享面板；
+     *        'none' = 这个壳没有这个能力（网页版 / 0.52.0 之前的 APK）—— 调用方退回下载；
+     *        其余 = 失败原因。
+     *
+     *  🔴 为什么不许 app.js 直接调 `window.Android.shareFile`：网页版根本没有
+     *     `window.Android`，而 app.js 里所有原生能力都从 `NativeApi` 走。
+     *     多一条旁路，就多一处「网页版点下去抛异常」的地方。
+     */
+    shareFile: function (name, text, mime) {
+      if (!(window.Android && typeof window.Android.shareFile === 'function')) return 'none';
+      try {
+        return String(window.Android.shareFile(
+          String(name || ''), String(text || ''), String(mime || 'text/calendar')) || '');
+      } catch (e) {
+        return 'fail: ' + ((e && e.message) || e);
+      }
+    },
+
+    /** 手机上「通知 / 精确闹钟 / 省电白名单 / 后台任务」开了没有
+     *  （Java 侧见 NativeBridge.permState）。
+     *
+     *  返回一个对象；这个壳没有这项能力（网页版 / 0.53.0 之前的 APK）返回 **null**。
+     *  🔴 返回 null 而不是空对象：空对象在页面上会渲染成「四项全没开」——
+     *     那是**假话**，而且正是这个项目最不能犯的错（没读到 ≠ 没有）。
+     */
+    permState: function () {
+      if (!(window.Android && typeof window.Android.permState === 'function')) return null;
+      try {
+        var s = String(window.Android.permState() || '');
+        var o = s ? JSON.parse(s) : null;
+        return (o && typeof o === 'object') ? o : null;
+      } catch (e) {
+        return null;
+      }
+    },
+
+    /** 跳到能改这一项的系统页（Java 侧见 NativeBridge.permOpen）。
+     *  返回 '' = 跳过去了；'none' = 这个壳没能力；其余 = 一句提示。 */
+    permOpen: function (what) {
+      if (!(window.Android && typeof window.Android.permOpen === 'function')) return 'none';
+      try {
+        return String(window.Android.permOpen(String(what || '')) || '');
+      } catch (e) {
+        return 'fail: ' + ((e && e.message) || e);
+      }
+    },
+
+    /** 在 App 内打开一个外链（Java 侧见 NativeBridge.openWeb → WebActivity）。
+     *
+     *  返回：'' = 已经打开了；
+     *        'none' = 这个壳没有这个能力（网页版 / 0.6.0 之前的 APK）；
+     *        其余 = 起不来的原因。
+     *
+     *  `warn`（0.17.3 起）：false = 这个地址本来就不用登录（公告正文、百科），
+     *  进去时别弹「登录已过期」。老 APK 没有 openWebEx ⇒ 退回两参数的 openWeb，
+     *  那边会按「要登录」处理 —— 老机子上多一句提示，但**不会开不了**。
+     *
+     *  🔴 为什么不让 app.js 直接调 Android.openWeb：
+     *     `window.Android` 在老 APK 上不存在这个函数，直接调会抛 TypeError，
+     *     整个点击处理器就断了（连「退回浏览器」都走不到）。这里统一兜住。
+     */
+    openWeb: function (url, title, warn) {
+      if (!(window.Android && typeof window.Android.openWeb === 'function')) return 'none';
+      try {
+        // 🔴 按函数是否存在分派，不能靠 try/catch 试第三个参数：
+        //    老 APK 收到三个参数会抛，而下面那个 catch 会把它写成
+        //    'fail: ...' ⇒ 调用方当成「窗口起不来」⇒ 静默退回浏览器。
+        if (typeof window.Android.openWebEx === 'function') {
+          return String(window.Android.openWebEx(
+            String(url || ''), String(title || ''), warn !== false) || '');
+        }
+        return String(window.Android.openWeb(String(url || ''), String(title || '')) || '');
+      } catch (e) {
+        return 'fail: ' + ((e && e.message) || e);
+      }
+    },
+
+    /** 与 bridge.py 的 /api/* 完全同构。app.js 只认这个契约。 */
+    handle: async function (path, body) {
+      body = body || {};
+      // 网页版的 api() 把参数拼在路径里（/api/notice?limit=60），APK 这边
+      // 得自己拆。拆完把 path 还原成不带参数的，下面那些精确比较
+      // （=== '/api/state'）才照旧成立。
+      var q = {};
+      path = String(path || '');
+      var qi = path.indexOf('?');
+      if (qi >= 0) {
+        var pairs = path.slice(qi + 1).split('&');
+        for (var pi = 0; pi < pairs.length; pi++) {
+          if (!pairs[pi]) continue;
+          var eq = pairs[pi].indexOf('=');
+          var k = eq < 0 ? pairs[pi] : pairs[pi].slice(0, eq);
+          var v = eq < 0 ? '' : pairs[pi].slice(eq + 1);
+          try { q[decodeURIComponent(k)] = decodeURIComponent(v.replace(/\+/g, ' ')); }
+          catch (e0) { q[k] = v; }
+        }
+        path = path.slice(0, qi);
+      }
+      try {
+        // ---------------- 慧生活798（直饮水） ----------------
+        // 和 bridge.py 的 /api/water/* **一一对应**（路径、字段、错误形状都一样），
+        // 所以 app.js 那边只写一套，不用 `if (NATIVE)` 分叉。
+        // 财务处（缴费）。只读：欠费 + 房间电费，没有充值和支付。
+        if (path === '/api/cw/state') return CwApi.state();
+        if (path === '/api/cw/login') return CwApi.login(body.xh, body.pwd);
+        if (path === '/api/cw/bill') return CwApi.bill();
+        if (path === '/api/cw/logout') return CwApi.logout();
+        if (path === '/api/cw/elec/options') {
+          return { ok: true, options: await CwApi.elecOptions(body.buildid) };
+        }
+        if (path === '/api/cw/records') {
+          var kind = String(body.kind || '') === 'use' ? 'use' : 'pay';
+          var rec;
+          try {
+            rec = await CwApi.records(body.cxid || '', kind);
+          } catch (e) {
+            return { ok: false, error: (e && e.message) || String(e),
+                     kind: (e && e.kind) || 'data' };
+          }
+          return { ok: true, kind: kind, items: rec.items || [],
+                   more: !!rec.more };
+        }
+        if (path === '/api/cw/elec') {
+          return { ok: true, elec: await CwApi.elec(body.buildid, body.roomid, body.label) };
+        }
+        if (path === '/api/water/state') return WaterApi.state();
+        if (path === '/api/water/captcha') {
+          var wk = WaterApi.captchaKey();
+          return { ok: true, key: wk, url: WaterApi.captchaUrl(wk) };
+        }
+        if (path === '/api/water/sms') {
+          await WaterApi.sendSms(body.phone, body.key, body.graph);
+          return { ok: true };
+        }
+        if (path === '/api/water/login') {
+          var wl = await WaterApi.login(body.phone, body.sms, body.kind);
+          // soft 要带上去：'soft' = 存好了但走的是备用加密方式。
+          // 它是**成功**，只是调用方有权知道一句（换手机/清数据后要重登）。
+          return { ok: true, phone: wl.phone, kind: wl.kind, soft: !!wl.soft };
+        }
+        if (path === '/api/water/home') {
+          var g0 = wGate('device');
+          if (g0) return { ok: false, error: g0, kind: 'auth' };
+          var wout = { ok: true };
+          // 🔴 余额和设备分开报错：一个挂了不该把另一个也变成「读不到」，
+          //    也不许安静吞掉。和 bridge.py 那段是同一套规则。
+          try {
+            wout.balance = await WaterApi.balance();
+          } catch (e1) {
+            if (e1 && e1.kind === 'auth') {
+              return { ok: false, error: e1.message, kind: 'auth' };
+            }
+            wout.balance = null;
+            wout.balanceError = (e1 && e1.message) || String(e1);
+          }
+          try {
+            wout.devices = await WaterApi.devices();
+          } catch (e2) {
+            if (e2 && e2.kind === 'auth') {
+              return { ok: false, error: e2.message, kind: 'auth' };
+            }
+            wout.devices = WaterApi.state().devices || [];
+            wout.devicesError = (e2 && e2.message) || String(e2);
+          }
+          return wout;
+        }
+        if (path === '/api/water/start') {
+          // 文案由 WaterApi.start 给，**不在这里另写一句** ——
+          // 两份文案各改各的会分叉，而且不报错（和 water.py 对照的测试抓得到）。
+          var wmsg = await WaterApi.start(body.did);
+          return { ok: true, msg: wmsg };
+        }
+        if (path === '/api/water/logout') {
+          WaterApi.logout(body.kind);
+          return { ok: true, kind: body.kind || '' };
+        }
+        // ---------------- 0.24.0：和 bridge.py 逐条对应 ----------------
+        if (path === '/api/water/score') {
+          var g1 = wGate('any');
+          if (g1) return { ok: false, error: g1, kind: 'auth' };
+          var sc = await WaterApi.score();
+          return { ok: true, valid: sc.valid, total: sc.total };
+        }
+        if (path === '/api/water/bills') {
+          var g2 = wGate('device');
+          if (g2) return { ok: false, error: g2, kind: 'auth' };
+          var bp = parseInt(q.page, 10);
+          var got = await WaterApi.bills(isFinite(bp) ? bp : 0, 20);
+          return { ok: true, items: got.items, more: got.more, total: got.total };
+        }
+        if (path === '/api/water/missions') {
+          var g3 = wGate('any');
+          if (g3) return { ok: false, error: g3, kind: 'auth' };
+          var mg = await WaterApi.missionsAll();
+          // 🔴 `daily` / `lanes` / `errors` 必须一起转发（同 bridge.py 那条注释）：
+          //    漏了 daily ⇒ 签到卡永远藏着；漏了 lanes ⇒ 界面不知道
+          //    「少一半任务是没登积分账号」，只会显得「任务就是这些」。
+          return { ok: true, items: mg.items, skipped: mg.skipped,
+                   daily: mg.daily, lanes: mg.lanes, errors: mg.errors };
+        }
+        if (path === '/api/water/signin') {
+          if (!String(body.adId || '').trim()) {
+            return { ok: false, error: '签到信息不全，做不了' };
+          }
+          var si = await WaterApi.signIn(body.adId, body.weekday, body.score);
+          return { ok: true, msg: si };
+        }
+        if (path === '/api/water/end') {
+          var g4 = wGate('device');
+          if (g4) return { ok: false, error: g4, kind: 'auth' };
+          if (!String(body.did || '').trim()) {
+            return { ok: false, error: '没给设备号' };
+          }
+          return { ok: true, msg: await WaterApi.end(body.did) };
+        }
+        if (path === '/api/water/mission') {
+          var g5 = wGate('any');
+          if (g5) return { ok: false, error: g5, kind: 'auth' };
+          if (!String(body.adId || '').trim()) {
+            return { ok: false, error: '没给任务 id' };
+          }
+          var as = (body.score == null || body.score === '') ? null : Number(body.score);
+          var mm = await WaterApi.missionDone(body.adId,
+                     isFinite(as) ? as : null, String(body.platform || ''));
+          return { ok: true, msg: mm };
+        }
+        // ---------------- 0.27.1：积分兑换余额 ----------------
+        // 和 bridge.py 一一对应（路径、字段、错误形状都一样）。
+        if (path === '/api/water/wallets') {
+          var gw = wGate('any');
+          if (gw) return { ok: false, error: gw, kind: 'auth' };
+          return { ok: true, wallets: await WaterApi.wallets() };
+        }
+        if (path === '/api/water/exchange') {
+          var ge = wGate('any');
+          if (ge) return { ok: false, error: ge, kind: 'auth' };
+          if (!String(body.eid || '').trim()) {
+            return { ok: false, error: '没选兑换到哪个钱包' };
+          }
+          if (body.score == null || body.score === '') {
+            return { ok: false, error: '没给要兑换的积分' };
+          }
+          try {
+            return { ok: true, sn: await WaterApi.scoreExchange(body.eid, body.score) };
+          } catch (e) {
+            var ek = (e && e.kind) || '';
+            // 🔴 网络类失败**不代表没扣分**：请求可能已经到服务端了。
+            //    文案必须让用户先去核验，不能让他「再点一次」—— 那就是再扣一次。
+            if (!ek || ek === 'net' || ek === 'limit') {
+              return { ok: false, kind: ek || 'net',
+                       error: '兑换结果未知（' + ((e && e.message) || e)
+                              + '），请勿重复兑换' };
+            }
+            return { ok: false, error: (e && e.message) || String(e), kind: ek };
+          }
+        }
+        if (path === '/api/water/exchange-bill') {
+          var gb = wGate('any');
+          if (gb) return { ok: false, error: gb, kind: 'auth' };
+          var bid = String((q && q.id) || '').trim();
+          if (!bid) return { ok: false, error: '没给账单号' };
+          try {
+            var eb = await WaterApi.exchangeBill(bid);
+            return { ok: true, id: eb.id, status: eb.status, done: eb.done };
+          } catch (e2) {
+            return { ok: false, error: (e2 && e2.message) || String(e2),
+                     kind: (e2 && e2.kind) || '' };
+          }
+        }
+        if (path === '/api/state') {
+          var c = loadCred();
+          var cs = '';
+          try { cs = String(Android.credState() || ''); } catch (e) { cs = ''; }
+          return { ok: true, bound: !!c, username: c ? c.u : '', credState: cs };
+        }
+        if (path === '/api/login') {
+          var user = (body.username || '').trim();
+          var pwd = body.password || '';
+          if (!user || !pwd) return { ok: false, error: '请填学号和密码' };
+          var payload = await doSync(user, pwd);
+          if (body.remember !== false) {
+            // 空串 = 存好了；"soft" = 走了备用方式；"fail: xxx" = 没存上。
+            // 🔴 别再把这三件事压成一个布尔值 —— 用户有权知道密码到底存没存住。
+            var why = '';
+            try { why = String(Android.saveCred(user, pwd) || ''); } catch (e) {
+              why = 'fail: 调用原生保存出错（' + ((e && e.message) || e) + '）';
+            }
+            payload.saved = why;
+          }
+          return payload;
+        }
+        if (path === '/api/sync') {
+          var acc = loadCred();
+          if (!acc) return { ok: false, error: '还没绑定账号', needBind: true };
+          return await doSync(acc.u, acc.p);
+        }
+        if (path === '/api/unbind') {
+          Android.clearCred();
+          // 解绑要连教务系统的会话一起丢掉：只清本机凭据不清 cookie 的话，
+          // 下次绑另一个账号时学校服务器还会认着旧会话（登录页被 302 走、
+          // 拿不到加盐值），只能靠 login() 里那段补救逻辑绕一圈才登得上。
+          clearCookies();
+          idsCache = '';
+          loggedIn = false;
+          loggedUser = '';
+          examPageSeen = false;
+          projectReady = false;
+          return { ok: true };
+        }
+        // ---- 学习通（作业待办）----
+        // 契约与 bridge.py 的 /api/cx/* 完全一致：app.js 只写一套分支。
+        if (path === '/api/cx/status') {
+          cxRestore();
+          var cxp = cxPwdLoad();
+          return { ok: true, linked: cxHasLogin(), user: CX_USER,
+                   saved: !!cxp,
+                   // 能不能一键重连：账号和密码都得在
+                   canRelink: !!(cxp && cxp.u),
+                   scan: cxScanState(), age: cxCacheAge() };
+        }
+        if (path === '/api/cx/todo') {
+          // 扫描要 60 秒，不能同步等。这里只读缓存 + 报进度，前端自己轮询。
+          cxRestore();
+          return { ok: true, scan: cxScanState(), age: cxCacheAge(), data: cxCacheGet() };
+        }
+        if (path === '/api/cx/live') {
+          // 随堂练习快查。只查「今天有课的那几门」的活动列表，全部请求都在
+          // 前台等着（2 秒级），所以同步返回，不像全量扫描那样排队轮询。
+          try {
+            var lv = await cxLiveCheck((body && body.names) || null,
+                                       String((body && body.semester) || ''));
+            return { ok: true, at: lv.at, items: lv.items, signs: lv.signs,
+                     checked: lv.checked };
+          } catch (e) {
+            var lk = String((e && e.kind) || 'net');
+            return { ok: false, kind: lk,
+                     error: String((e && e.message) || e) };
+          }
+        }
+        if (path === '/api/cx/notices') {
+          // 收件箱。不扫描、不排队：只翻两页、用户点开才拉。
+          // `?force=1` 穿透 5 分钟缓存（用户主动点「刷新」时）。
+          cxRestore();
+          var mage = Date.now() - cxMail.at;
+          if (cxMail.at && mage < CX_MAIL_TTL && !q.force) {
+            return { ok: true, list: cxMail.list, age: Math.floor(mage / 1000),
+                     err: cxMail.err, kind: cxMail.kind };
+          }
+          try {
+            var mrows = await cxNotices(20, 2);
+            cxMail = { at: Date.now(), list: mrows, err: '', kind: '' };
+            return { ok: true, list: mrows, age: 0, err: '', kind: '' };
+          } catch (e) {
+            var mmsg = String((e && e.message) || e);
+            var mkind = (e && e.kind) || 'net';
+            cxMail.err = mmsg;
+            cxMail.kind = mkind;
+            return { ok: false, error: mmsg, kind: mkind, needLogin: mkind === 'auth' };
+          }
+        }
+        if (path === '/api/cx/login') {
+          var cuser = String(body.user || '').replace(/^\s+|\s+$/g, '');
+          var cpwd = body.pass || '';
+          // 密码留空 = 「用本机存着的那份」。登录态过期后重连时，
+          // 人只需要点一下，不用再翻密码。
+          var cxUsedSaved = false;
+          if (!cpwd) {
+            var sc2 = cxPwdLoad();
+            if (!sc2) return { ok: false, error: '账号和密码都要填' };
+            // 🔴 存的是另一个账号的密码就**不许**拿去试：学习通会把
+            //    needVcode 撞成 1，之后要人做滑块。
+            if (sc2.u && cuser && sc2.u !== cuser) {
+              return { ok: false,
+                       error: '存的是 ' + sc2.u + ' 的学习通密码，跟这个账号对不上，请手动输入' };
+            }
+            cuser = cuser || sc2.u;
+            cpwd = sc2.p;
+            cxUsedSaved = true;
+          }
+          if (!cuser || !cpwd) return { ok: false, error: '账号和密码都要填' };
+          try {
+            await cxLogin(cuser, cpwd);
+          } catch (e) {
+            // 🔴 一次失败就回，绝不重试 —— 重试会把 needVcode 撞成 1
+            var cmsg = String((e && e.message) || e);
+            // 用着本机存的密码、服务端又明确说账号密码不对 ⇒ 把那份删掉。
+            // 不删的话下次还会拿一个错密码去撞。
+            if (cxUsedSaved && e && e.kind === 'auth') {
+              cxPwdClear();
+              return { ok: false, kind: 'auth', pwdStale: true,
+                       error: cmsg + ' —— 存着的那份密码已经删掉，请手动输入一次' };
+            }
+            return { ok: false, error: cmsg, kind: (e && e.kind) || 'net' };
+          }
+          var csaved = '';
+          try {
+            csaved = String(Android.cxSave(String(Android.cxDumpCookies() || '[]')) || '');
+          } catch (e2) {
+            csaved = 'fail: 调用原生保存出错（' + ((e2 && e2.message) || e2) + '）';
+          }
+          // 密码也存一份：下次过期只需点一下
+          var cpwSaved = cxPwdSave(cuser, cpwd);
+          if (csaved.indexOf('fail') === 0) csaved = cpwSaved;
+          CX_USER = cuser;
+          try { localStorage.setItem(CXS.USERKEY, cuser); } catch (e3) { /* 无所谓 */ }
+          return { ok: true, user: cuser, saved: csaved };
+        }
+        if (path === '/api/cx/scan') {
+          cxRestore();
+          // 🔴 这里**不再**用「cookie 里有没有 UID」当硬闸门。
+          //
+          //    2026-10-25 用户报的原话：「明明已经登录了学习通，点重新检查的时候
+          //    还是说学习通未登录」。根因有两层：
+          //      ① 在「打开学习通」那个 WebView 里登录的，cookie 进的是
+          //         android.webkit 的罐子，java.net 这个罐子压根没有 ——
+          //         两个罐子互不可见（见 WebActivity 的反向同步）。
+          //      ② 就算 cookie 在，用**名字**判登录态本身就是错判据：
+          //         本项目红线写着「「登录成功」= 需要登录的接口返回 200，
+          //         不是 cookie 在不在」。cookie 名一改（或某条被 HttpCookie
+          //         丢掉），会话明明还活着，这里也会说「未登录」。
+          //
+          //    改法：cookie 检查只当**快速提示**，不当结论。没有 UID 也照样
+          //    问一次服务器 —— 而且问的就是扫描本来要做的第一件事（拿课程列表），
+          //    所以**不多发一个请求**，拿到就顺手喂给扫描。
+          // 已经在扫就不排队、不并发 —— 风控怕这个。
+          // ⚠️ 这一条必须排在探网之前：否则「已经在扫」时再点一次，
+          //    会白发一个课程列表请求（那个请求正是扫描正在做的事）。
+          if (CX_SCAN.state === 'scanning') {
+            return { ok: true, started: false, scan: cxScanState() };
+          }
+          // 0.44.1：上次被拦下，还在冷静期里 ⇒ 一个请求都不发，直接说还要等多久。
+          // 比让他撞上去看一句「查得太频繁」有用 —— 后者听起来像在怪他。
+          var bu = cxBusyUntil();
+          if (bu > Date.now() / 1000) {
+            var leftMin = Math.ceil((bu - Date.now() / 1000) / 60);
+            return { ok: false, kind: 'busy',
+                     error: '学习通上次把查询拦下了，等 ' + leftMin +
+                            ' 分钟后再操作（等待期间不要重复提交，越提越久）',
+                     busyLeft: leftMin };
+          }
+          var preCourses = null;
+          if (!cxHasLogin()) {
+            try {
+              preCourses = await cxCourses();
+            } catch (e0) {
+              var k0 = String((e0 && e0.kind) || 'net');
+              // 🔴 0.53.0 v4（2026-11-15）：没有 cookie **不代表**没登录 ——
+              //    探测失败时先看本机有没有密码，自己登一次再来问，而不是
+              //    直接把人推去「打开学习通手动登」。见 cxAutoRelink。
+              if (k0 === 'auth' && await cxAutoRelink()) {
+                try {
+                  preCourses = await cxCourses();
+                } catch (e0b) {
+                  k0 = String((e0b && e0b.kind) || 'net');
+                  return { ok: false, error: String((e0b && e0b.message) || e0b),
+                           kind: k0, needLogin: k0 === 'auth' };
+                }
+              } else {
+                return { ok: false,
+                         error: String((e0 && e0.message) || e0),
+                         kind: k0,
+                         // auth 才让人去重连；net（限流/断网）说「未登录」是误导
+                         needLogin: k0 === 'auth' };
+              }
+            }
+          }
+          CX_SCAN.state = 'scanning';
+          CX_SCAN.at = 0;
+          CX_SCAN.i = 0;
+          CX_SCAN.n = 0;
+          CX_SCAN.course = '';
+          CX_SCAN.phase = '';
+          CX_SCAN.err = '';
+          CX_SCAN.kind = '';
+          // 后台跑，不 await：前端靠轮询 /api/cx/todo 看进度
+          (async function () {
+            // 一轮扫描。抽成函数是为了「登录态过期时自己重登一次再来一遍」——
+            // 那件事只该在**真过期**时发生一次，不能写成一串 try 里套 try。
+            var scanOnce = function (pre) {
+              return cxScanAll(prevRest(), !!(body && body.force), pre,
+                // 本学期教务课表里的课（课名 + 老师）：命中的全扫，其余只查签到。
+                // 前端拿不到课表就不传，见 cxScanAll 里「white 为空 ⇒ 不降级」。
+                (body && body.activeNames) || null,
+                // 教务给的当前学期，用来判「学习通这个班是不是别的学期开的」。
+                String((body && body.semester) || ''));
+            };
+            // 上一份结果里的 rest 就是「哪些课已经结课」的记忆。
+            // 每次重来都要现取 —— 重来那一轮已经写过缓存了。
+            var prevData = null;
+            var prevRest = function () {
+              if (!prevData) prevData = cxCacheGet();
+              return prevData && prevData.rest;
+            };
+            try {
+              var data;
+              try {
+                data = await scanOnce(preCourses);
+              } catch (eA) {
+                // 🔴 0.53.0 v4（2026-11-15）：真的过期了、本机又存着密码，
+                //    就自己登一次再来，别让人自己点。用户这一条说了七遍：
+                //    「明明已经正常登录学习通了，还是显示登录过期」——
+                //    他每次都能立刻登上，说明只差这一次续期。
+                //    频率限制在 cxAutoRelink 里（30 分钟一次、撞验证码停一天）。
+                if (String((eA && eA.kind) || '') !== 'auth') throw eA;
+                var again = await cxAutoRelink();
+                if (!again) throw eA;
+                data = await scanOnce(null);
+              }
+              cxCacheSet(data);
+              // 扫描过程中 cookie 可能续期，顺手存回本机
+              cxPersist();
+              CX_SCAN.state = 'done';
+              CX_SCAN.at = data.at;
+              CX_SCAN.err = '';
+              CX_SCAN.kind = '';
+              // 这一轮完整跑完了 ⇒ 冷静期作废。下次点就该正常查。
+              cxBusyClear();
+            } catch (e) {
+              CX_SCAN.state = 'error';
+              CX_SCAN.err = String((e && e.message) || e).slice(0, 140);
+              // kind 给前端判断「是不是登录态失效」用：失效且本机存着密码时
+              // 直接给一个「重连」按钮，不用人再输一遍。
+              CX_SCAN.kind = String((e && e.kind) || '');
+              // 被风控拦了 ⇒ 记 15 分钟。这 15 分钟里他再点，连请求都不发。
+              if (CX_SCAN.kind === 'busy') cxBusyMark();
+            }
+          })();
+          return { ok: true, started: true, scan: cxScanState() };
+        }
+        if (path === '/api/cx/logout') {
+          // 断开 = 不再保留这个账号的任何东西：cookie、密码、缓存、学号
+          try { Android.cxClear(); } catch (e) { /* 无所谓 */ }
+          cxPwdClear();
+          cxCacheClear();
+          // 🔴 收件箱也要清。不清的话换个人拿到这台手机，点开「消息」
+          //    看到的还是上一个人的老师发的通知 —— 和作业缓存一个道理。
+          cxMail = { at: 0, list: [], err: '', kind: '' };
+          CX_USER = '';
+          try { localStorage.removeItem(CXS.USERKEY); } catch (e2) { /* 无所谓 */ }
+          CX_SCAN.state = 'idle';
+          CX_SCAN.at = 0;
+          CX_SCAN.i = 0;
+          CX_SCAN.n = 0;
+          CX_SCAN.course = '';
+          CX_SCAN.phase = '';
+          CX_SCAN.err = '';
+          CX_SCAN.kind = '';
+          // 学习通跨 4 个域，全清。漏一个的话「断开」之后还能读到东西。
+          // 🔴 用 cxClearCookies 而不是 clearCookiesFor：后者会连 WebView 的
+          //    罐子一起清，把门户的登录态也带走 —— 断开学习通不该影响门户。
+          try {
+            if (typeof Android.cxClearCookies === 'function') Android.cxClearCookies();
+          } catch (e3) { /* 清不掉也只能这样 */ }
+          return { ok: true };
+        }
+        // ---- 中国大学 MOOC（0.45.0）----
+        // ⚠️ 和别的平台不一样：登录不在我们这边做（见 moocCookieHeader 上面的说明），
+        //    这里只读「登录态还在不在」。
+        if (path === '/api/mooc/status') {
+          var mhdr = moocCookieHeader();
+          var mcached = moocCached();
+          return { ok: true, linked: moocLinked(mhdr),
+                   user: String((mcached && mcached.user) || ''),
+                   age: moocAge(), webOnly: false };
+        }
+        if (path === '/api/mooc/todo') {
+          return { ok: true, age: moocAge(), data: moocCached(), webOnly: false };
+        }
+        if (path === '/api/mooc/scan') {
+          // MOOC 一门课一个请求，2 门课也就三四个请求、几秒钟，不用像
+          // 学习通那样后台扫 + 轮询。直接同步等，前端少一套状态机。
+          try {
+            var mdata = await moocScan();
+            return { ok: true, data: mdata, age: 0 };
+          } catch (e) {
+            var mk = String((e && e.kind) || 'net');
+            var mo = { ok: false, kind: mk, error: String((e && e.message) || e),
+                       needLogin: mk === 'auth' };
+            // 原文照旧带出去，但**只给排查用** —— 界面显示的是 error 那句人话
+            if (e && e.detail) mo.detail = String(e.detail);
+            return mo;
+          }
+        }
+        if (path === '/api/mooc/logout') {
+          moocCache = { at: 0, data: null };
+          // 罐子里的票也一起清掉 —— 否则下次进来又是「已登录」，
+          // 用户会以为「退出登录」没生效。
+          try {
+            if (window.Android && typeof Android.clearCookiesFor === 'function') {
+              Android.clearCookiesFor('icourse163.org');
+            }
+          } catch (e2) { /* 清不掉也不影响本地这份 */ }
+          return { ok: true };
+        }
+        // ---- 智慧门户：一卡通 + 19 个办事应用 ----
+        // 契约与 bridge.py 的 do_GET / do_POST 完全一致（app.js 只写一套分支）。
+        if (path === '/api/portal/status') {
+          var pst = pfState();
+          var pj = pfJwt();
+          // `saved` = 本机存着门户密码 ⇒ 过期后只需算一道验证码。
+          // 只回「存的是哪个学号」，密码本身不出原生层。
+          var pcr = pfCredLoad();
+          var savedInfo = { saved: !!pcr, savedUser: pcr ? pcr.u : '',
+                            pwdState: pfCredState() };
+          if (!pst.tgt && !pj) {
+            // 没连过。密码可能还存着（比如只断开了会话），「连接门户」照样能省一步。
+            return { ok: true, state: 'none', saved: savedInfo.saved,
+                     savedUser: savedInfo.savedUser, pwdState: savedInfo.pwdState };
+          }
+          // 只做本地判断，不探网：这个接口每次切到「校园」页都会调，
+          // 探一次网就多几百毫秒。真正的死活由 card/apps 的 needLogin 决定。
+          //
+          // 🔴 唯一例外是**保活**（2026-10-28）：它确实要发请求，但
+          //    `pfKeepAlive` 不 await、自己限频（2 小时一次）、失败不出声，
+          //    所以这里既不会变慢也不会因为门户抽风而报错。
+          //    放这儿是因为「进校园页」是用户一天里最稳定的那个动作。
+          pfKeepAlive();
+          return { ok: true, state: 'ok', user: pst.user || pfSub(pj),
+                   saved: savedInfo.saved, savedUser: savedInfo.savedUser,
+                   pwdState: savedInfo.pwdState };
+        }
+        if (path === '/api/portal/captcha') {
+          try { return await pfCaptcha(); }
+          catch (e) { return { ok: false, error: String((e && e.message) || e) }; }
+        }
+        if (path === '/api/portal/login') {
+          var pu = String(body.user || '').trim();
+          var pp = body.pass || '';
+          var pc = String(body.code || '').trim();
+          // 密码留空 = 「用本机存着的那份」。过期重登时人只需要算一道算术题。
+          var usedSaved = false;
+          if (!pp) {
+            var sc = pfCredLoad();
+            if (!sc) return { ok: false, error: '学号和密码都要填', needCaptcha: true };
+            // 🔴 存的是另一个学号的密码就**不许**拿去试：门户错 5 次锁号。
+            if (sc.u && pu && sc.u !== pu) {
+              return { ok: false, needCaptcha: true,
+                       error: '本机存的是 ' + sc.u + ' 的门户密码，跟这个学号对不上，请手动输入' };
+            }
+            pp = sc.p;
+            pu = pu || sc.u;
+            usedSaved = true;
+          }
+          // 🔴 一律带 needCaptcha：验证码是一次性的，哪一步失败这张都不能再用
+          if (!pu || !pp) return { ok: false, error: '学号和密码都要填', needCaptcha: true };
+          if (!pc) return { ok: false, error: '还没算验证码', needCaptcha: true };
+          var lr;
+          try { lr = await pfLogin(pu, pp, pc); }
+          catch (e) {
+            return { ok: false, error: '登录出错：' + ((e && e.message) || e),
+                     needCaptcha: true };
+          }
+          if (lr && lr.ok) {
+            // 这次用的密码是对的（不管是手输的还是存的）⇒ 存下来，下次省一步。
+            // 把「存没存住」如实带回去：存不上必须让人知道，否则下次又白输一遍。
+            lr.pwdSave = pfCredSave(pu, pp);
+            return lr;
+          }
+          var out = lr || { ok: false, error: '登录失败', needCaptcha: true };
+          // 用着本机存的密码、门户又明确说「密码/账号不对」⇒ 把密码和会话都扔了。
+          // 不扔的话下次还会拿一个错密码去撞，撞 5 次号就锁了。
+          if (usedSaved && PF_PWD_BAD.indexOf(String(out.code || '')) >= 0) {
+            pfCredClear();
+            try { localStorage.removeItem(PF.KEY); } catch (e2) { /* 无所谓 */ }
+            out.pwdStale = true;
+            out.error = String(out.error || '密码不对') + ' —— 存着的那份密码已经删掉，请手动输入一次';
+          }
+          return out;
+        }
+        if (path === '/api/portal/card') {
+          try { var pcard = await pfCard(); pcard.ok = true; return pcard; }
+          catch (e) { return pfFailBody(e); }
+        }
+        if (path === '/api/portal/apps') {
+          try { var papps = await pfApps(); papps.ok = true; return papps; }
+          catch (e) { return pfFailBody(e); }
+        }
+        // 给某个办事系统换一张 CAS 票（见 pfServiceTicket 的注释）。
+        // app.js 拿到票会拼在地址后面再打开，这样进门就是登录态。
+        if (path === '/api/portal/ticket') {
+          var svc = String(q.service || '').trim();
+          // 🔴 白名单只放学校的地址：这张票**等于一次登录态**，
+          //    拼到别人的域名上就是把登录态送出去了。
+          //    `([a-z0-9-]+\.)*` 让 `zua.edu.cn` 本身和各级子域都算，
+          //    但不接受 `zua.edu.cn.evil.com` 这种（后面必须紧跟 / 或结尾）。
+          if (!/^https:\/\/([a-z0-9-]+\.)*zua\.edu\.cn(\/|$)/i.test(svc)) {
+            return { ok: false, error: '只给学校（zua.edu.cn）的地址换票' };
+          }
+          return await pfServiceTicket(svc);
+        }
+        if (path === '/api/portal/logout') {
+          pfCap = null;
+          try { localStorage.removeItem(PF.KEY); } catch (e) { /* 无所谓 */ }
+          // 断开门户 = 不再保留这个账号的任何东西，包括那份密码。
+          // 只清会话不清密码的话，换个人用这台手机点「连接门户」就进去了。
+          pfCredClear();
+          // 只清门户那两个域，别顺手把教务系统的会话也清了 ——
+          // 用户只是不想看一卡通了，课表不该跟着掉线。
+          try {
+            if (window.Android && typeof Android.clearCookiesFor === 'function') {
+              Android.clearCookiesFor('zua.edu.cn');
+            }
+          } catch (e2) { /* 清不掉也只是本地不再用它 */ }
+          return { ok: true };
+        }
+        // 考试页「选学期」用。学期 id 由 /api/sync 或 /api/semesters 给，
+        // 界面只把用户点的那个原样送回来。
+        if (path === '/api/exams') {
+          var acc2 = loadCred();
+          if (!acc2) return { ok: false, error: '还没绑定账号', needBind: true };
+          var sid = String(body.semesterId == null ? '' : body.semesterId).trim();
+          if (!/^\d+$/.test(sid)) {
+            // 不猜、不兜底：id 不对就说，别默默拿当前学期的数据
+            // 冒充用户点的那一学期。
+            return { ok: false, error: '学期编号不对' };
+          }
+          var one = await withLogin(function () { return exams(sid); });
+          one.ok = true;
+          return one;
+        }
+        if (path === '/api/semesters') {
+          if (!loadCred()) return { ok: false, error: '还没绑定账号', needBind: true };
+          var sems = await withLogin(function () { return semesters(); });
+          return { ok: true, semesters: sems };
+        }
+        // 课表页翻历史学期（2026-10-31 加）。契约与 bridge.py 的同名接口一致。
+        if (path === '/api/timetable') {
+          if (!loadCred()) return { ok: false, error: '还没绑定账号', needBind: true };
+          var tsid = String(body.semesterId == null ? '' : body.semesterId).trim();
+          if (tsid && !/^\d+$/.test(tsid)) return { ok: false, error: '学期编号不对' };
+          var tsname = String(body.semesterName == null ? '' : body.semesterName).trim();
+          var tt2 = await withLogin(function () { return timetable(tsid, tsname); });
+          tt2.ok = true;
+          tt2.semesterId = tsid;
+          return tt2;
+        }
+        // 「该办的事」：选课 / 评教 / 免听 / 免修的开放状态。
+        // 单独一个接口而不是塞进 /api/sync —— 这四页要打四次教务系统，
+        // 学校有「别点太快」的守卫，串起来十几秒；而它一学期才变几次。
+        if (path === '/api/todo') {
+          if (!loadCred()) return { ok: false, error: '还没绑定账号', needBind: true };
+          var td = await withLogin(function () { return todo(); });
+          td.ok = true;
+          td.at = Math.floor(Date.now() / 1000);
+          return td;
+        }
+        if (path === '/api/room-options') {
+          if (!loadCred()) return { ok: false, error: '还没绑定账号', needBind: true };
+          var opts = await withLogin(function () { return roomOptions(); });
+          opts.ok = true;
+          return opts;
+        }
+        if (path === '/api/free-rooms') {
+          if (!loadCred()) return { ok: false, error: '还没绑定账号', needBind: true };
+          // 🔴 参数一个都不猜：日期必须是 YYYY-MM-DD，节次必须是 1~12。
+          //    写错了直接回错，别默默按「今天第 1 节」查一遍再冒充用户要的。
+          var one = await withLogin(function () { return freeRooms(body); });
+          one.ok = true;
+          return one;
+        }
+        // 校园公告：抓的是学校各部门的**公开页面**，所以不校验凭据。
+        // 这也是有意的 —— 公告是唯一「没绑教务账号也能看」的栏目。
+        if (path === '/api/notice') {
+          var lim = parseInt(q.limit, 10);
+          if (!(lim >= 1)) lim = 60;
+          if (lim > 200) lim = 200;
+          return await nFetchList(lim, q.force === '1');
+        }
+        if (path === '/api/notice/detail') {
+          var u = String(q.u || '').trim();
+          if (!u) return { ok: false, error: '通知打不开，请重试' };
+          return await nFetchDetail(u);
+        }
+        return { ok: false, error: '这个功能用不了（App 版本太旧）' };
+      } catch (e) {
+        var msg = (e && e.message) || String(e);
+        var detail = (e && e.detail) || '';
+        // 网络层错误（超时、连不上）没有 EamsError 的语义，补一句人话
+        // 🔴 2026-10-23 改：以前是 `msg = '连不上教务系统（' + msg + '）'`。
+        //    人话是有了，但**括号里塞的是 Java 原文**，用户看到的是
+        //    「连不上教务系统（原生请求失败：java.net.SocketTimeoutException:
+        //      failed to connect to ... after 15000ms）」。
+        //    各层都以为自己守住了：底层说「我加了『原生请求失败』这个中文前缀」，
+        //    这一层说「我加了『连不上教务系统』这个中文前缀」—— 合起来还是异常原文。
+        //    （2026-10-23 南师侧踩到同一个，两边结构一模一样。）
+        //    现在：message 只放人话，原文进 detail —— 不显示，但排查时还在。
+        if (!(e instanceof EamsError) && /timeout|failed|connect|Network/i.test(msg)) {
+          detail = msg;
+          // ⚠️ 不写死「教务只在校内网能打开」：郑航的教务解析到公网地址
+          //    （202.196.166.172），到底放不放行校外还没实测过。措辞留余地，
+          //    两种情况下都不算撒谎。
+          msg = /timeout|failed to connect|ETIMEDOUT/i.test(msg)
+            ? '连不上教务系统，检查网络；校外需连校园网'
+            : '连不上教务系统，请检查网络后重试';
+        }
+        var out = { ok: false, error: msg };
+        if (detail) out.detail = detail;
+        // 🔴 错误分类必须一起带出去（2026-10-30 修）。
+        //    以前这里只回 {ok, error}，`e.kind` 就被吞在原生层里了 ——
+        //    bridge.py 那条路有 kind，native.js 这条路没有，于是同一份
+        //    app.js 在网页版分得清「签名被拒 / 限流 / 登录过期」，在 APK 里
+        //    一律退化成一句原话。**不报错，只是少了一层信息**，最难发现。
+        if (e && e.kind) out.kind = String(e.kind);
+        // 排查用的证据（形如 `page_200_5969`）。界面上一个字都不显示，
+        // 但会随失败上报出去 —— 下次再有人「绑不上」，看这一个字段
+        // 就知道是哪一档，不用再靠猜。
+        if (e && e.diag) out.diag = String(e.diag);
+        if (e && e.stage) out.stage = String(e.stage);
+        // 🔴 2026-11-14：失败原因**写进本机日志**。
+        //    之前 `detail`（原生那边返回的原文，例如「明文通道 2300997 …；系统通道 …」）
+        //    只是跟着回执走，谁也没存下来 —— 用户报「登不上」，我们手上只有一句
+        //    人话，只能猜。现在落进 `appLog`，「我的 → 问题反馈」里能看到原文。
+        //    日志本来就只在本机、只存 200 行，而且写之前先脱敏（见 appLog）。
+        if (typeof appLog === 'function') {
+          appLog('接口失败 ' + path + ' | ' + msg
+                 + (detail ? ' | ' + detail : '')
+                 + (out.diag ? ' | ' + out.diag : ''));
+        }
+
+        // 凭据失效（密码改了）才让用户重输；网络问题别让人白输一遍
+        if (e instanceof EamsError && e.kind === 'auth') out.authFail = true;
+        return out;
+      }
+    },
+    /**
+     * 用系统浏览器打开链接。目前只给「检查更新 → 立即更新」下载 APK 用。
+     *
+     * 🔴 WebView 默认没有 DownloadListener，点 .apk 链接什么都不会发生，
+     *    所以必须走系统浏览器（Java 那边的 openUrl）。返回 false = 没交出去，
+     *    界面要给出「复制下载地址」的兜底，不能假装打开了。
+     */
+    openUrl: function (url) {
+      try { Android.openUrl(String(url || '')); return true; }
+      catch (e) { return false; }
+    },
+
+    /** 别的 App 装了没有。返回 '1' / '0' / 'none'。
+     *
+     *  'none' = 这个壳**没有这个接口**（网页版、加这个能力之前的 APK）。
+     *
+     *  🔴 必须和 '0'（确实没装）分开。两者都是「拿不到」，但该做的事相反：
+     *     '0'   → 让人去装（点了才提示，别在页面上催）
+     *     'none'→ 直接给网页/商店入口，别催一个网页版用户去装 App
+     *     以前这里如果统一返回 boolean，两种都是 undefined，调用方只能猜 ——
+     *     猜错的代价是「装了却让人去下载」。
+     */
+    hasApp: function (pkg) {
+      if (!(window.Android && typeof window.Android.hasApp === 'function')) return 'none';
+      try { return String(window.Android.hasApp(String(pkg || '')) || '0'); }
+      catch (e) { return '0'; }
+    },
+
+    /** 拉起另一个 App（Java 侧见 NativeBridge.openApp，**包名走白名单**）。
+     *
+     *  返回：'ok' = 已经切过去了；'notinstalled' = 没装；
+     *        'deny' = 包名不在白名单（调用方写错）；'none' = 这个壳没这个能力；
+     *        其余 = 起不来的原因。
+     */
+    openApp: function (pkg) {
+      if (!(window.Android && typeof window.Android.openApp === 'function')) return 'none';
+      try { return String(window.Android.openApp(String(pkg || '')) || 'fail: 空返回'); }
+      catch (e) { return 'fail: ' + ((e && e.message) || e); }
+    },
+
+    /** 钉钉通知（Android 专属，0.52.1 v12）。网页版一律返回"没有"。
+     *
+     *  Java 侧见 Ding / DingListener。这里只做转发，**不做任何解析** ——
+     *  过滤包名、拼标题正文全在原生那边，因为那是隐私边界，不能留一条
+     *  「网页也能读到全机通知」的路。
+     */
+    ding: {
+      /** {granted, n}。granted 是**现查系统设置**的结果，不是本地记的标记。 */
+      state: function () {
+        if (!(window.Android && typeof window.Android.dingState === 'function')) return null;
+        try { return JSON.parse(String(window.Android.dingState() || '')) || null; }
+        catch (e) { return null; }
+      },
+      /** [{k,t,x,w}] 最新在前。没授权时是空数组。 */
+      list: function () {
+        if (!(window.Android && typeof window.Android.dingList === 'function')) return [];
+        try {
+          const a = JSON.parse(String(window.Android.dingList() || '[]'));
+          return Array.isArray(a) ? a : [];
+        } catch (e) { return []; }
+      },
+      clear: function () {
+        if (window.Android && typeof window.Android.dingClear === 'function') {
+          try { window.Android.dingClear(); } catch (e) { /* 清不掉就算了 */ }
+        }
+      },
+      /** 跳系统「通知使用权」页。返回 false = 这台机器跳不过去。 */
+      grant: function () {
+        if (!(window.Android && typeof window.Android.dingGrant === 'function')) return false;
+        try { return !!window.Android.dingGrant(); } catch (e) { return false; }
+      },
+    },
+
+    /** 完美校园账号（Android 专属，0.52.1 v15）。网页版一律"没有"。
+     *
+     *  Java 侧见 WxCard。这里只转发，**不加任何业务判断** —— 账号能不能用、
+     *  该不该提示风控，全在原生那边一次做完，网页只负责把结果画出来。
+     *
+     *  🔴 密码只在这个 Promise 里过一道，**不进 localStorage**。
+     *     存下来的是登录后的 token（原生存的），密码用完就没了。
+     */
+    wx: {
+      /** {on, name, stuNo, school, phone4, at, last}。没有这个能力时返回 null。 */
+      state: function () {
+        if (!(window.Android && typeof window.Android.wxState === 'function')) return null;
+        try { return JSON.parse(String(window.Android.wxState() || '')) || null; }
+        catch (e) { return null; }
+      },
+      /** login(phone, pwd) → Promise<{ok, name?, stuNo?, msg?, needSms?}> */
+      login: function (phone, pwd) {
+        return wxDo('wxLogin', [String(phone || ''), String(pwd || '')]);
+      },
+      /** sendSms(phone) → Promise<{ok, msg?}>。新设备第一次登录要先走这一步。 */
+      sendSms: function (phone) {
+        return wxDo('wxSendSms', [String(phone || '')]);
+      },
+      /** loginSms(phone, code) → 和 login 同一种回执。 */
+      loginSms: function (phone, code) {
+        return wxDo('wxLoginSms', [String(phone || ''), String(code || '')]);
+      },
+      /** card() → Promise<{ok, balance?, msg?}>。登录之后查一卡通余额。 */
+      card: function () {
+        return wxDo('wxCard', []);
+      },
+      logout: function () {
+        if (window.Android && typeof window.Android.wxLogout === 'function') {
+          try { window.Android.wxLogout(); } catch (e) { /* 清不掉就算了 */ }
+        }
+      },
+    },
+
+    /** 慧生活798（直饮水）。定义在本文件上半部分，规则和 water.py 逐条镜像。 */
+    water: WaterApi,
+
+    /** 应用内下载更新（APK 专属）。网页版调用 available() 会得到 false，
+     *  app.js 据此退回「交给浏览器」。 */
+    update: UpdApi,
+
+    // 给测试用的内部函数（真机上不对外用）
+    _test: {
+      sha1hex: sha1hex, parseTimetable: parseTimetable, parseGrades: parseGrades,
+      parseProfile: parseProfile, parseExams: parseExams, parseExamPage: parseExamPage,
+      parseSemesterList: parseSemesterList,
+      parseFreeRooms: parseFreeRooms, parseRoomOptions: parseRoomOptions,
+      parsePlan: parsePlan, splitCourseCell: splitCourseCell,
+      // 公告三件套。和 notice.py 的 parse_list / parse_article / classify
+      // 是同一套规则，_lab/out/check_notice_js.py 会拿同一份 HTML 对拍两边结果。
+      nParseList: nParseList, nParseArticle: nParseArticle, nClassify: nClassify,
+      // 「该办的事」四个页面的状态判断。每个都要单独钉：
+      // 判错的后果是「没开放说成开放」，用户白跑一趟就不信这软件了。
+      parseElect: parseElect, parseFreeListen: parseFreeListen,
+      parseExemption: parseExemption, parseEvaluate: parseEvaluate,
+      plainText: plainText, selectOptions: selectOptions,
+      tablesOf: tablesOf, evalIndex: evalIndex, utf8Bytes: utf8Bytes,
+      // 学习通的纯函数。和 chaoxing.py 的 parse_work / parse_courses /
+      // parse_left / bucket 是同一套规则，_lab/cx/check_cx_js.py 拿
+      // 同一份 HTML 对拍两边结果 —— 两边不一致的话，手机上看到的作业
+      // 条数会和电脑版不一样，而且**不报错**。
+      cxLeft: cxLeft, cxBucket: cxBucket, cxEndFromLeft: cxEndFromLeft,
+      cxParseCourses: cxParseCourses, cxParseWork: cxParseWork,
+      // 「已完成」那一批的挑选规则，和 chaoxing.py 的 done_items_of 对拍。
+      cxDoneItems: cxDoneItems,
+      // 「疑似登录失效」的降级规则（探针说会话还活着之后才用），
+      // 和 chaoxing.py 的 downgrade_auth 对拍。
+      cxDowngradeAuth: cxDowngradeAuth,
+      // 登录态的两条判据都要能对拍：HTML 登录页 / JSON 里的「请重新登录」
+      cxLooksLoggedOut: cxLooksLoggedOut, cxJsonLoggedOut: cxJsonLoggedOut,
+      // 0.13.0 起作业之外还有考试和课堂活动，解析器也开出来给对拍脚本用
+      cxKindOf: cxKindOf, cxParseActive: cxParseActive, cxParseExam: cxParseExam,
+      // 签到的「签了没」判定也要对拍：和 chaoxing.py 的 sign_state 不一致的话，
+      // 同一份数据在网页版和 APK 上会算出两个「漏签次数」，而且不报错。
+      cxSignState: cxSignState,
+      // 详情页地址的拼法也要对拍：拼错了手机上点开就是「参数错误」，
+      // 而且**不报错**，只是页面打不开
+      cxActiveUrl: cxActiveUrl,
+      // HTTP 状态判据。和 chaoxing.py 的 _status_ok() 是同一套规则：
+      // 非 200 一律 kind='net'。两边不一致的话，同一个 502 在网页版是
+      // 「服务器出错」、在 APK 上是「没给作业入口」—— 而后者是假话。
+      cxStatusOk: cxStatusOk,
+      // 结课判定：必须和 chaoxing.py 的 rest_next 逐条对拍。
+      // 两份实现只改一边**不报错**，只是两边结论会不一样 ——
+      // 和 cxStatusOk 那对是同一类风险。
+      cxRestNext: cxRestNext,
+      cxRestConst: function () {
+        return { streak: CX_REST_STREAK, span: CX_REST_SPAN, gap: CX_REST_GAP,
+                 cold: CX_COLD_DAY, coldNoWhite: CX_COLD_NO_WHITE,
+                 actProbe: CX_ACT_PROBE_GAP, warmAct: CX_WARM_ACT,
+                 staleEnd: CX_STALE_END };
+      },
+      // 0.39.0：结课 key 和教务课表白名单。两样都要和 chaoxing.py 对拍 ——
+      // 白名单判错的后果是「本学期的课被降频」，用户会漏作业。
+      cxRestKey: cxRestKey,
+      cxUniqueCourses: cxUniqueCourses,
+      cxNormName: cxNormName,
+      cxNormWhite: cxNormWhite,
+      cxCurTerm: cxCurTerm,
+      cxCourseTerm: cxCourseTerm,
+      cxIsActiveCourse: cxIsActiveCourse,
+      cxIsStale: cxIsStale,
+      cxParseDue: cxParseDue,
+      // 等待本身也开出来验（`check_cx_js.py` 的 [22]）：
+      // 🔴 「后台那个 WebView 里等 1.8 秒」用 setTimeout 会被 Chromium 节流，
+      //    一轮三十多门课就被拉成几十分钟 —— 用户报的「后台检查永远失败」
+      //    就是这个。`cxWait` 走原生定时器，判据要能证明它真的没碰 setTimeout。
+      cxWait: cxWait,
+      // 0.44.0：扫描调度本身也开出来给判据用（`_lab/cx/check_cx_scan_js.py`）。
+      // 🔴 「哪些课这一轮真的发了请求」只有真跑一遍才看得见；而 APK 里跑的就是
+      //    这一份 —— 用 Python 那份测出来的绿，不能当成这一份也绿。
+      cxScanAll: cxScanAll,
+      // 登录链路是「有记忆的」（CX_SCAN / CX_USER / CX_RESTORED），
+      // 不开这两个口子就没法在同一个页面里连着验几种状态。
+      cxScanState: cxScanState,
+      cxReset: function () {
+        CX_RESTORED = false; CX_USER = '';
+        CX_SCAN.state = 'idle'; CX_SCAN.at = 0; CX_SCAN.i = 0;
+        CX_SCAN.n = 0; CX_SCAN.course = ''; CX_SCAN.phase = ''; CX_SCAN.err = '';
+      },
+      // 教务那边的会话状态机（loggedIn / loggedUser），同样是有记忆的，
+      // 不开这两个口子就没法在同一个页面里连着验几种会话状态。
+      login: login, sessionAlive: sessionAlive,
+      sessionState: function () { return { loggedIn: loggedIn, user: loggedUser }; },
+      resetSession: function () {
+        loggedIn = false; loggedUser = ''; idsCache = '';
+        examPageSeen = false; projectReady = false;
+      },
+    },
+  };
+
+  window.NativeApi = NativeApi;
+})();

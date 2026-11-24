@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 4×1 横条小组件的元数据（0.52.0 v12 加）。
+
+     minWidth / minHeight 按系统的算法填：70dp × 格数 − 30dp。
+     4 格宽 = 250dp，1 格高 = 40dp。
+     ⚠️ 40dp 只够一行字（见 hyt_widget_strip.xml 的注释），别把它当成
+        「4×2 压扁」——压扁的那一版会把任务行和第一行课一起裁掉，
+        看起来像「这个小组件坏了」。
+
+     其余字段的来历见 hyt_widget_info.xml 的注释。 -->
+<appwidget-provider xmlns:android="http://schemas.android.com/apk/res/android"
+    android:minWidth="250dp"
+    android:minHeight="40dp"
+    android:updatePeriodMillis="1800000"
+    android:initialLayout="@layout/hyt_widget_strip"
+    android:previewLayout="@layout/hyt_widget_strip"
+    android:description="@string/widget_desc_strip"
+    android:label="@string/widget_label_strip"
+    android:resizeMode="horizontal|vertical"
+    android:widgetCategory="home_screen" />

@@ -1,0 +1,84 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 长按桌面图标弹出来的四个快捷方式（2026-11-11 加）。
+
+     为什么加这个：每天真正要用的只有两件事 —— 看下一节课在哪、看看学习通有没有
+     新作业。现在都得「打开 App → 等它加载 → 点底部那一栏」。长按图标直接跳过去，
+     少两步，而且不用等首页把课表画完。
+
+     🔴 extra 的名字必须和 MainActivity.EXTRA_PAGE 一模一样（`hyt_page`）。
+        写错了不会报错，只会**跳回首页** —— 看起来像「快捷方式没做完」。
+     🔴 value 只许小写字母：MainActivity.pageOf() 会把非小写字母全删掉，
+        写 `Schedule` 会被清成空串，同样静默失败。
+     🔴 这四个页面都得是**真存在的**（见 app.js 的 SUBPAGES / 底部那一栏）：
+        schedule / exams / wiki / campus / me 是 tab，rooms 之类是子页。
+        指向一个不存在的名字，switchTab 不认，停在当前页。
+     ⚠️ 这个文件是**静态**的：数量、名字在编译期就定了，运行时不增不减。
+        想做「今天 3 节课」这种动态文案要改用 ShortcutManager，那需要每次
+        同步课表时都刷一遍，收益不值。 -->
+<shortcuts xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <shortcut
+        android:shortcutId="schedule"
+        android:enabled="true"
+        android:icon="@drawable/ic_sc_schedule"
+        android:shortcutShortLabel="@string/sc_schedule_short"
+        android:shortcutLongLabel="@string/sc_schedule_long">
+        <intent
+            android:action="android.intent.action.VIEW"
+            android:targetPackage="com.nepu.dongyoutong"
+            android:targetClass="com.nepu.dongyoutong.MainActivity">
+            <extra
+                android:name="hyt_page"
+                android:value="schedule" />
+        </intent>
+    </shortcut>
+
+    <shortcut
+        android:shortcutId="exams"
+        android:enabled="true"
+        android:icon="@drawable/ic_sc_exams"
+        android:shortcutShortLabel="@string/sc_exams_short"
+        android:shortcutLongLabel="@string/sc_exams_long">
+        <intent
+            android:action="android.intent.action.VIEW"
+            android:targetPackage="com.nepu.dongyoutong"
+            android:targetClass="com.nepu.dongyoutong.MainActivity">
+            <extra
+                android:name="hyt_page"
+                android:value="exams" />
+        </intent>
+    </shortcut>
+
+    <shortcut
+        android:shortcutId="rooms"
+        android:enabled="true"
+        android:icon="@drawable/ic_sc_rooms"
+        android:shortcutShortLabel="@string/sc_rooms_short"
+        android:shortcutLongLabel="@string/sc_rooms_long">
+        <intent
+            android:action="android.intent.action.VIEW"
+            android:targetPackage="com.nepu.dongyoutong"
+            android:targetClass="com.nepu.dongyoutong.MainActivity">
+            <extra
+                android:name="hyt_page"
+                android:value="rooms" />
+        </intent>
+    </shortcut>
+
+    <shortcut
+        android:shortcutId="campus"
+        android:enabled="true"
+        android:icon="@drawable/ic_sc_campus"
+        android:shortcutShortLabel="@string/sc_campus_short"
+        android:shortcutLongLabel="@string/sc_campus_long">
+        <intent
+            android:action="android.intent.action.VIEW"
+            android:targetPackage="com.nepu.dongyoutong"
+            android:targetClass="com.nepu.dongyoutong.MainActivity">
+            <extra
+                android:name="hyt_page"
+                android:value="campus" />
+        </intent>
+    </shortcut>
+
+</shortcuts>
