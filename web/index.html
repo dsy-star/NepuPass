@@ -2,7 +2,7 @@
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
-<title>航院通</title>
+<title>东油通</title>
 <!-- ===== 内容安全策略（2026-11-10）=====
      这一页里**没有任何内联脚本**（只有下面两个 <script defer src>），
      也没有 <iframe>、<form>、javascript: 链接 —— 所以这组规则可以写得比较紧，
@@ -33,7 +33,7 @@
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="default">
-<meta name="apple-mobile-web-app-title" content="航院通">
+<meta name="apple-mobile-web-app-title" content="东油通">
 <link rel="manifest" href="manifest.webmanifest">
 <link rel="apple-touch-icon" href="icon-180.png">
 <link rel="stylesheet" href="app.css">
@@ -117,9 +117,9 @@
         <div class="empty-ico">
           <svg viewBox="0 0 24 24"><rect x="3" y="4.5" width="18" height="16" rx="3"/><path d="M3 9.5h18M8 3v3M16 3v3"/></svg>
         </div>
-        <h2>还没绑定教务处账号</h2>
-        <p>绑定后就能把课表和成绩同步到手机，之后断网也能看。</p>
-        <button class="btn primary" id="goBind">去绑定</button>
+        <h2>课表尚未同步</h2>
+        <p>登录后，到“我的 → 账号管理”同步教务数据。</p>
+        <button class="btn primary" id="goBind">去登录</button>
         <!-- 电脑上已经绑过的时候不用再输一次密码（换手机、清了缓存都会遇到） -->
         <button class="btn quickbox" id="goQuick" hidden>
           直接同步 <span class="qwho"></span>
@@ -181,7 +181,7 @@
          进去先看学习通，考试 / 成绩 / 学分是它的子选项。 -->
     <!-- ================= 学习页的导航 =================
          2026-11-04 用户要求按**来源**分两类：
-           外部平台 = 学习通、中国大学 MOOC 这类第三方学习网站
+           外部平台 = 学习通、其他平台 这类第三方学习网站
            学校平台 = 考试、成绩、学分这些教务的数据
 
          🔴 为什么是「一行 + 分组标签」，不是上下两行（外部/学校 各一行）：
@@ -193,19 +193,12 @@
          学校那组一个字都不用动。 -->
     <div class="exnav" id="exNav"></div>
 
-    <!-- ---------------- 外部平台（学习通 / 中国大学 MOOC / 以后更多） --------
-         只读 —— 不签到、不刷课、不自动答题、不代交。
-         作业挂在每门课下面，32 门课要 40 秒，所以是「检查一次 → 缓存 →
-         写清更新于何时」，不是实时。 -->
+    <!-- ---------------- 学习通 ----------------
+         只读作业和截止时间，按需刷新并缓存结果。 -->
     <div class="scroll" id="exViewAll">
       <!-- 学习通（原 exViewCx，id 保留：判据脚本按它找元素） -->
       <div id="exViewCx">
         <div id="cxBody"></div>
-      </div>
-
-      <!-- 中国大学 MOOC（0.45.0 新增） -->
-      <div id="exViewMooc" hidden>
-        <div id="moocBody"></div>
       </div>
 
       <!-- ---------------- 学校平台（考试 / 成绩 / 学分） ----------------
@@ -233,7 +226,7 @@
         </div>
         <h2 id="exEmptyTitle">还没有考试安排</h2>
         <p id="exEmptyText">绑定账号后会自动同步一次。</p>
-        <button class="btn primary" id="goBind3" hidden>去绑定</button>
+        <button class="btn primary" id="goBind3" hidden>登录并同步</button>
         <button class="btn" id="exRetry" hidden>再试一次</button>
       </div>
 
@@ -251,17 +244,17 @@
         </div>
         <h2>还没有成绩数据</h2>
         <p>绑定账号后会自动同步一次。</p>
-        <button class="btn primary" id="goBind2">去绑定</button>
+        <button class="btn primary" id="goBind2">登录并同步</button>
       </div>
 
       <div id="grBody" hidden>
         <div class="sumcard">
           <div class="sum-main">
-            <span class="sum-label">平均绩点</span>
+            <span class="sum-label">本地加权绩点</span>
             <b id="grGpa">—</b>
           </div>
           <div class="sum-side">
-            <div><b id="grCredits">—</b><span>总学分</span></div>
+            <div><b id="grCredits">—</b><span>已修学分</span></div>
             <div><b id="grCount">—</b><span>门数</span></div>
           </div>
         </div>
@@ -290,8 +283,7 @@
           <svg viewBox="0 0 24 24"><path d="M4 19V5M4 19h16"/><path d="M8 15l4-5 3 3 4-6"/></svg>
         </div>
         <h2 id="crEmptyTitle">还没算出来</h2>
-        <p id="crEmptyText">绑定账号后会自动同步培养计划和成绩。</p>
-        <button class="btn primary" id="goBind5" hidden>去绑定</button>
+        <p id="crEmptyText">同步教务数据后显示培养计划和学分进度。</p>
       </div>
 
       <div id="crBody" hidden></div>
@@ -308,66 +300,17 @@
           没绑教务账号也能看 —— 刚装完 App 的人至少有个东西是能用的。 -->
   <section class="page" id="page-notice" hidden>
     <header class="pagehead">
-      <!-- 0.38.0 补的。公告是从「功能」页进来的一行入口，是个**子页**，
-           可它原来只有右上角一颗刷新 —— 用户进来之后找不到出去的路
-           （网页版没有安卓那个返回键）。子页一律要有可见的返回。 -->
-      <button class="ghost-btn back" id="ntBack" aria-label="返回功能">
+      <!-- 公告作为校园页子页，提供明确的返回入口。 -->
+      <button class="ghost-btn back" id="ntBack" aria-label="返回校园">
         <svg viewBox="0 0 24 24"><path d="M15 5l-7 7 7 7"/></svg>
       </button>
       <h1>公告</h1>
-      <button class="ghost-btn" id="ntRefresh" aria-label="刷新公告">
-        <svg viewBox="0 0 24 24"><path d="M20 11a8 8 0 1 0-2.3 5.7"/><path d="M20 5v6h-6"/></svg>
-      </button>
     </header>
 
     <div class="scroll">
-      <!-- ===== 消息提醒（0.52.1 v12 起：钉钉 / 完美校园）=====
-           两家都读不到里面的数据，唯一能拿到的是**系统通知栏**那一条。所以这一块
-           不是"接入了钉钉"，而是"把推送里的那句话抄一份放这里"。
-           钉钉：学校用的是专有版（图标叫「郑州航院」，包名 rimet.zzhy）；
-           完美校园：它的「校园卡通知」里就带消费金额和余额。
-
-           🔴 整块默认 hidden，只有原生侧真的存在这个能力（`NativeApi.ding.state()`
-              不是 null）才显示。网页版、老 APK 上它一个像素都不占。
-           🔴 文案不写"授权后可以读取您的通知"这种笼统说法 —— 用户要能一眼看出
-              我们只抄钉钉、只存本机。 -->
-      <div class="dingbox" id="dingBox" hidden>
-        <div class="dinghd">
-          <i class="dingico" aria-hidden="true">讯</i>
-          <div class="dingtx">
-            <b>消息提醒</b>
-            <span id="dingSub"></span>
-          </div>
-          <button class="dingact" id="dingAct" type="button"></button>
-        </div>
-        <div class="dinglist" id="dingList" hidden></div>
-      </div>
-
-      <!-- 分类 chip。数字是**这一层有几条**，让用户先看到分布：
-           大部分时候「要办事」二十几条、「影响出行」两三条，
-           一眼就知道哪些该看、哪些可以略过。 -->
-      <div class="chips" id="ntChips" hidden></div>
-
-      <!-- 「6 个来源 · 52 条 · 10-20 15:30 更新」。
-           来源数和条数都要露出来 —— 少一个源的时候用户得能发现，
-           不然「今天怎么只有 3 条」会被当成「学校没发通知」。 -->
-      <div class="ntsum" id="ntSum" hidden></div>
-
-      <!-- 有源没取到时单独警告一行。绝不安静地少一块。 -->
-      <div class="ntwarn" id="ntWarn" hidden></div>
-
-      <div class="exloading" id="ntLoading" hidden>正在从学校各部门的网站取公告…</div>
-
-      <div class="empty" id="ntEmpty" hidden>
-        <div class="empty-ico">
-          <svg viewBox="0 0 24 24"><path d="M4 10v4a1 1 0 0 0 1 1h2.5L14 19V5L7.5 9H5a1 1 0 0 0-1 1z"/><path d="M17.5 8.5a5 5 0 0 1 0 7"/></svg>
-        </div>
-        <h2 id="ntEmptyTitle">还没取到公告</h2>
-        <p id="ntEmptyText">公告来自学校各部门的公开网页，不需要登录。</p>
-        <button class="btn primary" id="ntRetry">再试一次</button>
-      </div>
-
-      <div class="ntlist" id="ntList" hidden></div>
+      <p class="tip note" id="nepuNoticeState">登录教务并同步后查看近三个月公告</p>
+      <button class="btn" id="nepuNoticeSync">同步教务公告</button>
+      <div class="ntlist" id="nepuNoticeList"></div>
     </div>
   </section>
 
@@ -404,7 +347,7 @@
       <div id="calBody"></div>
 
       <p class="calnote">
-        按学校《2026–2027 学年校历》抄的关键日期。临时调整以学校通知为准。
+        东油校历尚未接入，学期安排以学校通知为准。
       </p>
 
       <!-- 「作业进日历」（0.52.3 v6）：从「学习」页列表底下搬来的。
@@ -515,33 +458,7 @@
     </header>
 
     <div class="scroll">
-      <!-- ===== 并排两张小卡：饮水 / 宿舍电费（2026-11-16 换人）=====
-           这两张是**入口卡**：一眼看到两个钱包各剩多少，点哪张进哪边的明细。
-
-           🔴 2026-11-16 用户原话：「把功能页面顶部那个校园卡余额默认隐藏，
-              太没用了，在航院通登录完美校园会和官方 APP 抢登录，把那个位置换成宿舍电费」。
-              完美校园是**单会话**：我们一登录查余额，手机上官方 App 就被顶下去。
-              校园卡那张因此挪去「我的 → 账号管理 → 完美校园」（点「查看」进弹层），
-              而且**不再一进页面就去查**。
-
-           🔴 为什么不做成一张卡里左右分栏：两个钱包是**两个不同的服务**
-              （慧生活798 的饮水钱包 / 财务处的房间电费），余额也各记各的。
-              并成一张，用户会以为能互相转。
-           🔴 网页版没有完美校园能力时，两张照样画，写「要在手机上登录」——
-              不藏起来。藏了的话 App 和网页的页面高度对不上，
-              `check_one_screen` 量到的高度就不是真机的了（同一页的账号行也是这样处理的）。 -->
-      <div class="pair2" id="cpPair">
-        <button type="button" class="minicard" id="mcWater">
-          <span class="mc-k">饮水余额</span>
-          <span class="mc-v" id="mcWaterV">—</span>
-          <span class="mc-s" id="mcWaterS">接水 · 消费记录</span>
-        </button>
-        <button type="button" class="minicard" id="mcElec">
-          <span class="mc-k">宿舍电量</span>
-          <span class="mc-v" id="mcElecV">—</span>
-          <span class="mc-s" id="mcElecS">剩余 · 用电记录</span>
-        </button>
-      </div>
+      <div class="card"><p class="sub">查看饮水余额与消费记录，管理饮水设备，并使用积分和每日任务。</p></div>
 
       <!-- 没登慧生活时的一句话。登录表在「我的 → 账号管理 → 慧生活账号」。 -->
       <div class="card wtpad" id="wtNeedLogin" hidden>
@@ -714,7 +631,7 @@
                ⚠️ 原来页面底部还有一句「充值、绑定一卡通去慧生活798 里做」，
                   0.38.0 并到这一行：两件事都是「钱」，拆在两处讲反而都讲不全，
                   而且那一行本来要占 30px —— 这一页差的就是这 30px。 -->
-          <p class="tip note" id="wtRisk">接水会真的出水扣钱；充值、绑一卡通去慧生活798 里做。</p>
+          <p class="tip note" id="wtRisk">接水费用按设备显示为准；充值与一卡通绑定请在慧生活798办理。</p>
 
           <!-- 被「在本机隐藏」的设备。一行搞定：不想要的那台还在慧生活798
                名下，只是我们这边不画了 —— 恢复也是点这一行，不用进二级页面。 -->
@@ -887,193 +804,29 @@
         </div>
       </div>
 
-      <!-- 公告并进了这一页（原来占着底部中间那格 tab）。
-           0.32.0：它和「校园服务」都是**一行字就能说完**的入口，
-           各占一张卡 = 两张卡为了两个字的高度在那里摆着（用户原话：
-           「信息密度很低」）。合成一张，两行之间用一条细分隔线。 -->
-      <div class="card">
-        <button class="row tap" id="ntEnter">
-          <span class="k">校园公告</span>
-          <span class="rowend">
-            <span class="v muted" id="ntBrief">校级 · 教务 · 团委 · 后勤</span>
-            <svg class="rowico" viewBox="0 0 24 24"><path d="M9 6l6 6-6 6"/></svg>
-          </span>
-        </button>
-        <!-- 低频的一堆（一卡通、19 个办事入口、门户登录）原来在这张卡下面
-             就地展开，展开后是半屏 —— 而这一页的主体是接水。
-             2026-11-08 用户：「校园服务做成二级界面也做一下吧」。
-             ⇒ 这一行现在是**入口**：点进「校园服务」那一页，不再就地摊开。
-             ⚠️ id 保留 `cpMoreToggle`：判据和「从功能页进校园服务」都按它走。 -->
-        <button class="row tap" id="cpMoreToggle">
-          <span class="k">校园服务</span>
-          <span class="rowend">
-            <span class="v muted">一卡通 · 办事入口</span>
-            <svg class="rowico" viewBox="0 0 24 24"><path d="M9 6l6 6-6 6"/></svg>
-          </span>
-        </button>
-      </div>
-
     </div>
   </section>
 
   <!-- ================= 校园服务（二级页）=================
-       从「功能」页那一行进来。为什么单独一页：这一块展开就是半屏（门户、一卡通、
-       19 个办事入口），而「功能」页的主体是接水和积分任务 —— 低频的东西
-       不该把高频的挤出去。用户 2026-11-08：「校园服务做成二级界面也做一下吧」。
-       ⚠️ 底部 tab 仍亮「功能」（SUB_PARENT.services = 'campus'），返回也回那里；
-          它本来就属于那个 tab 的一件事，不是第 6 个 tab。 -->
+       从「校园」页进入，保留独立二级页面。 -->
   <section class="page" id="page-services" hidden>
     <header class="pagehead">
-      <button class="ghost-btn back" id="svBack" aria-label="返回功能">
+      <button class="ghost-btn back" id="svBack" aria-label="返回校园">
         <svg viewBox="0 0 24 24"><path d="M15 5l-7 7 7 7"/></svg>
       </button>
       <h1>校园服务</h1>
-      <button class="ghost-btn" id="svRefresh" aria-label="刷新">
-        <svg viewBox="0 0 24 24"><path d="M20 11a8 8 0 1 0-2.3 5.7"/><path d="M20 5v6h-6"/></svg>
-      </button>
     </header>
 
     <div class="scroll">
       <div id="cpMoreBox" hidden>
-        <div id="cpOff">
-          <div class="card cp-card">
-            <h2>连接智慧门户</h2>
-            <p class="sub">一卡通、请假、第二课堂等 19 个入口都在这里。</p>
-            <p class="sub small">密码和教务系统不一样，要单独连一次。</p>
-            <button class="btn primary block" id="cpConnect">连接门户</button>
-          </div>
+        <div class="card cp-card">
+          <h2>东北石油大学服务门户</h2>
+          <p class="sub" id="cpNote">已验证学校门户提供办事服务目录；本地目录读取待接入。</p>
+          <button class="btn primary block" id="cpOpenPortal">打开学校门户</button>
         </div>
-
-        <!-- 已连门户 -->
-        <div id="cpOn" hidden>
-          <!-- 门户过期、但本机还存着上次的数据时出现。
-               🔴 以前这种情况会把整块内容藏起来换成「连接门户」——
-                  用户看到的是「数据没了」，其实只是「门票过期了」。
-                  现在数据照常显示，只在这里标一下它有多旧。 -->
-          <div class="card warncard" id="cpExpired" hidden>
-            <h2>门户登录过期了</h2>
-            <p class="sub" id="cpExpiredTxt">下面是上次拿到的数据，余额可能不是最新的。</p>
-            <button class="btn primary block" id="cpReconnect">重新连接门户</button>
-          </div>
-
-          <div class="card ykt">
-            <div class="ykt-top">
-              <span class="ykt-k">一卡通余额</span>
-              <span class="ykt-t" id="yktTime">—</span>
-            </div>
-            <div class="ykt-bal"><b id="yktBal">—</b><span>元</span></div>
-            <!-- 余额随时会变，所以这行必须说清楚「这个数字是什么时候的」。
-                 有缓存、又没连网刷新过的时候才出现。 -->
-            <p class="sub small ykt-at" id="yktAt" hidden></p>
-            <!-- 余额低的时候常驻一条，**不弹窗**：弹窗会被点掉，而「快没钱了」
-                 这件事需要在你想起来的时候还看得见。充值后自然消失。 -->
-            <p class="lowbal" id="yktLow" hidden></p>
-            <!-- 余额提醒的入口就放在余额卡里（2026-10-22 用户要求）。
-                 以前在「我的 → 设置」，问题是：想调阈值的时候人正看着余额，
-                 却要去另一个页面找。放在这里，阈值和它管的那个数字在同一张卡上。 -->
-            <button class="row tap" id="yktAlert">
-              <span class="k">余额提醒</span>
-              <span class="rowend">
-                <span class="v muted" id="yktAlertV">低于 20 元时提醒</span>
-                <svg class="rowico" viewBox="0 0 24 24"><path d="M9 6l6 6-6 6"/></svg>
-              </span>
-            </button>
-            <button class="row tap" id="yktMore">
-              <span class="k">消费明细</span>
-              <span class="rowend">
-                <span class="v muted" id="yktCount">—</span>
-                <svg class="rowico" viewBox="0 0 24 24"><path d="M9 6l6 6-6 6"/></svg>
-              </span>
-            </button>
-            <!-- 明细就地展开，不再弹一层：这里没有别的操作，
-                 弹出去反而多一次「返回」。 -->
-            <div class="ykt-list" id="yktList" hidden></div>
-          </div>
-
-          <div class="card cp-card">
-            <!-- 19 个办事入口一年用不了几次（请假、第二课堂、打印中心…），
-                 默认折起来，只留一行「办事入口 · 19 个」。
-                 用户 2026-10-30：「校园页的绝大部分功能使用频率都极低」——
-                 高频的东西不该被这一屏的低频入口挤到下面去。
-                 ⚠️ 折起来不等于藏起来：`.appitem` 仍在 DOM 里（判据按数量算），
-                    只是 `#cpAppsBox` 带 hidden。 -->
-            <button class="row tap" id="cpAppsToggle" aria-expanded="false">
-              <span class="k">办事入口</span>
-              <span class="rowend">
-                <span class="v muted" id="cpAppsN">—</span>
-                <svg class="rowico cpchev" viewBox="0 0 24 24"><path d="M9 6l6 6-6 6"/></svg>
-              </span>
-            </button>
-            <div id="cpAppsBox" hidden>
-              <!-- 这两句话**必须不一样**，因为两条路真的不一样（见 app.js 的 openApp）：
-                   APK 0.6.0 起在 App 内开 WebView，门户的 cookie 一起带过去，
-                   CAS 认得出人 ⇒ 不用再登；
-                   网页版只能新开标签页，那是另一个 cookie 罐子 ⇒ 第一次要再登。
-                   以前这里统一写「在 App 里打开、不用再输密码」，是假的，改掉。
-                   ⚠️ 以后再改这句，记得两边一起改 —— applyEnvTexts 只搬 data-app。 -->
-              <p class="sub small"
-                 data-app="点击直接进入，无需重新登录。">浏览器打开，第一次要再登一次。</p>
-              <div class="applist" id="cpApps"></div>
-            </div>
-          </div>
-          <!-- 0.39.1：「重新登录门户 / 断开门户」这两行删掉了。
-               用户原话：「删除东西的功能你做的实在是显眼过头了……还容易让用户误触」。
-               断开是一学期也用不上一次的动作，却占着两张整行，还挨着常用入口。
-               现在一个系统只有一个断开处 ——「我的 → 账号管理」，那一页本来就写着
-               「只回答两件事：连没连上、怎么连/怎么断」。过期重连也走那儿。 -->
-        </div>
-
-        <p class="cpnote" id="cpNote">
-          只读取，不会代替你提交任何申请。
-        </p>
-      </div>
-
-      <!-- ============ 学校的其他事（2026-11-16）============
-           清点了一遍学校散在各处的线上服务：教务、成绩、一卡通、饮水、学习通
-           这些已经有自己的一屏。剩下的分成两半：
-
-           · 缴费 —— 财务处的「校园统一支付平台」（学费、住宿费、空调电费都在
-             里面，`cwcfw.zua.edu.cn`，公网 http 可达）。这一格**有数据**：
-             它有一套对外接口，`mobile/cwcfw.py` 与 native.js 的 `CwApi`
-             各实现一份，查得到欠费合计、明细、房间电费余额。
-           · 图书馆官网 `lib.zua.edu.cn` —— 能直接开，登录还是网页自己来。
-           · 只能在公众号里的两个 —— 报修要扫动态码、座位要在馆内签到，
-             所以点开是**步骤**，不是数据。
-           以前它们连「在哪办」都没地方看 —— 用户只能翻聊天记录找公众号。
-
-           🔴 不许假装成功能：报修和座位那两格，弹层里不许出现任何金额。
-              缴费那格能写数，是因为数**真读到了**（2026-11-16 起）。
-              读不到时写「直接打开」，不写 0 —— 「没读到」和「不欠」是两件事。
-           🔴 不放进 `#cpMoreBox`：那个块要连门户才出现，而这四件事
-              和门户登录没有关系 —— 没连门户的人也交学费、也要报修。
-           🔴 缴费平台是 **http**（跟教务一样，学校没开 443）。WebView 能开，
-              但别指望 https —— 地址写死 `http://`。 -->
-      <div class="card cp-card" id="dirCard">
-        <h2>学校的其他事</h2>
-        <!-- 🔴 别写成「这几件事都只在公众号里，应用内打不开」——
-             缴费和借阅这两格是能直接开的，那句话会和它们当场打架
-             （2026-11-16 第一版就是这么写的，发出去之前发现）。 -->
-        <p class="sub">欠费能查到；报修和座位在公众号。</p>
-        <!-- 2026-11-16：四行竖排撑爆了这一屏（`check_one_screen` 量到
-             626 / 594，要滑 32px），改成 2×2 的格子 —— 省 40px，
-             而且四件事一眼全看见，比四行更好扫。 -->
-        <div class="dirgrid">
-          <!-- 第一格的小字是**唯一**放欠费金额的地方（`cwPaintCell` 写它）。
-               🔴 标题写「缴费」不写「电费和学费」：这个小字只有学费和住宿费，
-                  写成「电费和学费 · 欠 800」，用户会以为电费也欠 800。
-                  电费在弹层里单独一行，按房间查。 -->
-          <button type="button" class="dircell" id="dirPay">
-            <b>缴费</b><span>直接打开</span>
-          </button>
-          <button type="button" class="dircell" id="dirFix">
-            <b>宿舍报修</b><span>后勤</span>
-          </button>
-          <button type="button" class="dircell" id="dirSeat">
-            <b>图书馆座位</b><span>预约</span>
-          </button>
-          <button type="button" class="dircell" id="dirLib">
-            <b>图书馆借阅</b><span>直接打开</span>
-          </button>
+        <div class="card cp-card">
+          <h2>一卡通</h2>
+          <p class="sub">余额与消费记录接口当前返回未授权，暂不显示数据。</p>
         </div>
       </div>
     </div>
@@ -1355,27 +1108,19 @@
                 所以不是把它做粗一点，是**让它单独占一行**。
              高度没加：把下面「关于本项目」从整行收成半颗（和清缓存并排），
                 省下的 44px 正好给这一行。整张卡反而比第一版矮 12px。 -->
-        <button class="row tap" id="btnFeedback">
-          <span class="k">问题反馈</span>
+        <!-- 2026-11-24：用户「在版本那里增加检查更新按钮」。
+             按钮塞在**这一行里**，不新开一行 —— 这一页是一屏卡死的
+             （见上面 11-10 那几段），多 44px 就要从别处抠。
+             版本号仍是行的主体，按钮只是它右边的一颗小胶囊：
+             视觉上当附注，触控目标靠伪元素撑到 44px（样式见 app.css .meupd）。
+             逻辑在 app.js 里绑 #meUpd（手动查一次，见 checkUpdate(true)）。 -->
+        <div class="row">
+          <span class="k">版本</span>
           <span class="rowend">
-            <svg class="rowico" viewBox="0 0 24 24"><path d="M9 6l6 6-6 6"/></svg>
+            <span class="v muted" id="meVersion">0.0.3</span>
+            <button class="meupd" id="meUpd" type="button">检查更新</button>
           </span>
-        </button>
-        <!-- 郑航百科原来在这里（0.20.0 及以前）。2026-10-28 用户原话：
-             「还有 zuawiki，你把它换个位置吧，我的界面太隐蔽了」
-             ⇒ 搬到「校园」页第一张卡。搬的理由不是随便挪：
-               百科讲的是宿舍/食堂/转专业/校医院这些**校园生活**的事，
-               跟「校园」这一页是同一件事；而且「我的」这一页要滚到底才看得到它。
-             ⚠️ 搬走后这里只剩「检查更新」，别再往回塞 —— 判据 [1] 钉着位置。 -->
-        <!-- 版本号不写死在这里：app.js 的 APP_VERSION 是唯一来源，
-             build_apk.py 和 version.json 都从那儿读。 -->
-        <button class="row tap" id="btnUpdate">
-          <span class="k">检查更新</span>
-          <span class="rowend">
-            <span class="v muted" id="meVersion">—</span>
-            <svg class="rowico" viewBox="0 0 24 24"><path d="M9 6l6 6-6 6"/></svg>
-          </span>
-        </button>
+        </div>
         <!-- 0.41.0：用户 2026-11-02「我的 加上 关于本项目 的这一栏，里面写上
              本项目参考的项目及对应链接，再加上我的联系方式」。
              这一行只做入口，内容在弹层（app.js 的 openAboutSheet）——
@@ -1415,52 +1160,6 @@
              正式版的包里没有那颗按钮、没有那一页、也没有 stats.js。 -->
 
       </div>
-    </div>
-  </section>
-
-  <!-- ================= 问题反馈（「我的」→ 问题反馈）=================
-       2026-11-10 用户要求：「加上日志功能，能够自动记录日志，用户遇见 bug 或者
-       问题时可以有问题描述，还能默认附上日志发到咱们的服务器…日志在用户端
-       脱敏后存储在本地，发过来的时候只发脱敏的」。
-
-       🔴 这一页发出去的是**用户点过预览的那一份**：日志里账号、密码、手机号、
-          邮箱、本机地址后两段都已经换成 #（见 app.js 的 fbScrub）。
-       🔴 日志只存在这台手机上，程序不会自己把它传出去 —— 只有在这里点「发送」
-          才发。自动上报那条线（reportProblem）传的是一句话，不是日志。 -->
-  <section class="page" id="page-feedback" hidden>
-    <header class="pagehead">
-      <button class="ghost-btn back" id="fbBack" aria-label="返回我的">
-        <svg viewBox="0 0 24 24"><path d="M15 5l-7 7 7 7"/></svg>
-      </button>
-      <h1>问题反馈</h1>
-    </header>
-
-    <div class="scroll">
-      <div class="card">
-        <h2 class="fb-h2">遇到什么问题了？</h2>
-        <p class="sub">写一句是哪一步出的问题就行，别写账号密码。</p>
-        <textarea class="fb-text" id="fbText" rows="5" maxlength="800"
-                  placeholder="比如：连着 Wi-Fi，一直说没检测到校园网"></textarea>
-
-        <label class="fb-check">
-          <input type="checkbox" id="fbLog" checked>
-          <!-- 文案从「（账号、密码、手机号已换成 #）」压到这一句：
-               原来那串在 360dp 上正好折行，第二行只剩一个「#）」——
-               看着像排版坏了。缩短之后一行放得下，说的还是同一件事。
-               🔴 措辞从「换成 #」改成「已打码」：给用户看的是结果，
-                  不是我们内部拿什么字符替换的。 -->
-          <span>附带运行日志（账号、密码已打码）</span>
-        </label>
-
-        <button class="btn primary block" id="fbSend">发送</button>
-        <button class="btn block fb-prevbtn" id="fbPreview">看看要发什么</button>
-        <p class="tip note" id="fbTip"></p>
-        <!-- 预览就摊在页面上，不另开弹层：用户点「看看要发什么」之后，
-             要能**一边看一边改**上面那段描述。 -->
-        <pre class="fb-prev" id="fbPrev" hidden></pre>
-      </div>
-
-      <p class="fb-note">日志只存在这台手机上。什么时候发、发不发，都由你决定。</p>
     </div>
   </section>
 
@@ -1538,6 +1237,18 @@
            留最短的一句，只回答「我的密码安不安全」。 -->
       <p class="acc-note">密码只存在这台手机里。</p>
       <div class="card acc-list" id="accList"></div>
+      <section class="card wtpad" aria-labelledby="nepuTitle">
+        <h2 id="nepuTitle">东油教务</h2>
+        <p class="sub" id="nepuStatus" role="status" aria-live="polite">尚未登录；同步时通过学校 WebVPN 登录。</p>
+        <label class="field" for="nepuTerm">
+          <span>同步学期</span>
+          <select id="nepuTerm" aria-label="选择教务同步学期"><option value="">当前学期</option></select>
+        </label>
+        <div class="sheetbtns">
+          <button class="btn" id="nepuLogin" type="button">WebVPN 登录</button>
+          <button class="btn primary" id="nepuSync" type="button">同步教务数据</button>
+        </div>
+      </section>
 
       <!-- ===== 完美校园 / 慧生活（0.52.1 v15 起）=====
            这两家的行都由 renderAccounts 画在**同一张卡**里（和上面三个学校系统
@@ -1589,63 +1300,30 @@
         </div>
       </div>
 
-      <!-- 0.39.1：「这个平台不是学校官方的，也不是我们做的。我们只照着它公开的
-           接口协议做查询和接水，出了问题请在慧生活798 里找客服。」三句压成一句：
-           用户只需要知道「不是学校的，出问题找谁」。 -->
-      <p class="acc-note fine">慧生活798 不是学校的，有问题找它客服。</p>
+      <p class="acc-note fine">平台服务问题请联系慧生活798客服。</p>
     </div>
   </section>
 
-  <!-- ================= 郑航百科（「我的」→ 郑航百科）=================
-       学长们做的非官方百科（wiki.zua.fan），不是我们写的、也不是学校官方。
-       **只做入口，不复制正文** —— 站上写着「任何复制、转载请注明出处！
-       严禁用于商业用途！」，而且它目前还没开源（「预计近期上线 GitHub」）。
-       ⇒ 这里只有「标题 + 外链」，点了在系统浏览器里打开原站那一页。
-
-       为什么是独立页而不是弹层：11 个条目 + 4 个分组在 .sheet 里放不下 ——
-       实测内容 839px、可用高度 641px（76%），按钮会被滚出屏幕（底边 1009/844）。
-       一页装得下，也不用内部滚动。
-       🔴 条目跳转必须走 openExternal：MainActivity 拦掉一切非 app.local
-          的跳转，`<a href>` 点了毫无反应、也不报错。 -->
   <section class="page" id="page-wiki" hidden>
-    <header class="pagehead">
-      <!-- 0.27.0：WIKI 是底部 tab 页，不再是从「校园」点进来的子页，所以没有返回键。 -->
-      <h1>郑航攻略</h1>
-    </header>
-
-    <div class="scroll">
-      <!-- 头卡：这站是什么、谁写的，加一个「打开原站首页」。
-           以前这页只有一句灰字 + 13 行链接，看着像一堆没整理的书签 ——
-           用户 2026-10-28 说的「美化一下 zuawiki 的审美 UI」就是指这里。 -->
-      <div class="card wikihero">
-        <!-- 2026-11-01：原来是「图标+站名」一行、「在校学生自己写的，不是学校官方，
-             也不是我们做的」一段、再加一个通栏大按钮，一共 168px。
-             真机 360×712 上 WIKI 页超出 147px，这一张卡就占了 100 ——
-             而它只说清「这是个什么站、从哪进」。
-             压成一行：站名 + 域名 · 非官方，按钮挪到右边。免责那句没删，
-             缩成「学生自建，非官方」跟在域名后面。 -->
-        <div class="wh-top">
-          <span class="wh-badge" aria-hidden="true">
-            <svg viewBox="0 0 24 24"><path d="M12 6.6C10.5 5.3 8.4 4.5 5.5 4.5H4v13.2h1.5c2.9 0 5 .8 6.5 2.1 1.5-1.3 3.6-2.1 6.5-2.1H20V4.5h-1.5c-2.9 0-5 .8-6.5 2.1z"/><path d="M12 6.6v13.2"/></svg>
+    <header class="pagehead"><h1>校园</h1></header>
+    <div class="scroll" id="wikiList">
+      <div class="card"><h2 class="campus-status">校园内容接入中</h2></div>
+      <div class="card campus-links">
+        <button class="row tap" id="ntEnter">
+          <span class="k">校园公告</span>
+          <span class="rowend">
+            <span class="v muted" id="ntBrief">东油适配中</span>
+            <svg class="rowico" viewBox="0 0 24 24"><path d="M9 6l6 6-6 6"/></svg>
           </span>
-          <span class="wh-txt">
-            <b>ZUA Wiki</b>
-            <!-- 🔴 0.52.1：原来写「wiki.zua.fan · 学生自建，非官方」，可用宽度
-                 只有 ~180px，中文按字符断行 ⇒ 屏幕上显示成「学生自建，非官 /
-                 方」。「非官方」这三个字最关键，必须在一行里读完；「学生自建」
-                 挪到下面「关于这个站」那条（它的副标题就写着「在校学生自建」）。 -->
-            <span>wiki.zua.fan · 非官方</span>
+        </button>
+        <button class="row tap" id="cpMoreToggle">
+          <span class="k">校园服务</span>
+          <span class="rowend">
+            <span class="v muted">东油适配中</span>
+            <svg class="rowico" viewBox="0 0 24 24"><path d="M9 6l6 6-6 6"/></svg>
           </span>
-          <button class="btn primary wh-go" id="wikiHome">打开</button>
-        </div>
+        </button>
       </div>
-
-      <!-- 分组由 app.js 的 renderWikiPage() 画：组名在卡片**外面**
-           （iOS 分组列表的样子），每条一行、右边一个箭头。 -->
-      <div id="wikiList"></div>
-
-      <!-- 2026-11-01 删掉：「点开在浏览器里打开原站，正文和更新都在那边。」
-           按钮写着「打开」，点开跳浏览器是常识，这句话只是占 20px 高。 -->
     </div>
   </section>
 
@@ -1739,10 +1417,8 @@
          公告本身没消失，并进了「功能」页 —— 它是低频内容，不该占一个
          常驻位置；而攻略对新生是天天要翻的。 -->
     <button class="tab" data-tab="wiki">
-      <!-- 摊开的书（两页连成的 V 形 + 中间书脊），和 WIKI 页头部卡里那个
-           图标是同一个形状 —— 点进去看到的是同一件东西。 -->
-      <svg viewBox="0 0 24 24"><path d="M12 6.6C10.2 5.2 7.6 4.4 4.6 4.4H3.2v13.4h1.4c3 0 5.6.8 7.4 2.2 1.8-1.4 4.4-2.2 7.4-2.2h1.4V4.4h-1.4c-3 0-5.6.8-7.4 2.2z"/><path d="M12 6.6v13.4"/></svg>
-      <span>WIKI</span>
+      <svg viewBox="0 0 24 24"><path d="M12 6.6C10.2 5.2 7.6 4.4 4.6 4.4H3.2v13.4h1.4c3 0 5.6.8 7.4 2.2 1.8-1.4 4.4-2.2 7.4-2.2h1.4V4.4h-1.4c-2.9 0-5.4.8-7.4 2.2z"/><path d="M12 6.6v13.4"/></svg>
+      <span>校园</span>
     </button>
     <!-- 「校历」和「空教室」原来各占一个 tab，底部挤到 6 个。
          2026-10-21 用户提出来「主流 App 底部最多 5 个」，于是把这两项收进课表页：
@@ -1826,6 +1502,7 @@
 <script defer src="stats.js"></script>
 <!-- /@stats -->
 <script defer src="native.js"></script>
+<script defer src="nepu.js"></script>
 <script defer src="app.js"></script>
 </body>
 </html>

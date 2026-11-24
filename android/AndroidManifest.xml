@@ -4,6 +4,13 @@
 
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <!-- 应用内下载更新、拉起系统安装器（2026-11-24）。
+         🔴 这不是「声明了就有」的权限：Android 8.0+ 每个 App 一个开关
+            （设置 → 安装未知应用）。没打开时 UpdateDownloader.install()
+            返回 "need-permission"，界面引导用户去开。
+            但**不声明**的话，那个开关根本不会出现在设置里 —— 表现为
+            点了「安装」什么也没发生，而且不报错。 -->
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
     <!-- ===== 提醒 =====
          2026-11-07（0.47.8）加。三个权限各自解决一件不同的事，别删任何一个：
 
@@ -173,6 +180,16 @@
             android:exported="false"
             android:label="东北石油大学登录"
             android:windowSoftInputMode="adjustResize" />
+
+        <!-- 把下好的安装包借给系统安装器读（2026-11-24「应用内下载更新」）。
+             只开放 ApkProvider 那个目录里的 .apk，别的什么都不认。
+             🔴 authorities 必须和 ApkProvider.AUTHORITY 一字不差；
+                对不上时**不报错**，只是点「安装」没反应。 -->
+        <provider
+            android:name=".ApkProvider"
+            android:authorities="com.nepu.dongyoutong.apk"
+            android:exported="false"
+            android:grantUriPermissions="true" />
 
         <!-- 导出的日历文件借给日历 App 读（2026-11-11「导出日历」）。
              仅开放 ShareProvider 缓存目录中的 .ics 文件。

@@ -1,3 +1,8 @@
+# 发版目录（2026-11-24）：tools/make_update_json.py 的产物（清单 + 安装包 + 发布页）。
+# 它是**从**仓库里算出来的中间物，每次发版重算，留着只会跟源码对不上。
+# 真正上线的那份在 gh-pages 分支上，由 .github/workflows/release.yml 推。
+pub/
+
 # 构建产物
 android/build/
 android/dist/

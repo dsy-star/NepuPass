@@ -1072,6 +1072,29 @@ body::after {
 .row .v { color: var(--sub); text-align: right; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .row .v.muted { color: var(--sub); font-size: 13px; }
 .rowend { display: flex; align-items: center; gap: 4px; min-width: 0; }
+/* 「检查更新」（2026-11-24）：挂在「版本」行右边的一颗小胶囊。
+   🔴 不能把行撑高：我的这一页是一屏卡死的（见 index.html 上方注释），
+      而 .row 的 min-height:44px 已经在那儿，按钮就贴在 rowend 里。
+   🔴 触控目标是靠 ::after 把可点区域补到 44px，**不是**把胶囊画成 44px 高 ——
+      视觉上一颗 26px 的胶囊才是「版本号旁边的附注」，方块会把版本号压成配角。
+   🔴 用 --accent-soft 底 + --accent 字，不描边：行里已经有一条 0.5px 分隔线，
+      再给按钮加边就成两张纸叠在一起了。 */
+.meupd {
+  position: relative; flex: 0 0 auto;
+  min-height: 26px; margin-left: 6px; padding: 0 11px;
+  display: inline-flex; align-items: center;
+  border: 0; border-radius: 999px;
+  background: var(--accent-soft); color: var(--accent);
+  font-family: inherit; font-size: 12.5px; line-height: 1; white-space: nowrap;
+}
+.meupd::after {
+  content: ''; position: absolute; left: 0; right: 0; top: 50%;
+  height: 44px; transform: translateY(-50%);
+}
+.meupd:active { opacity: .62; }
+/* 查的过程中（disabled）不换颜色，只除下高亮 —— 颜色一换就像变成了另一个按钮，
+   而它还是同一颗，只是暂时不能按。 */
+.meupd[disabled] { background: var(--fill); color: var(--sub); }
 .rowico {
   width: 15px; height: 15px; flex: 0 0 auto; color: var(--sub);
   fill: none; stroke: currentColor; stroke-width: 1.8;
@@ -2020,46 +2043,6 @@ body::after {
 }
 .aboutmini:active { color: var(--text); }
 
-/* ---------------- 问题反馈页（2026-11-10） ---------------- */
-/* 🔴 `.card` 自己**不带内边距**（各卡按需加，见 .about / .cx-signcard）。
-   这张卡第一版忘了加，结果标题贴着卡顶、最后一个按钮贴着卡底 ——
-   用户 2026-11-10 的截图配文是「里面没有显示完整」。
-   漏的其实不是内容，是那两圈空白：没有它，卡片看起来像被截掉了半截。
-   下面写 14px 不是 16px：`.tip` 自带 8px 上边距，加起来正好和上面那一圈一样。 */
-#page-feedback .card { padding: 16px 16px 14px; }
-/* 提示句没话要说的时候不占位。它是个空 `<p>`，仍有 18px 行高，
-   会在最后那颗按钮和卡底之间多出一条对不齐的缝。 */
-#fbTip:empty { display: none; }
-.fb-h2 { margin: 0 0 4px; font-size: 16px; }
-.fb-text {
-  display: block; width: 100%; margin: 10px 0 0; padding: 10px 12px;
-  border: 1px solid var(--rule); border-radius: var(--r-ctl);
-  background: var(--field); color: var(--text);
-  font-family: inherit; font-size: 15px; line-height: 1.55;
-  resize: none; box-sizing: border-box;
-}
-.fb-text:focus { outline: none; border-color: var(--accent-line, var(--accent)); }
-.fb-check {
-  display: flex; align-items: flex-start; gap: 8px;
-  margin: 12px 0 14px; font-size: 13px; line-height: 1.5; color: var(--sub);
-}
-.fb-check input { margin: 2px 0 0; width: 16px; height: 16px; flex: 0 0 auto; }
-.fb-prevbtn { margin-top: 10px; }
-/* 预览块：等宽字、可换行、能滚。它显示的是**要发出去的原文**，
-   所以不能折行折到看不出结构 —— 用 pre + wrap。 */
-.fb-prev {
-  margin: 12px 0 0; padding: 10px 12px; max-height: 240px; overflow: auto;
-  border-radius: var(--r-ctl); background: var(--rule);
-  font-family: ui-monospace, Consolas, monospace; font-size: 12px;
-  line-height: 1.5; color: var(--text); white-space: pre-wrap; word-break: break-all;
-}
-.fb-note {
-  margin: 14px 2px 0; font-size: 12px; line-height: 1.6; color: var(--sub);
-}
-
-/* ---------------- 「关于本项目」弹层（0.41.0） ----------------
-   内容比一般弹层长（三条参考项目 + 源码 + 联系 + 一句声明），
-   `.sheet` 自带 max-height 76% + overflow-y auto，直接能滚，不用另搭一层。 */
 .ab-hd {
   margin: 16px 0 8px; font-size: 12px; color: var(--sub);
 }
@@ -2088,103 +2071,6 @@ body::after {
   font-size: 12px; line-height: 1.6; color: var(--sub);
 }
 
-/* 求 Star（2026-11-14）。放在「这个项目」那张卡下面，一行说完 ——
-   它不是说明文字，是一个**动作**，所以右边给一颗实心小按钮，
-   左边用浅强调底把它和上面的署名分开（混在正文里会被当广告忽略）。
-   🔴 不用金色星星图标：全 App 只有一个强调色（DESIGN.md 第 2 条），
-      多一种颜色就等于多一个「这里不一样」的信号，而它并没有多重要。 */
-.ab-star {
-  display: flex; align-items: center; gap: 10px;
-  margin-top: 12px; padding: 10px 12px;
-  border-radius: var(--r-chip); background: var(--accent-soft);
-}
-.ab-star-i {
-  flex: 0 0 auto; width: 18px; height: 18px; color: var(--accent);
-  fill: none; stroke: currentColor; stroke-width: 1.6;
-  stroke-linecap: round; stroke-linejoin: round;
-}
-.ab-star-t { flex: 1 1 auto; min-width: 0; }
-.ab-star-t b { display: block; font-size: 13px; font-weight: 600; }
-.ab-star-t span {
-  display: block; margin-top: 2px;
-  font-size: 11px; line-height: 1.45; color: var(--sub);
-}
-.ab-star-go {
-  flex: 0 0 auto; min-height: 34px; padding: 0 12px;
-  border: 0; border-radius: var(--r-chip);
-  background: var(--accent); color: #fff;
-  font-family: inherit; font-size: 13px; font-weight: 600;
-}
-.ab-star-go:active { opacity: .8; }
-
-/* 匿名问题上报开关（0.47.6）。放在关于弹层最后，不占「我的」那一屏。
-   ⚠️ 开关本身用现成的 .switch（46×27），不另写一套 ——
-      同一个 App 里两种开关，用户会以为它们不是一回事。 */
-.ab-sw {
-  display: flex; align-items: center; gap: 12px;
-  margin-top: 14px; padding-top: 12px;
-}
-.ab-sw .ab-sw-t { flex: 1 1 auto; min-width: 0; }
-.ab-sw b { display: block; font-size: 13px; font-weight: 600; color: var(--text); }
-.ab-sw span {
-  display: block; margin-top: 3px;
-  font-size: 11.5px; line-height: 1.5; color: var(--sub);
-}
-
-/* 「清除本机缓存」（2026-11-10 第三版）。从「我的」第一屏搬进弹层最底下 ——
-   用户原话「清理本机缓存平常很少用，你放深一些」。
-   🔴 它比匿名上报还深一格，理由是不可撤销：上报关掉只是不发数据，能开回来；
-      清缓存清完课表、成绩、一卡通全要重下，校园网可能还得重新登录。
-   所以这里只给一行灰字：找得到、点得动，但不招呼人来点。 */
-.ab-more {
-  margin-top: 16px; padding-top: 14px;
-  border-top: .5px solid var(--line);
-  text-align: center;
-}
-.ab-more-b {
-  min-height: 40px; padding: 0 14px; border: 0; border-radius: var(--r-ctl);
-  background: none; font-family: inherit; font-size: 13px; color: var(--sub);
-}
-.ab-more-b:active { color: var(--text); }
-
-/* ---------- 提醒（0.47.8） ----------
-   挂在「上课时间和提醒」弹层里，作息表上面那一小块。
-   样式复用「关于」页那套开关（.ab-sw / .switch），只补三样这里独有的：
-   提前量的下拉、状态那一行、以及「去打开」那个小按钮。
-
-   下面三种颜色是有分工的，别合并：
-     rm-bad   不处理就**一定不会响**（权限被关）
-     rm-warn  会响，但**不按时**（精确提醒被关，可能晚十几分钟）
-     rm-ok    一切正常
-   把 warn 说成 bad 会让人白白跑去改设置；把 bad 说成 ok 就是骗人。 */
-.rm-box { margin-top: 2px; }
-
-.rm-lead {
-  display: flex; align-items: center; gap: 6px;
-  margin-top: 8px; padding-left: 2px;
-  font-size: 12px; color: var(--sub);
-}
-.rm-lead[hidden] { display: none; }
-.rm-lead select {
-  padding: 3px 6px; border: .5px solid var(--line); border-radius: 7px;
-  background: var(--card); color: var(--text);
-  font-family: inherit; font-size: 12px;
-}
-
-.rm-tip { margin-top: 10px; font-size: 11.5px; line-height: 1.55; }
-.rm-tip:empty { display: none; }
-.rm-bad { color: #b4322f; }
-.rm-warn { color: #8a5a0b; }
-.rm-ok { color: var(--sub); }
-.rm-mute { color: var(--sub); }
-.rm-go {
-  margin-left: 6px; padding: 3px 10px;
-  border: .5px solid var(--line); border-radius: 999px; background: var(--card);
-  font-family: inherit; font-size: 11.5px; color: var(--text);
-}
-
-/* 「参考的项目」那一行 —— 0.44.0：从一整段署名压成一行，点开才是明细。
-   用户 2026-11-03：「把参考的项目压缩为 参考的项目并做成二级界面」。 */
 .ab-refs {
   display: flex; align-items: center; justify-content: space-between;
   width: 100%; margin-top: 14px; padding: 13px 0;
@@ -2498,7 +2384,7 @@ body::after {
 .sheet-x:active { background: var(--fill); }
 .sheet-grab { width: 36px; height: 4px; border-radius: 999px; background: var(--line-strong); margin: 0 auto 14px; }
 /* 右边留出 ✕ 的位置：标题最长也就「发现新版本 0.38.0」，不让它钻到按钮底下。 */
-.sh-title { font-size: 17px; font-weight: 600; margin: 0 0 3px; padding-right: 40px; }
+.sh-title { min-width: 0; font-size: 17px; font-weight: 600; line-height: 1.4; overflow-wrap: anywhere; margin: 0 0 3px; padding-right: 40px; }
 .sh-sub { font-size: 13px; color: var(--sub); margin: 0 0 16px; }
 /* 学期 chip 行（课表页「跳到第几周」弹层顶部，2026-10-31）。
    不复用 `.chips`：那个类自带 `padding: 2px 0 12px`，是给页面里横滑列表的，
@@ -3434,16 +3320,18 @@ body::after {
 }
 .ntitem:active { background: var(--line); }
 .nt-title {
+  min-width: 0; overflow-wrap: anywhere;
   font-size: 15px; font-weight: 500; line-height: 1.42;
   display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
   overflow: hidden;
 }
 .nt-meta {
+  min-width: 0;
   display: flex; align-items: center; gap: 8px;
   margin-top: 8px; font-size: 11px; color: var(--sub);
 }
 .nt-meta .nt-date { margin-left: auto; flex: 0 0 auto; }
-.nt-dept { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.nt-dept { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 .nt-tag {
   flex: 0 0 auto;
@@ -3471,8 +3359,17 @@ body::after {
 .ntd-body {
   margin: 14px 0 0; padding-top: 12px; border-top: .5px solid var(--line);
   font-size: 13px; line-height: 1.75; white-space: pre-wrap;
-  word-break: break-word;
+  min-width: 0; max-width: 100%; overflow-wrap: anywhere; word-break: break-word;
 }
+#sheetMask:has(.ntd-body) { align-items: stretch; padding-top: max(12px, env(safe-area-inset-top)); }
+#sheetMask:has(.ntd-body) .sheet {
+  display: flex; flex-direction: column; min-height: 0; max-height: 100%;
+  border-radius: var(--r) var(--r) 0 0;
+}
+#sheetMask:has(.ntd-body) #sheetBody { min-width: 0; overflow-y: auto; overscroll-behavior: contain; }
+#sheetMask:has(.ntd-body) .sh-title { padding: 4px 52px 0 0; line-height: 1.45; overflow-wrap: anywhere; }
+#sheetMask:has(.ntd-body) .sh-sub { overflow-wrap: anywhere; }
+#sheetMask:has(.ntd-body) .sheetbtns { flex: none; }
 .ntd-note {
   margin: 12px 0 0; font-size: 11px; color: var(--sub); line-height: 1.6;
 }
@@ -5183,6 +5080,17 @@ body::after {
 
 /* 页标题再收紧半格。34px 的中文不收紧，字与字之间会松得像没排过版。 */
 .pagehead h1 { letter-spacing: -.9px; }
+
+/* 一级页统一标题尺度；功能页头右侧给 44px 图标留出与卡片边缘一致的视觉间距。 */
+#page-campus > .pagehead { padding-left: 16px; padding-right: 8px; }
+#page-campus > .pagehead h1 { font-size: 34px; letter-spacing: -.9px; }
+#page-campus > .scroll > .card:first-child { padding: 12px 16px; }
+#page-campus > .scroll > .card:first-child .sub { margin: 0; line-height: 1.5; }
+
+/* 行按钮比原卡片内缩进各收 2px，并扣除总缩进宽度，避免右侧被卡片裁切。 */
+.card > .row { width: calc(100% - 12px); margin-left: 6px; margin-right: 6px; }
+#meIdCard > .row { padding-left: 15px; padding-right: 15px; }
+#meIdCard > .row:only-of-type { background: transparent; border-radius: 0; }
 
 /* 大数字统一收紧字距：34px 的「2.51」不收紧，两个数字之间会漏风 */
 .sum-main b, .ykt-bal b { letter-spacing: -.8px; }

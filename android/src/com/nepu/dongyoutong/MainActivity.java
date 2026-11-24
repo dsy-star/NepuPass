@@ -43,7 +43,7 @@ public class MainActivity extends Activity {
      * build_apk.py 校验 DongYouTong/ 版本标识与网页版本一致。
      *    改版本号时这里必须同步更新。
      */
-    public static final String UA_TAG = " DongYouTong/0.0.5";
+    public static final String UA_TAG = " DongYouTong/0.1.0";
 
     private WebView web;
 
@@ -131,6 +131,11 @@ public class MainActivity extends Activity {
         // 因为它要拿 Activity（读卡模式挂在窗口上），而 NativeBridge 只有 WebView。
         nfc = new WaterNfc(this, web);
         web.addJavascriptInterface(nfc, "AndroidNfc");
+        // 应用内下载更新（2026-11-24）：自己收流、算 SHA-256、拉起系统安装器。
+        // 单独一个对象：它要拿 Activity 才能 startActivity 弹安装器，
+        // 而 NativeBridge 只持有一个 WebView。网页版没有这个对象，
+        // 前端（web/native.js 的 UpdApi）每个方法调用前都会现查。
+        web.addJavascriptInterface(new UpdateDownloader(this), "AndroidUpdate");
         // 渠道先建好：第一次发通知时才建的话，头一条有可能被系统吞掉
         // （渠道创建是异步生效的）。这里建不会打扰用户，也没有权限要求。
         Notify.ensureChannels(this);

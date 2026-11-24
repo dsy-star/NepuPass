@@ -1,7 +1,7 @@
 {
-  "name": "航院通",
-  "short_name": "航院通",
-  "description": "郑州航空工业管理学院课表、成绩与考试安排（本地同步）",
+  "name": "东油通",
+  "short_name": "东油通",
+  "description": "东北石油大学校园助手，课程表本地查看",
   "start_url": "./",
   "scope": "./",
   "display": "standalone",

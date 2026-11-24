@@ -1,0 +1,108 @@
+name: 发版
+
+# 打一个 `v0.1.1` 这样的 tag 就发一版：出包 → 推 更新清单+安装包 到 gh-pages → 建 Release。
+#
+# 为什么这么绕（App 读清单、安装包从 Pages 下）：
+#   ① 检查更新读的是一份**静态 JSON**（web/app.js 的 UPD_STABLE），不是 GitHub API ——
+#      API 要 token、有速率限制，校网里也常连不上。
+#   ② 安装包不放 Release 下载链接：github.com 在国内时通时断，
+#      而 GitHub Pages 和 jsDelivr 都能连（清单里 apk / apk_cn 就是这两个入口）。
+#      Release 里仍然挂一份，那是**留档**，不是主要下载路径。
+#
+# 🔴 必须 windows 跑：android/build_apk.py 找的是 aapt2.exe / zipalign.exe / d8.jar
+#    这套 Windows 名字，换 ubuntu 会直接卡在 check_env。
+# 🔴 签名必须是同一把钥匙：换钥匙的包装不上去（Android 只允许同签名的升级）。
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # 2026-11-24 撞过这个：远端 main 里没有 web/ 目录（那份历史只有
+      # README/LICENSE/android），而 build_apk.py 第一步就要读 web/app.js。
+      # 在那种树上打 tag，CI 报的是一句看不出因果的文件不存在。
+      # 这个脚本把「缺哪个文件」直接说出来。
+      - name: 检查仓库是否推全
+        shell: bash
+        run: python tools/check_release_tree.py
+
+      # build_apk.py 用 JAVA/JAVAC/KEYTOOL 打包和签名，17 是它验证过的版本。
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: 解开签名密钥
+        shell: bash
+        env:
+          KEY_B64: ${{ secrets.DONGYOU_KEYSTORE_B64 }}
+        run: |
+          set -euo pipefail
+          if [ -z "${KEY_B64:-}" ]; then
+            echo "::error::仓库没有配 DONGYOU_KEYSTORE_B64。发版包必须签名，见 docs/GITHUB-UPDATE.md 第一节"
+            exit 1
+          fi
+          mkdir -p android/.local
+          printf '%s' "$KEY_B64" | base64 -d > android/.local/release.keystore
+
+      - name: 出包
+        shell: bash
+        env:
+          DONGYOU_KEYSTORE: android/.local/release.keystore
+          DONGYOU_KS_PASS: ${{ secrets.DONGYOU_KS_PASS }}
+          DONGYOU_KEY_ALIAS: ${{ secrets.DONGYOU_KEY_ALIAS || 'dongyoutong' }}
+        run: python android/build_apk.py --clean
+
+      - name: 生成更新清单
+        id: pub
+        shell: bash
+        run: |
+          set -euo pipefail
+          eval "$(python tools/make_update_json.py --out pub)"
+          # 🔴 tag 和包里的版本号必须一致：清单里的安装包地址是按版本号拼的，
+          #    对不上就是发了一份指向 404 的清单，而 App 会照它去下。
+          if [ "v$VERSION" != "${GITHUB_REF_NAME}" ]; then
+            echo "::error::tag 是 ${GITHUB_REF_NAME}，包里却是 $VERSION —— 版本号没改全（RELEASE-NOTES.md 开头那四个文件六个值）"
+            exit 1
+          fi
+          { echo "version=$VERSION"; echo "apk=$APK"; } >> "$GITHUB_OUTPUT"
+
+      - name: 发布清单到 gh-pages
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          cd pub
+          git init -q -b gh-pages
+          git add -A
+          git -c user.name="github-actions[bot]" \
+              -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+              commit -qm "publish v${{ steps.pub.outputs.version }}"
+          # 每次都从头写（-f）：历史里堆几十个几百 KB 的 APK 只是垃圾，
+          # 老版本要留档的部分在 Release 里。
+          git push -f "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" gh-pages
+
+      - name: 建 Release（留档）
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh release create "${{ github.ref_name }}" \
+            "android/dist/${{ steps.pub.outputs.apk }}" \
+            -F pub/notes.md \
+            -t "东油通 ${{ steps.pub.outputs.version }}" \
+            --verify-tag

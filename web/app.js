@@ -84,8 +84,8 @@ const DAY_CN = ['一', '二', '三', '四', '五', '六', '日'];
    build_apk.py 里，两处各写一遍，迟早会出现「软件里显示 0.1.0、装上去是 0.1.1」
    这种没法解释的事。现在 build_apk.py 和 version.json 都从这里读。
    code 是整数，只增不减：比版本号字符串靠谱（"0.10.0" < "0.9.0" 是字符串比较的经典坑）。 */
-const APP_VERSION = '0.53.0';
-const APP_CODE = 178;
+const APP_VERSION = '0.1.0';
+const APP_CODE = 191;
 
 /* 功能说明书的地址（2026-11-15）。
  *
@@ -100,7 +100,7 @@ const APP_CODE = 178;
  * 🔴 末尾这个斜杠别省：站点 html_handling 是 auto-trailing-slash，
  *    写成 /help 会 307 多跳一次。
  */
-const HELP_URL = 'https://hobson.cc/help/';
+
 
 /* 这一版是**测试版**还是正式版。2026-11-06 加。
  *
@@ -112,7 +112,7 @@ const HELP_URL = 'https://hobson.cc/help/';
  * 🔴 这个值由 mobile/beta.py 改：打测试版时写 'beta'，正式发版写 'stable'。
  *    两边对不上的后果很隐蔽 —— build_apk.py --beta 会核这一项，
  *    正式打包时也会核（'beta' 的包不许进 version.json）。 */
-const APP_CHANNEL = 'beta';
+const APP_CHANNEL = 'local';
 
 /* 测试版序号（2026-11-07 起）：同一版号下的 v1 / v2 / v3…，正式版永远是 0。
  *
@@ -255,6 +255,44 @@ let examItems = [];
 let examPastOpen = false;
 /* 整份同步是否正在进行。四个入口共用一个开关，防止连点变成两次登录。 */
 let syncing = false;
+let nepuSession = false;
+let nepuTerms = [];
+const NEPU_TIMEOUT = 150000;
+const nepuPending = new Map();
+let nepuRequestId = 0;
+function nepuBridgeCall(method, ...args) {
+  const bridge = window.AndroidNepu;
+  if (!bridge || typeof bridge[method] !== 'function') {
+    return Promise.reject(new Error('请在东油通 App 内打开教务登录'));
+  }
+  const id = ++nepuRequestId;
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      nepuPending.delete(String(id));
+      reject(new Error('教务操作超时，请检查网络后重试'));
+    }, NEPU_TIMEOUT);
+    nepuPending.set(String(id), { resolve, reject, timer });
+    try { bridge[method](id, ...args); }
+    catch (e) {
+      clearTimeout(timer); nepuPending.delete(String(id)); reject(e);
+    }
+  });
+}
+window.__nepuDone = function (id, json) {
+  const pending = nepuPending.get(String(id));
+  if (!pending) return;
+  clearTimeout(pending.timer);
+  nepuPending.delete(String(id));
+  try {
+    const result = typeof json === 'string' ? JSON.parse(json) : json;
+    if (result && result.ok) pending.resolve(result);
+    else {
+      const error = new Error((result && result.error) || '教务操作失败');
+      error.kind = (result && result.kind) || '';
+      pending.reject(error);
+    }
+  } catch (e) { pending.reject(e); }
+};
 /* 后台「把其他学期的考试也提前拉一遍」的进度。
    prefetchTok 是轮次号：换账号、重新同步都会 ++，正在跑的那一轮自己退出。 */
 let prefetching = false;
@@ -277,9 +315,6 @@ let CFG = Object.assign(
     // 为什么不是「每次打开」：一天开十次 App 就查十次，而一天之内
     // 根本不会有新版本 —— 纯属白耗流量。想更勤可以在设置里改成「每次打开」。
     updOn: true, updFreq: 'daily', updLast: 0, updSkip: '',
-    // 匿名问题上报（0.47.6）：默认开。关掉之后一条都不发、也不攒。
-    // 只用于「哪一步没成功」，不含任何能指到人的东西（见 reportProblem）。
-    reportOn: true,
     // 绑定完课表后「要不要开提醒」问过没有（0.48.1）。
     // 🔴 只问一次：每次绑定都弹一遍就成了骚扰，用户会直接点「先不用」
     //    然后永远不再看它。问过、答过，这个标记就置 true，跟开关无关。
@@ -289,11 +324,6 @@ let CFG = Object.assign(
     //   cxOn   学习通每隔 cxMin 分钟自己查一次
     //   wtOn   今天没做完就自己跑一遍积分任务（做完当天不再动）
     auto: { cxOn: false, cxMin: 120, wtOn: false },
-    // 求 Star 问过没有（2026-11-14）。只问一次，答过就置 true ——
-    // 反复弹「给个 Star」是最快让人卸载的做法。
-    starAsked: false,
-    // 打开过几次。求 Star 要等到第 2 次以后：第一次打开就伸手是要糖。
-    launchN: 0,
   },
   store.get(KEY.settings, {})
 );
@@ -304,8 +334,6 @@ if (CFG.times && CFG.times.length === LEGACY_TIMES.length &&
     CFG.times.every((r, i) => r && r[0] === LEGACY_TIMES[i][0] && r[1] === LEGACY_TIMES[i][1])) {
   CFG.times = null;
 }
-
-// ------------------------------------------------------------------ 匿名上报
 
 /* 出问题的时候，悄悄把「哪一类问题、哪个版本、它说的话」发回去。
  *
@@ -326,195 +354,9 @@ if (CFG.times && CFG.times.length === LEGACY_TIMES.length &&
  * 用户可以在「我的 → 匿名问题上报」里关掉（CFG.reportOn）。关掉之后
  * 一条都不发，也**不攒** —— 关的意思就是关，不是「先攒着，等打开再发」。
  */
-const REPORT_URL = 'https://hobson.cc/r';
-/* 只报这几类。和 worker/index.js 的 KINDS 是同一张表 ——
-   多了少了都只会让那条上报被丢掉，不会报错，所以改的时候两边一起改。 */
-const REPORT_KINDS = ['eams_bind', 'eams_timetable', 'eams_sync', 'water_bind',
-                      'water_task', 'water_score', 'cx_scan', 'mooc', 'js', 'net'];
-const REPORT_MAXQ = 8;              // 本机最多攒几条
-const REPORT_GAP = 10 * 60 * 1000;  // 同一类、同一句话，10 分钟内只算一次
-const REPORT_TO = 6000;             // 一次最多等 6 秒
-/* 这一次打开里，每类问题各出现过几次（只在内存里）。用来区分
-   「一个人点了十几下」和「十几个人各遇到一次」。 */
-const REPORT_SES = {};
-
-/** 把可能指到人的东西从原话里抹掉。
- *
- *  🔴 顺序不能换：先认「打过码的学号」（2507****30），它里面既有数字又有星号，
- *     放在后面会被「连续数字」那条拆成两半、留下 `****` 和零散位数。
- *     邮箱放在连续数字前面：不然 `zhang2021001@xx.edu.cn` 会先被数字那条切开。
- */
-function reportScrub(s) {
-  return String(s == null ? '' : s)
-    .replace(/\d{3,4}\*{2,}\d{2,4}/g, '#')          // 2507****30（界面上显示的学号）
-    .replace(/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+/g, '#')  // 邮箱
-    .replace(/\d{5,}/g, '#')                        // 学号、手机号、单号
-    .replace(/\s+/g, ' ')
-    .trim()
-    .slice(0, 160);
-}
-
-/** 上报开关。默认开着；只有用户亲手关掉（存了 false）才不发。 */
-function reportWanted() {
-  return CFG.reportOn !== false;
-}
-
-/** 这台浏览器是不是**自动化**的（判据 / 截图脚本 / 爬虫）。
- *
- *  🔴 自动化浏览器一个字都不许往外发 —— 发出去的每一条都是**假的**：
- *     · 那一枪日活：每个脚本开一个全新上下文 ⇒ 每次都是一个新码，
- *       跑一轮回归就在线上多几十台「设备」，还是我们自己造的；
- *     · 那一条问题上报：脚本喂的是假数据、假门户，页面里那些
- *       「stub 没有这个接口」「短信验证码错误」全会被当成真问题记下来。
- *
- *  2026-11-09 Cloudflare 来信：「KV 每日操作已用掉 50%」。翻当天的上报：
- *  前一天 257 条里绝大多数带着测试用的版本号，没有一条来自真人 ——
- *  这就是那 50% 的来源。额度是真会被吃光的，吃光之后**上报和日活一起停**，
- *  而且不报错。
- *
- *  Playwright / Selenium 会把 navigator.webdriver 设成 true，真机是 undefined。
- */
-function isBot() {
-  try {
-    return !!(navigator && navigator.webdriver);
-  } catch (e) {
-    return false;          // 老 WebView 连这个字段都没有
-  }
-}
-
-/** 上报一条问题。**永远不抛错、永远不等它**，调用处不用 try 也不用 await。 */
-function reportProblem(kind, detail, msg, page) {
-  try {
-    if (!reportWanted()) return;
-    // 自动化浏览器一条都不发（和那一枪日活同一个判据，见 isBot）。
-    // 回归和截图脚本会开真页面、喂假数据，那些「没读到」全是真的，
-    // 但**不是用户的问题** —— 记进线上只会把 KV 额度吃光、把数据看歪。
-    if (isBot()) return;
-    if (REPORT_KINDS.indexOf(kind) < 0) return;
-    const d = String(detail || '').replace(/[^A-Za-z0-9_-]/g, '').slice(0, 24);
-    const m = reportScrub(msg);
-    // 调用处知道是哪一页就按它报（绑定失败其实发生在「我的」那张表单上，
-    // 哪怕用户当时还停在课表页）；不知道就按当前标签。
-    const p = String(page || '').replace(/[^a-z]/g, '').slice(0, 20) || reportPage();
-
-    // 同一件事 10 分钟内只算一次。失败重试会一瞬间连打十几条，
-    // 那在后台看起来像「十几个人遇到」，其实是「一个人点了十几下」。
-    const seen = store.get('zt.reportSeen', {}) || {};
-    const key = kind + '|' + d + '|' + m.slice(0, 40);
-    const now = Date.now();
-    if (seen[key] && now - seen[key] < REPORT_GAP) return;
-    seen[key] = now;
-    // 只留最近 20 个标记，不然这个对象会一直长
-    const ks = Object.keys(seen);
-    if (ks.length > 20) {
-      ks.sort((a, b) => seen[b] - seen[a]).slice(20).forEach((k) => { delete seen[k]; });
-    }
-    store.set('zt.reportSeen', seen);
-
-    REPORT_SES[key] = (REPORT_SES[key] || 0) + 1;
-
-    // 同一件事也记进本机日志：用户反馈时，这段比「哪一类失败」有用得多。
-    appLog(kind + (d ? ' ' + d : '') + (m ? '：' + m : ''));
-
-    const q = store.get('zt.reportQ', []) || [];
-    q.push({
-      v: APP_VERSION, c: APP_CODE, ch: APP_CHANNEL,
-      e: NATIVE ? 'android' : 'web',
-      k: kind, d: d, m: m, p: p, n: REPORT_SES[key],
-    });
-    while (q.length > REPORT_MAXQ) q.shift();
-    store.set('zt.reportQ', q);
-    reportFlush();
-  } catch (e) { /* 上报自己坏了，绝不能连累正事 */ }
-}
-
-let reportBusy = false;
-
-/** 把攒着的逐条发出去（一次只发一条，发完接着下一条）。 */
-function reportFlush() {
-  if (reportBusy || !reportWanted()) return;
-  const q = store.get('zt.reportQ', []) || [];
-  if (!q.length) return;
-  const one = q[0];
-  reportBusy = true;
-  const ctl = (typeof AbortController !== 'undefined') ? new AbortController() : null;
-  const timer = ctl ? setTimeout(() => ctl.abort(), REPORT_TO) : 0;
-  const done = () => {
-    clearTimeout(timer);
-    reportBusy = false;
-    reportFlush();
-  };
-  try {
-    fetch(REPORT_URL, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(one),
-      signal: ctl ? ctl.signal : undefined,
-    }).then((r) => {
-      // 🔴 只有**确认对方收下了**才从队列删掉。网络断了、超时、被拦了都留着 ——
-      //    「发过了」和「发出去了」是两件事，前者不能当后者用。
-      //    4xx 例外：那说明这条本身不合格（字段不对），留着也永远不会成功。
-      const st = r ? r.status : 0;
-      if ((st >= 200 && st < 300) || st === 429 || (st >= 400 && st < 500)) {
-        const now = store.get('zt.reportQ', []) || [];
-        now.shift();
-        store.set('zt.reportQ', now);
-      }
-    }).catch(() => {}).then(done, done);
-  } catch (e) {
-    done();
-  }
-}
-
-/** 出事时在哪个页面。取当前标签；取不到就空着，不猜。
- *
- *  ⚠️ `CUR_PAGE` 是用 `let` 声明的，位置在本文件**后面**。页面还没画完就
- *     抛错的话（window.onerror 可能在启动阶段就触发），直接读它会撞上
- *     TDZ 抛 ReferenceError —— 而上报函数里那个 try 会把它吞掉，
- *     结果就是「页面名丢了」，看起来像没发出去。所以这里自己裹一层。
- */
-function reportPage() {
-  try {
-    return String(CUR_PAGE || '').replace(/[^a-z]/g, '').slice(0, 20);
-  } catch (e) {
-    return '';
-  }
-}
-
-/** 上报里那串「分类 + 证据」。
- *
- *  以前只传 `kind`（auth / net …），有些失败 kind 是空的，库里就只剩一个
- *  空字段 —— 2026-11-11 三条「绑不上」的上报全是 detail=''，看数据完全
- *  不知道发生了什么，只能靠猜。
- *
- *  `diag` 是数据层给的证据串（例如 `page_200_5969` = 页面回来了、长度
- *  5969、但里面没认出取盐那一行；`net_0_0` = 请求根本没通）。
- *  它只进上报，不上屏，用户看不到。
- */
-function reportCode(res) {
-  const k = String((res && res.kind) || '');
-  const d = String((res && res.diag) || '');
-  return d || k;
-}
-
-/* ===== 本机日志 + 问题反馈（2026-11-10）=====
- *
- * 用户原话：「能不能在校园网软件和航院通APP里都加上日志功能，能够自动记录日志，
- * 用户遇见bug或者问题时可以有问题描述，还能默认附上日志发到咱们的服务器…
- * 日志在用户端脱敏后存储在本地，发过来的时候只发脱敏的」。
- *
- * 🔴 这份日志**只存在这台手机上**（localStorage），发不发由用户在「问题反馈」页
- *    自己勾。程序**不会**自己把它传出去 —— 自动上报那条线（reportProblem）
- *    传的是一句话，不是日志。
- * 🔴 每写一行就先脱敏（`fbScrub`）—— 落盘那一刻就脱，就不会出现
- *    「本地一份明文、发之前忘了脱」。规则和 reportScrub 同一套，只是多了
- *    token=… / IP 两条，并且**每行单独一条**（日志要能按行读）。
- * 🔴 环形：只留最近 200 行。不设上限的话用一个学期能把 localStorage 吃满，
- *    而那时存不下的是课表 —— 那是主功能。
- */
 const LOG_MAX = 200;
 const LOG_LINE_MAX = 300;
-const FEEDBACK_URL = 'https://hobson.cc/fb';
+const FEEDBACK_URL = '';
 let LOG_BUF = null;
 
 /** 把可能指到人的东西抹掉。`max` 是这条最多留多少字。
@@ -522,7 +364,7 @@ let LOG_BUF = null;
  *  ⚠️ 顺序不能换，理由见 reportScrub：打过码的学号 → 邮箱 → IP →
  *     查询串里那几个键 → 连续 5 位以上数字。反过来会互相切开。
  */
-function fbScrub(s, max) {
+function logClean(s) {
   return String(s == null ? '' : s)
     .replace(/\d{3,4}\*{2,}\d{2,4}/g, '#')
     .replace(/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+/g, '#')
@@ -531,7 +373,7 @@ function fbScrub(s, max) {
     .replace(/\d{5,}/g, '#')
     .replace(/\s+/g, ' ')
     .trim()
-    .slice(0, max || 300);
+    .slice(0, LOG_LINE_MAX);
 }
 
 function logStamp() {
@@ -545,212 +387,18 @@ function logStamp() {
 function appLog(msg) {
   try {
     if (!LOG_BUF) LOG_BUF = store.get('zt.log', []) || [];
-    LOG_BUF.push(logStamp() + ' ' + fbScrub(msg, LOG_LINE_MAX));
+    LOG_BUF.push(logStamp() + ' ' + logClean(msg));
     while (LOG_BUF.length > LOG_MAX) LOG_BUF.shift();
     store.set('zt.log', LOG_BUF);
   } catch (e) { /* 日志自己坏了，绝不能连累正事 */ }
 }
 
 /** 整段日志（一行一条）。 */
-function appLogText() {
-  try {
-    if (!LOG_BUF) LOG_BUF = store.get('zt.log', []) || [];
-    return (LOG_BUF || []).join('\n');
-  } catch (e) { return ''; }
-}
-
-/** 系统那一行（Android 13 / Windows 10/11）。
- *
- *  ⚠️ 网页版要在浏览器里跑，UA 前半截是 `Mozilla/5.0 (Windows NT 10.0; Win64…` ——
- *     直接截 40 个字进日志，等于每次反馈都带一句没用的噪音。所以按系统认一遍，
- *     认不出来就**空着**：猜一个版本号比不写更坏。 */
-function fbOsText() {
-  try {
-    const ua = navigator.userAgent || '';
-    const m = ua.match(/Android\s+([\d.]+)/);
-    if (m) return ('Android ' + m[1]).slice(0, 40);
-    if (/Windows NT 10\.0/.test(ua)) return 'Windows 10/11';
-    if (/Windows NT 6\.1/.test(ua)) return 'Windows 7';
-    if (/Mac OS X/.test(ua)) return 'macOS';
-    if (/iPhone|iPad/.test(ua)) return 'iOS';
-    return '';
-  } catch (e) { return ''; }
-}
-
-/** 反馈页要发出去的那份。 */
-function fbPayload() {
-  const desc = fbScrub(($('fbText') && $('fbText').value) || '', 800);
-  const withLog = !!($('fbLog') && $('fbLog').checked);
-  return {
-    v: APP_VERSION, c: APP_CODE, ch: APP_CHANNEL,
-    e: NATIVE ? 'android' : 'web',
-    os: fbOsText(),
-    desc: desc,
-    log: withLog ? appLogText() : '',
-  };
-}
-
-function fbTip(msg, kind) {
-  const el = $('fbTip');
-  if (!el) return;
-  el.textContent = msg || '';
-  el.className = 'tip note' + (kind === 'err' ? ' bad' : '');
-}
-
-/** 「看看要发什么」：把要发的那份原样摊开。
- *
- *  🔴 这个按钮不是装饰：用户点过预览再发，这件事才不叫「偷偷把日志传走」。 */
-function fbPreview() {
-  const p = fbPayload();
-  const box = $('fbPrev');
-  if (!box) return;
-  box.textContent = '【你写的那段】\n' + (p.desc || '（空）') +
-                    '\n\n【运行日志】\n' + (p.log || '（这次不带日志）');
-  box.hidden = false;
-}
-
-let fbBusy = false;
-
-function fbSend() {
-  if (fbBusy) return;
-  const p = fbPayload();
-  if (!p.desc && !p.log) {
-    fbTip('写一句你遇到的情况，或者把「附带运行日志」打开。', 'err');
-    return;
-  }
-  // 自动化环境一律不发（和那一枪日活同一个判据，见 isBot）。
-  if (isBot()) { fbTip('这个环境不发反馈。', 'err'); return; }
-  fbBusy = true;
-  const btn = $('fbSend');
-  if (btn) btn.disabled = true;
-  fbTip('正在发送…', '');
-  const ctl = (typeof AbortController !== 'undefined') ? new AbortController() : null;
-  const timer = ctl ? setTimeout(() => ctl.abort(), 25000) : 0;
-  const done = (ok, msg) => {
-    clearTimeout(timer);
-    fbBusy = false;
-    if (btn) btn.disabled = false;
-    fbTip(msg, ok ? '' : 'err');
-    if (ok) {
-      if ($('fbText')) $('fbText').value = '';
-      if ($('fbPrev')) { $('fbPrev').hidden = true; $('fbPrev').textContent = ''; }
-      appLog('发出了一条反馈（' + p.desc.length + ' 字，' +
-             (p.log ? '带' : '不带') + '日志）');
-    }
-  };
-  try {
-    fetch(FEEDBACK_URL, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(p),
-      signal: ctl ? ctl.signal : undefined,
-    }).then((r) => {
-      const st = r ? r.status : 0;
-      if (st >= 200 && st < 300) done(true, '发出去了，谢谢。');
-      else if (st === 429) done(false, '今天收到的反馈已经满了，明天再发一次。');
-      else if (st === 413) done(false, '内容过大，请关闭「附带运行日志」后重试。');
-      else if (st === 503) done(false, '服务器暂时无法接收，请稍后再试。');
-      else done(false, '没发出去（对方回了 ' + st + '），请稍后再试。');
-    }).catch(() => done(false, '没发出去 —— 网络没通。写的内容还在这页上。'));
-  } catch (e) {
-    done(false, '未发出，请稍后再试。');
-  }
-}
-
-/** 进「问题反馈」页：只清预览和提示。
- *
- *  🔴 **描述的草稿不清**：用户切出去看一眼别的页再回来，写了一半的字
- *     不能没了 —— 那不是「重新开始」，是「我刚才写的呢」。
- */
-function renderFeedback() {
-  fbTip('', '');
-  const box = $('fbPrev');
-  if (box) { box.hidden = true; box.textContent = ''; }
-}
-
 /* 界面自己抛的错（改坏一处、某个字段 undefined 之类）。
  *
  * 🔴 只报**一句话**，不报堆栈：堆栈里全是文件路径和行号，对我们排查没用
  *    （代码就是我们自己写的），却可能把用户的目录名带出去。
  *    真的要看堆栈，让他截图发过来就行。 */
-
-window.addEventListener('error', (e) => {
-  const m = (e && (e.message || (e.error && e.error.message))) || '';
-  if (m) {
-    // 界面抛的错先记进本机日志（反馈时能带上），再按老路报一句话。
-    appLog('界面出错：' + m);
-    reportProblem('js', '', m, reportPage());
-  }
-});
-
-/* ===== 每天一枪：告诉服务端「今天多了一台设备」（0.49.0 v8）=====
- *
- * 用户 2026-11-08：「把日活计算更精确一些，让请求更新时返回一次设备码之类的
- * 唯一标识」。原来只能数「检查更新」的请求次数，一台设备一天查几次就多算几台。
- *
- * 🔴 这里发出去的**不是设备码**：每天重新生成一个随机串，跨天就换一个，
- *    卸载重装也换一个，和手机硬件 / 账号 / 学号没有任何关系。
- *    服务端只数「今天这个前缀下有几个键」，不记录谁是谁。
- *    代价是算不出「上周来的人这周还来不来」—— 要算就得用更持久的标识，
- *    那是另一个取舍，得先商量。
- *
- * 🔴 一天只打一枪（`devSent` 记日期）。不是省事 —— KV 免费额度是每天
- *    1000 次**写**，而检查更新一天几百次，按次打会把额度吃光，
- *    上报反而写不进去了。
- *
- * 🔴 关掉「匿名问题上报」的人，这一枪也不打。开关说「一条不发」，
- *    那就一条都不发，不能因为这一条「只是统计」就自作主张。
- */
-const DEV_URL = 'https://hobson.cc/u';
-
-/** 当天用的随机串（16 位十六进制）。换天就换，旧的直接丢掉。 */
-function devCode() {
-  const d = ymd(today0());
-  const o = store.get(KEY.devDay, null);
-  if (o && o.d === d && /^[a-z0-9]{12,32}$/.test(String(o.v || ''))) return o;
-  const a = new Uint8Array(8);
-  try {
-    crypto.getRandomValues(a);
-  } catch (e) {
-    // 老 WebView 没有 crypto：退回 Math.random。这个串不需要密码学强度，
-    // 只需要「同一天的两台设备不会撞」——8 字节撞的概率可以忽略。
-    for (let i = 0; i < 8; i++) a[i] = Math.floor(Math.random() * 256);
-  }
-  let v = '';
-  for (let i = 0; i < 8; i++) v += ('0' + a[i].toString(16)).slice(-2);
-  const one = { d: d, v: v };
-  store.set(KEY.devDay, one);
-  return one;
-}
-
-/** 打一枪。**永远不等它、永远不抛错**，调用处不用 try 也不用 await。 */
-function devPing() {
-  try {
-    if (!reportWanted()) return;
-    // 🔴 自动化浏览器不打这一枪（判据见 isBot）。判据和截图脚本每次都要开一个
-    //    **全新的浏览器上下文** —— 也就每次都换一个新码，跑一轮回归就在生产 KV
-    //    里多几十台「设备」，数据台那个数字变成测试自己的噪音。
-    //    （2026-11-08 真踩了：一天之内「30 台设备」，一台都不是真人。）
-    if (isBot()) return;
-    const o = devCode();
-    if (store.get(KEY.devSent, '') === o.d) return;   // 今天打过了
-    fetch(DEV_URL + '?i=' + o.v, { cache: 'no-store' })
-      .then((r) => {
-        // 🔴 只有真回 2xx 才算打过。断网 / 被拦都留着下次再打 ——
-        //    「发过了」和「发出去了」是两件事。
-        if (r && r.status >= 200 && r.status < 300) store.set(KEY.devSent, o.d);
-      })
-      .catch(() => {});
-  } catch (e) { /* 统计坏了不能连累正事 */ }
-}
-window.addEventListener('unhandledrejection', (e) => {
-  const r = e && e.reason;
-  const m = (r && (r.message || String(r))) || '';
-  if (m) reportProblem('js', '', m, reportPage());
-});
-
-// 网络回来了就把攒着的发掉（在电梯里点了没发出去，出来自己补上）。
-window.addEventListener('online', () => { reportFlush(); });
 
 // ------------------------------------------------------------------ 工具
 
@@ -771,10 +419,20 @@ function esc(s) {
 }
 
 async function api(path, body) {
-  // APK 里没有电脑上的 bridge.py（手机连不到电脑的 127.0.0.1），
-  // 改由 App 内置的原生桥 + 本地解析顶上；两条路径返回的 JSON 契约完全一样。
-  if (NATIVE) return window.NativeApi.handle(path, body || {});
+  if (path === '/api/state') {
+    return { ok: true, data: DATA, config: CFG, version: APP_VERSION, native: NATIVE };
+  }
+  if (/^\/api\/(water|cx)\//.test(path)) {
+    if (NATIVE) return window.NativeApi.handle(path, body || {});
+    return { ok: false, kind: 'native_unavailable', error: '此功能需在东油通 Android 版使用' };
+  }
+  if (/^\/api\//.test(path)) {
+    return { ok: false, kind: 'school_not_configured', error: '东油适配中' };
+  }
 
+  if (/^\/api\/(cw|water|cx)\//.test(path)) {
+    return { ok: false, kind: 'native_unavailable', error: '此功能需在东油通 Android 版使用' };
+  }
   const opt = { method: body ? 'POST' : 'GET', headers: { 'X-Token': TOKEN } };
   if (body) {
     opt.headers['Content-Type'] = 'application/json';
@@ -1917,18 +1575,14 @@ function visibleDays() {
    中间那格原来是「公告」，用户 2026-10-30 要求换成 WIKI —— 公告是低频内容，
    并进了「功能」页；攻略是新生天天翻的。 */
 const TABS = ['schedule', 'exams', 'wiki', 'campus', 'me'];
-const SUBPAGES = ['calendar', 'rooms', 'accounts', 'notice', 'stats', 'services',
-                  'feedback', 'perm'];
+const SUBPAGES = ['calendar', 'rooms', 'accounts', 'notice', 'stats', 'services', 'perm'];
 /* 子页是从哪个 tab 进去的 —— 返回时回那里，底部也要高亮那一个。
    原来只有校历/空教室两个、都挂在课表下，所以写死成 'schedule'；
    0.14.0 的「账号管理」是从「我的」进去的，再写死就会高亮错 tab。
    0.50.0 的「校园服务」同理：它挂在「功能」下，是那一页的低频区块。 */
 const SUB_PARENT = { calendar: 'schedule', rooms: 'schedule',
-                      accounts: 'me', notice: 'campus', stats: 'me',
-                      services: 'campus',
-                      // 2026-11-10：问题反馈挂在「我的」。放在这里而不是底部，
-                      // 理由和其他子页一样 —— 它不是天天用的。
-                      feedback: 'me',
+                      accounts: 'me', notice: 'wiki', stats: 'me',
+                      services: 'wiki',
                       // 2026-11-15：权限自检挂在「我的」。它是一次「看看哪儿没配对」
                       // 的检查，一学期点不了两次，不该占底部一个位置。
                       perm: 'me' };
@@ -2243,45 +1897,22 @@ function switchTab(name) {
   const hl = SUB_PARENT[name] || name;
   document.querySelectorAll('.tab').forEach((b) => b.classList.toggle('active', b.dataset.tab === hl));
   if (name === 'exams') {
-    renderExamView(); renderExams(); renderGrades();
-    // 只加载当前那一格：外部平台看的是平台（学习通 / MOOC），
-    // 学校平台的数据是整份同步下来的，进页面不用再问一次。
-    if (CFG.examView === 'mooc') moocEnter();
-    else if (!CFG.examView || CFG.examView === 'cx') cxEnter();
-    // 随堂练习快查（0.52.3 v6）：进这一页顺手问一次「今天这几门课现在有没有
-    // 正在进行的练习/签到」。不 await、不挡渲染，失败就当没查（见 cxLiveRun）。
+    renderExamView();
+    if (!CFG.examView || CFG.examView === 'cx') cxEnter();
     cxLiveRun();
   }
   if (name === 'me') renderMe();
   // 数据台（只有测试版）：进来就取一次，一分钟内重复进来不再打。
   // 上面那道 statsReady() 已经在这个分支之前 return 过了，这里只管调用。
   if (name === 'stats') statsLoad(false);
-  // 财务处的状态是本机存的，读一下就有（不打学校服务器），所以和慧生活一起刷。
   if (name === 'accounts') {
     renderAccounts(); wtStateRefresh();
-    cwStateRefresh(false).then(renderAccounts);
   }
-  if (name === 'feedback') renderFeedback();
-  if (name === 'wiki') renderWikiPage();
-  // 功能：直饮水是这一页的主体，先画本机缓存再探一次网（见 renderWater）
-  if (name === 'campus') { renderCampus(); renderWater(); }
-  // 校园服务（二级页）：门户 / 一卡通 / 办事入口。原来的 `#cpMoreBox` 就在这一页上。
-  if (name === 'services') renderServices();
+  // 功能页只保留慧生活798饮水功能。
+  if (name === 'campus') renderWater();
+  if (name === 'notice' || name === 'wiki') renderNepuNotices();
   // 校历纯本地计算，没有网络，每次进来重画一遍就行（跨零点后周次会变）
   if (name === 'calendar') renderCalendar();
-  // 公告：本机有就先画，再按新鲜度决定要不要后台刷。
-  // （以前是「第一次进来才抓」，等于每次都从空白页开始等 6 个学校站点。）
-  if (name === 'notice') enterNotice();
-  if (name === 'rooms') {
-    renderRooms();
-    // 第一次进这一页就直接查一遍：用户点「空教室」就是想看结果，
-    // 再让他点一次「查询」属于白等。整个 App 生命周期只自动查这一次，
-    // 之后切来切去不再打学校服务器（空教室数据也不会几秒钟就变）。
-    if (DATA && !ROOM.autoTried) {
-      ROOM.autoTried = true;
-      queryRooms().then(() => { loadRoomOptions(); });
-    }
-  }
   // 课表页重新可见时补量一次：隐藏状态下量不出宽度，两间教室的字号没法缩
   if (name === 'schedule') {
     fitRoomLines($('wkTrack')); fitRoomLines($('dayView'));
@@ -2309,16 +1940,6 @@ document.addEventListener('visibilitychange', () => {
   // 用户最常做的动作就是「课间切回来看一眼新作业」，这正是最该是最新的时刻。
   if (CUR_PAGE === 'exams') {
     cxAutoScan();
-    // 0.45.0：从内置网页登完 MOOC 回来，这一下正是「该读了」的时刻。
-    // 🔴 不接这一下，登录卡上那句「登录完成后回到这个页面，会自动读」
-    //    就是空话 —— 人登完回来看到的还是一张「请登录」，只能自己再点一次。
-    // 🔴 这里**不能调 moocEnter**：它只在 state === null（头一次进来）时才去读，
-    //    「未登录」和「读失败」两种状态它都是直接画完就走 —— 正好是登完回来
-    //    最需要重读的那两种。所以直接调 moocRefresh，做完再画。
-    if (CFG.examView === 'mooc' && typeof MOOC !== 'undefined' &&
-        MOOC.state !== 'ok') {
-      moocRefresh(true, false).then(moocPaint);
-    }
   }
 });
 
@@ -2592,141 +2213,94 @@ function ntCacheLoad() {
  *     不是显示一句「仅 App 可用」，是连占位都不要有。
  *  🔴 一屏只画前 {@link DING_SHOW} 条：再往下就是上周的事，去钉钉翻更合适。
  */
-const DING_SHOW = 12;
+const NEPU_NOTICE_KEY = 'zt.nepu-notices';
+let nepuNoticeCache = store.get(NEPU_NOTICE_KEY, null);
+let nepuNoticeError = '';
+let nepuNoticeSheetToken = 0;
 
-function dingApi() {
-  const n = window.NativeApi;
-  return (n && n.ding) ? n.ding : null;
+function renderNepuNotices() {
+  const list = window.Nepu ? Nepu.normalizeNotices(nepuNoticeCache && nepuNoticeCache.items) : [];
+  const host = $('nepuNoticeList');
+  if (!host) return;
+  host.innerHTML = list.map(it => '<button class="ntitem nepu-notice-item" data-notice-id="' + it.id + '">' +
+    '<span class="nt-title">' + esc(it.title) + '</span><span class="nt-meta">教务通知<span class="nt-date">' +
+    esc(it.date.slice(0, 10)) + '</span></span></button>').join('');
+  $('nepuNoticeState').textContent = nepuNoticeError || (nepuNoticeCache
+    ? (list.length ? '近三个月 · ' + list.length + ' 条 · ' + ntStamp(nepuNoticeCache.at) + ' 更新' : '教务列表中暂无近三个月公告')
+    : '登录教务并同步后查看近三个月公告');
+  $('ntBrief').textContent = nepuNoticeCache ? (list.length + ' 条公告') : '待同步';
 }
 
-/** 「09:12 / 昨天 / 3 天前 / 11/2」。一列只有 34px，放不下「昨天 09:12」。 */
-function dingWhen(ms) {
-  const t = Number(ms) || 0;
-  if (!t) return '';
-  const d = new Date(t);
-  const d0 = new Date(d.getFullYear(), d.getMonth(), d.getDate());
-  const diff = Math.round((today0().getTime() - d0.getTime()) / 86400000);
-  const hm = ('0' + d.getHours()).slice(-2) + ':' + ('0' + d.getMinutes()).slice(-2);
-  if (diff <= 0) return hm;
-  if (diff === 1) return '昨天';
-  if (diff < 7) return diff + '天前';
-  return (d.getMonth() + 1) + '/' + d.getDate();
-}
-
-function dingPaint() {
-  const box = $('dingBox');
-  if (!box) return;
-  const api = dingApi();
-  const st = api ? api.state() : null;
-  box.hidden = !st;
-  if (!st) return;
-
-  const sub = $('dingSub');
-  const act = $('dingAct');
-  const list = $('dingList');
-  const granted = !!st.granted;
-
-  if (!granted) {
-    // 权限列表里那一项叫「航院通」，不叫钉钉 —— 这里把名字给出来，
-    // 用户才知道该勾哪一个。两家一起说：勾一次两个都收。
-    sub.textContent = '开启后，钉钉、完美校园的消息在这里也能看到';
-    act.textContent = '去开启';
-    act.dataset.act = 'grant';
-    list.hidden = true;
-    list.textContent = '';
-    return;
+function saveNepuNotices(raw) {
+  nepuNoticeError = raw.noticesError || '';
+  if (raw.notices && Array.isArray(raw.notices.items)) {
+    nepuNoticeCache = {items: Nepu.normalizeNotices(raw.notices.items), at: raw.notices.at || Math.floor(Date.now() / 1000)};
+    if (!store.set(NEPU_NOTICE_KEY, nepuNoticeCache)) nepuNoticeError = '公告已更新，本地缓存保存失败';
   }
-
-  const items = api.list();
-  if (!items.length) {
-    sub.textContent = '已开启，最近没有新消息';
-    act.textContent = '去钉钉';
-    act.dataset.act = 'open';
-    act.dataset.pkg = 'ding';
-    list.hidden = true;
-    list.textContent = '';
-    return;
-  }
-
-  // 条数写在副标题里：用户要能判断「是不是漏了」。
-  // 完美校园那条单独点一下 —— 校园卡的消费通知和「谁找我」不是一回事，
-  // 混在一个数字里，用户会以为钉钉里有一堆未读。
-  const nw = items.filter((i) => String(i.s || '') === 'wanxiao').length;
-  sub.textContent = '最近 ' + items.length + ' 条'
-    + (nw ? '（其中校园卡 ' + nw + ' 条）' : '')
-    + ' · 只存在本机，不上传';
-  // 有列表时这个按钮还是「清空」（用户最常想干的是清掉）。
-  // 「打开对应 App」挪到**点某一条**上 —— 点哪条就开哪个，比一个
-  // 固定写死「去钉钉」的按钮准。空列表时按钮才变「去…」。
-  act.textContent = '清空';
-  act.dataset.act = 'clear';
-  list.hidden = false;
-  list.innerHTML = items.slice(0, DING_SHOW).map((it) => {
-    const nm = esc(String(it.t || '通知'));
-    const tx = esc(String(it.x || ''));
-    const wx = String(it.s || '') === 'wanxiao';
-    return '<div class="dingitem' + (wx ? ' wx' : '') + '" data-app="'
-      + (wx ? 'wanxiao' : 'ding') + '">' +
-      '<span class="dt">' + dingWhen(it.w) + '</span>' +
-      '<span class="dx"><span class="dn">' + nm + '</span>' +
-      (tx ? '<span class="dc"> ' + tx + '</span>' : '') +
-      '</span></div>';
-  }).join('');
+  renderNepuNotices();
 }
 
-/** 钉钉的几个包名（和 Ding.PKGS、`<queries>` 是同一份）。
- *
- *  专有版排在最前：学校手机上装的是「郑州航院」那个（`rimet.zzhy`），
- *  官方通用版通常不在。hasApp / openApp 只认**精确包名**，所以只能一个个试。 */
-const DING_PKGS = [
-  'com.alibaba.android.rimet.zzhy',   // 郑州航院专有版（学校发的）
-  'com.alibaba.android.rimet',        // 官方通用版
-  'com.alibaba.work.android',         // 阿里郎/专属版
-];
-
-/** 拉起钉钉，真的起来了才回 true。
- *
- *  🔴 不能只写一个包名：认死 `rimet` 时，学校那台机器上「装了却说没装、
- *     点了没反应」—— 2026-11-13 用户拿真机 APK 来问，根因就是这。
- *  🔴 老 APK 没有 hasApp（回 'none'）时挨个试：openApp 认白名单，
- *     没装的回 notinstalled，不会把别的 App 拉起来。 */
-function dingOpen() {
-  const n = window.NativeApi;
-  if (!n || typeof n.openApp !== 'function') return false;
-  let list = DING_PKGS;
+async function openNepuNotice(it) {
+  const token = ++nepuNoticeSheetToken;
+  const body = $('sheetBody');
+  body.innerHTML = '<div class="sh-title">' + esc(it.title) + '</div><div class="sh-sub">' + esc(it.date) + '</div>' +
+    '<div class="ntd-body" id="nepuNoticeBody">正在读取教务原文…</div>';
+  const target = $('nepuNoticeBody');
+  $('sheetMask').hidden = false;
   try {
-    const got = DING_PKGS.filter((p) => n.hasApp(p) === '1');
-    if (got.length) list = got;
-  } catch (e) { /* 老壳：退回挨个试 */ }
-  for (const p of list) {
-    try {
-      if (n.openApp(p) === 'ok') return true;
-    } catch (e) { /* 试下一个 */ }
-  }
-  return false;
-}
-
-/** 完美校园的包名（和 Ding.PKGS、NativeBridge.ALLOWED_APPS、`<queries>` 同一份）。 */
-const WX_PKG = 'com.newcapec.mobile.ncp';
-
-/** 拉起完美校园，真的起来了才回 true。 */
-function wxOpen() {
-  const n = window.NativeApi;
-  if (!n || typeof n.openApp !== 'function') return false;
-  try {
-    return n.openApp(WX_PKG) === 'ok';
+    const result = await nepuBridgeCall('noticeDetail', it.id);
+    const doc = new DOMParser().parseFromString(String(result.data && result.data.html || ''), 'text/html');
+    const content = doc.querySelector('#content');
+    if (!content) throw new Error('公告正文结构已变化，请稍后重试');
+    content.querySelectorAll('script,style,iframe,object,embed').forEach(n => n.remove());
+    content.querySelectorAll('br').forEach(n => n.replaceWith(doc.createTextNode('\n')));
+    content.querySelectorAll('p,div,tr,li').forEach(n => n.appendChild(doc.createTextNode('\n')));
+    if (token !== nepuNoticeSheetToken || !target.isConnected || $('sheetMask').hidden) return;
+    target.textContent = content.textContent.replace(/\u00a0/g, ' ').replace(/\n[ \t]*\n[ \t]*\n/g, '\n\n').trim() || '公告正文为空';
+    const links = Array.from(content.querySelectorAll('a[href]')).map(a => ({title: a.textContent.trim(), href: a.getAttribute('href')}));
+    if (content.querySelector('img') || links.length) {
+      const note = document.createElement('p'); note.className = 'ntd-note';
+      note.textContent = '图片及附件请在教务系统原文中查看。'; body.appendChild(note);
+    }
+    const original = document.createElement('button'); original.className = 'btn'; original.textContent = '查看教务原文';
+    original.onclick = () => {
+      if (window.AndroidNepu && typeof window.AndroidNepu.openNotice === 'function') window.AndroidNepu.openNotice(it.id);
+      else toast('请使用新版东油通查看原文');
+    };
+    body.appendChild(original);
   } catch (e) {
-    return false;
+    if (token === nepuNoticeSheetToken && target.isConnected && !$('sheetMask').hidden) {
+      target.textContent = e.message || '公告读取失败，请重试';
+      if (/auth|login|session/i.test(e.kind || '')) {
+        nepuSession = false;
+        const login = document.createElement('button'); login.className = 'btn'; login.textContent = '登录教务';
+        login.onclick = () => { $('sheetMask').hidden = true; switchTab('accounts'); doNepuLogin(); };
+        body.appendChild(login);
+      }
+    }
   }
 }
 
-function enterNotice() {
-  dingPaint();       // 进来先画一次：从系统设置回来时就是靠这个刷新的
-  if (!NT.tried && ntCacheLoad()) renderNotice();
-  ntMarkSeen();      // 已经加载过的情况：renderNotice 不会再跑，这里补一刀
-  if (NT.loading) return;
-  const age = NT.at ? (Date.now() / 1000 - NT.at) : 1e9;
-  if (!NT.tried || age > 10 * 60) loadNotice(false);
+function enterNotice() { renderNepuNotices(); }
+
+async function syncNepuNotices() {
+  const button = $('nepuNoticeSync');
+  const generation = CACHE_GEN;
+  nepuNoticeError = '';
+  if (button) button.disabled = true;
+  $('nepuNoticeState').textContent = '正在同步教务公告…';
+  try {
+    const result = await nepuBridgeCall('syncNotices');
+    if (generation !== CACHE_GEN) return;
+    saveNepuNotices(result.data || {});
+    if (nepuNoticeError) toast(nepuNoticeError);
+  } catch (e) {
+    if (generation !== CACHE_GEN) return;
+    nepuNoticeError = e.message || '公告同步失败，已保留上次内容';
+    renderNepuNotices();
+  } finally {
+    if (button) button.disabled = false;
+  }
 }
 
 async function loadNotice(force) {
@@ -2865,73 +2439,7 @@ function openNotice(it) {
   if (!NT_DETAIL[it.url]) ntLoadDetail(it);
 }
 
-$('ntRefresh').addEventListener('click', () => { if (!NT.loading) loadNotice(true); });
-// 公告是「功能」页的子页，返回回那里（见 SUB_PARENT）
-$('ntBack').addEventListener('click', () => switchTab('campus'));
-$('ntRetry').addEventListener('click', () => loadNotice(true));
-
-/* 钉钉那一块上唯一一个按钮，四个状态共用一个位置（去开启 / 去钉钉 / 清空）。
-   用 `data-act` 分流，不绑三个监听 —— 三个监听都得自己判断"现在该不该响应"，
-   改一处漏两处。 */
-$('dingAct').addEventListener('click', () => {
-  const api = dingApi();
-  if (!api) return;
-  const act = $('dingAct').dataset.act;
-  if (act === 'grant') {
-    // 系统设置页只在"通知使用权"那一层，用户勾完按返回就回到这里。
-    // 拿不到（个别定制 ROM）就告诉他去哪找，别让人以为按钮坏了。
-    if (!api.grant()) toast('去 系统设置 → 通知 → 通知使用权 里打开');
-    return;
-  }
-  if (act === 'clear') {
-    api.clear();
-    dingPaint();
-    toast('已清空');
-    return;
-  }
-  if (act === 'open') {
-    if (!dingOpen()) toast('没找到钉钉');
-  }
-});
-
-/* 点某一条通知 → 打开**它来自的那个 App**（v15 起收两家）。
-   绑在容器上而不是每条上：列表每次重画都换 innerHTML，绑在条目上必然漏。 */
-$('dingList').addEventListener('click', (e) => {
-  const it = e.target && e.target.closest ? e.target.closest('.dingitem') : null;
-  if (!it) return;
-  if (it.dataset.app === 'wanxiao') {
-    if (!wxOpen()) toast('没找到完美校园');
-    return;
-  }
-  if (!dingOpen()) toast('没找到钉钉');
-});
-
-/* 从系统设置勾完回来，页面不会重新 enter 一次（我们是同一个 WebView），
-   所以要在这里补一刀。只在这一页才画，别的地方白算一次。 */
-document.addEventListener('visibilitychange', () => {
-  if (!document.hidden && CUR_PAGE === 'notice') dingPaint();
-});
-
-$('ntChips').addEventListener('click', (e) => {
-  const b = e.target.closest ? e.target.closest('.chip') : null;
-  if (!b || !b.dataset.tier || NT.tier === b.dataset.tier) return;
-  NT.tier = b.dataset.tier;
-  NT.showN = 4;      // 换了分类，首屏重新从 4 条开始
-  renderNotice();
-});
-$('ntList').addEventListener('click', (e) => {
-  // 「还有 N 条」—— 挂在 #ntList 上而不是按钮上：列表每次重画都会换掉
-  // innerHTML，绑在按钮上要每次重绑（漏一次就点不动）。
-  if (e.target.closest && e.target.closest('#ntMore')) {
-    NT.showN = 9999;
-    renderNotice();
-    return;
-  }
-  const card = e.target.closest ? e.target.closest('.ntitem') : null;
-  if (!card) return;
-  const it = NT.all.find((x) => x.url === card.dataset.url);
-  if (it) openNotice(it);
-});
+if ($('ntBack')) $('ntBack').addEventListener('click', () => switchTab('wiki'));
 
 // ------------------------------------------------------------------ 课表
 
@@ -2972,73 +2480,18 @@ function dayAnchor() {
   return addDays(startDate(), (w - 1) * 7 + wd);
 }
 
-/** 课表空着的时候这一屏该说什么。
- *
- *  用户 2026-11-06：「绑定完成之后莫名其妙显示去绑定，但事实上已经绑定了」。
- *
- *  🔴 根因不是判断写错，是**问的问题不对**：以前这段只问「本机有没有课表」，
- *     没有课表就说「还没绑定教务处账号」，还摆一颗「去绑定」。可「有没有课表」
- *     和「绑没绑」是两件事 —— 已绑定的人（界面上甚至还挂着「直接同步 ·
- *     2507****30」）照样被劝去绑一次，而他已经绑过了。
- *     按成绩页那三档的同一条原则分开说：
- *       ① 确实没绑         → 去绑定
- *       ② 绑了，本机还没有   → 直接同步（凭据在上一台机器/电脑上）
- *       ③ 绑了，也同步过了   → 是教务那边没课，别再催他绑
- *  🔴 ②③ 两档必须把「去绑定」**藏掉**。留着它，等于嘴上说「你已经绑了」，
- *     手上还递一张「去绑定」的票 —— 用户只会以为自己没绑上（这次报的就是这个）。
- *  ⚠️ BOUND === null（还没问到 / 网页版没有这个接口）按没绑走：这时候
- *     只有「去绑定」是真能走下去的那条路。
- */
+/** 空课表统一引导用户登录东油教务，再返回同步课表。 */
 function renderSchEmpty() {
   const box = $('schEmpty');
   if (!box) return;
-  const h = box.querySelector('h2');
-  const p = box.querySelector('p');
-  const bind = $('goBind');
-  const quick = $('goQuick');
-
-  // 「绑过」的证据有两个：BOUND 明确为真，或者本机躺着学籍数据。
-  // 后者用来兜 BOUND 还没回来（probeBound 不 await）的那几百毫秒。
-  const bound = BOUND === true ||
-    !!(DATA && DATA.profile && DATA.profile.studentId);
-  const synced = !!(DATA && (DATA.profile || DATA.courses));
-
-  if (!bound) {
-    h.textContent = '还没绑定教务处账号';
-    p.textContent = '绑定后课表成绩同步到手机，断网可看';
-    if (bind) bind.hidden = false;
-    if (quick) quick.hidden = true;
-    return;
+  box.querySelector('h2').textContent = '课表尚未同步';
+  box.querySelector('p').textContent = '登录东油教务后，返回这里同步课表。';
+  const login = $('goBind');
+  if (login) {
+    login.hidden = false;
+    login.textContent = '登录教务';
   }
-
-  if (!synced) {
-    // 换了手机、清了缓存：凭据还在，只是这台机器上什么都没有。
-    h.textContent = envText('这台电脑还没同步过', '这台手机还没同步过');
-    p.textContent = envText(
-      '电脑上存着账号，点下面同步一次，无需密码',
-      '点下方「同步」即可，无需再输密码。'
-    );
-    if (bind) bind.hidden = true;
-    if (quick) quick.hidden = false;
-    return;
-  }
-
-  // 🔴 「没读到」和「没有」必须分开说（2026-11-06）：
-  //    课表页开得开、但里面没编号（没分班 / 还没排课 / 页面改版）时，
-  //    以前一律显示「教务那边还没排出课」—— 那是把「我没读到」说成「学校没有」。
-  if (DATA && DATA.timetableError) {
-    h.textContent = '课表这次没读到';
-    p.textContent = DATA.timetableError + '。成绩和考试照常能看。';
-    if (bind) bind.hidden = true;
-    if (quick) quick.hidden = false;
-    return;
-  }
-
-  // 绑了、也同步过了，就是没有课 —— 新生开学前、放假、这学期没排课都会这样。
-  h.textContent = '还没有课表';
-  p.textContent = '教务还没排课，或这学期没课；点刷新重试';
-  if (bind) bind.hidden = true;
-  if (quick) quick.hidden = true;
+  if ($('goQuick')) $('goQuick').hidden = true;
 }
 
 /** 顶上那条「这次没读到，下面是上次同步的」。
@@ -3070,6 +2523,7 @@ function renderSchedule() {
   const hasData = allCourses().length > 0;
   $('schEmpty').hidden = hasData;
   if (!hasData) renderSchEmpty();
+  $('wkGutter').hidden = !hasData;
   $('gridWrap').hidden = !(hasData && CFG.view === 'week');
   $('dayWrap').hidden = !(hasData && CFG.view === 'day');
   // 视图切换按钮上写的是**当前**视图（周 / 日），点一下换成另一个。
@@ -4305,8 +3759,7 @@ function openDueItem(r, date) {
     return;
   }
   const isExam = r.kind === 'exam';
-  const srcWord = r.src === 'mooc' ? '中国大学 MOOC'
-    : (r.src === 'school' ? '教务系统' : '学习通');
+  const srcWord = r.src === 'school' ? '教务系统' : '学习通';
   const when = (r.at && r.at > 0)
     ? dueFullWhen(r.at)
     : ((date ? mdSlash(date) : '') + (r.when ? ' ' + r.when : '')).trim();
@@ -4948,15 +4401,7 @@ $('meAuto').addEventListener('click', () => openAutoSheet());
  *
  * ⚠️ 必须先判 `window.NativeApi`：网页版里 native.js 整块不执行
  *    （首行就是 `if (!window.Android) return;`），直接调会让整段点击处理器断掉。 */
-$('meHelp').addEventListener('click', () => {
-  if (NATIVE && window.NativeApi && typeof NativeApi.openWeb === 'function') {
-    let why = 'none';
-    try { why = NativeApi.openWeb(HELP_URL, '使用说明', false); }
-    catch (e) { why = 'fail: ' + ((e && e.message) || e); }
-    if (why === '') return;
-  }
-  if (!openExternal(HELP_URL)) toast('打不开浏览器，可以复制链接手动打开');
-});
+$('meHelp').addEventListener('click', () => toast('本地版本暂未提供在线说明'));
 $('rmBack').addEventListener('click', () => switchTab('schedule'));
 
 // ------------------------------------------------------------------ 成绩
@@ -5059,8 +4504,20 @@ function scoreNum(c) {
   return isNaN(n) ? NaN : n;
 }
 
+/** 汇总口径（加权绩点/已修学分/门数）。
+ *  同步时就已算好存在 DATA.grades.overall；旧缓存里没有这一项（早于本功能同步的），
+ *  就在渲染时按同一套 gradeStats 现算一遍，避免缓存用户看到一排「—」。 */
+function gradeOverall(g) {
+  if (!g || !g.courses || !g.courses.length) return {};
+  if (g.overall && (g.overall.gpa || g.overall.credits)) return g.overall;
+  if (window.Nepu && typeof Nepu.gradeStats === 'function') {
+    try { return Nepu.gradeStats(g.courses) || {}; } catch (e) { return {}; }
+  }
+  return {};
+}
+
 function renderGrades() {
-  const hasData = !!(DATA && DATA.grades && DATA.grades.courses && DATA.grades.courses.length);
+  const hasData = !!(DATA && DATA.source === 'nepu' && DATA.grades && DATA.grades.courses && DATA.grades.courses.length);
   $('grEmpty').hidden = hasData;
   $('grBody').hidden = !hasData;
   if (!hasData) {
@@ -5070,13 +4527,13 @@ function renderGrades() {
     //    新生第一学期走的永远是 ②，而 2026-11-01 之前后端把它当成了
     //    「登录态过期」，人连绑定都过不去 —— 所以这里必须说清楚是「没有分」。
     const g = (DATA && DATA.grades) || null;
-    const bound = !!(DATA && DATA.profile && DATA.profile.studentId) || BOUND;
+    const bound = !!(DATA && DATA.source === 'nepu');
     const h = $('grEmpty').querySelector('h2');
     const p = $('grEmpty').querySelector('p');
     const btn = $('goBind2');
     if (!bound) {
       h.textContent = '还没有成绩数据';
-      p.textContent = '绑定账号后会自动同步一次。';
+      p.textContent = '在账号管理中登录学校 WebVPN，再同步教务数据。';
       if (btn) btn.hidden = false;
     } else if (g && g.error) {
       h.textContent = '这次没读到成绩';
@@ -5091,7 +4548,7 @@ function renderGrades() {
   }
 
   const g = DATA.grades;
-  const o = g.overall || {};
+  const o = gradeOverall(g);
   $('grGpa').textContent = o.gpa || '—';
   $('grCredits').textContent = o.credits || '—';
   $('grCount').textContent = o.count || '—';
@@ -5177,7 +4634,7 @@ function renderGrades() {
     return '<div class="gradeitem">' +
       '<div class="gi-main"><div class="gi-name">' + esc(c.name) + '</div>' +
       '<div class="gi-meta">' + meta + '</div></div>' +
-      '<div class="gi-score' + cls + '"><b>' + esc(score) + '</b><span>绩点 ' + esc(c.gpa) + '</span></div>' +
+      '<div class="gi-score' + cls + '"><b>' + esc(score) + '</b><span>' + (c.gpaEstimated ? '估算绩点 ' : '绩点 ') + esc(c.gpa) + '</span></div>' +
       '</div>';
   }).join('') || ('<div class="gradeitem"><div class="gi-main"><div class="gi-meta">' +
     (q ? '没搜到「' + esc(gradeFind.trim()) + '」' : '这个学期没有成绩记录') +
@@ -5363,14 +4820,18 @@ function renderCredit() {
   $('crBody').hidden = !p.ok;
   if (!p.ok) {
     const t = $('crEmptyTitle'), d = $('crEmptyText');
-    if (!bound) {
-      t.textContent = '还没绑定账号';
-      d.textContent = '绑定后自动同步培养计划与成绩，算学分进度';
+    if (!hasPlan && DATA && DATA.source === 'nepu') {
+      t.textContent = '培养计划暂不可用';
+      const overall = gradeOverall(DATA.grades);
+      d.textContent = hasGrade
+        ? '已修学分 ' + (overall.credits || '—') + ' · ' + (overall.estimated ? '估算绩点 ' : '加权绩点 ') + (overall.gpa || '—')
+        : '成绩同步后显示已修学分。';
+    } else if (!bound) {
+      t.textContent = '培养计划暂不可用';
+      d.textContent = '当前教务数据未包含培养计划。';
     } else if (!hasPlan) {
       t.textContent = '培养计划没取到';
-      // 0.39.1：「这是附加信息」是在替用户判断要不要在意，去掉；
-      // 留「不影响课表和成绩」—— 这句才是他会担心的。
-      d.textContent = p.why + '。不影响课表和成绩。';
+      d.textContent = p.why;
     } else if (!hasGrade) {
       t.textContent = '还没有成绩';
       d.textContent = '没有成绩无法计算已修学分，请点右上角刷新。';
@@ -5378,7 +4839,6 @@ function renderCredit() {
       t.textContent = '算不出进度';
       d.textContent = p.why;
     }
-    $('goBind5').hidden = bound;
     return;
   }
 
@@ -5597,7 +5057,7 @@ function examEvent(e) {
   if (!blankField(e.category)) lines.push('类型 ' + String(e.category).trim());
   if (!blankField(e.code)) lines.push('课程号 ' + String(e.code).trim());
   if (!blankField(e.note)) lines.push('说明 ' + String(e.note).trim());
-  lines.push('来自「航院通」，以教务系统为准');
+  lines.push('来自「东油通」，以教务系统为准');
   return {
     title: '考试：' + String(e.name || '未命名课程').trim(),
     desc: lines.join('\n'),
@@ -5814,8 +5274,9 @@ function scheduleEvents() {
       return;
     }
     courseBlocks(c).forEach((b) => {
-      const st = hhmmToMin(tt[b.from] && tt[b.from][0]);
-      const en = hhmmToMin(tt[b.to] && tt[b.to][1]);
+      const hasRecordedTimes = c.source === 'nepu' && c.startTime && c.endTime;
+      const st = hasRecordedTimes ? hhmmToMin(c.startTime) : hhmmToMin(tt[b.from] && tt[b.from][0]);
+      const en = hasRecordedTimes ? hhmmToMin(c.endTime) : hhmmToMin(tt[b.to] && tt[b.to][1]);
       if (st == null || en == null || en <= st) {
         skipped.push(String(c.name || ''));
         return;
@@ -5825,7 +5286,7 @@ function scheduleEvents() {
         const base = new Date(day.getFullYear(), day.getMonth(), day.getDate()).getTime();
         const lines = [];
         if (c.teacher) lines.push('教师 ' + c.teacher);
-        lines.push('来自「航院通」，以教务系统为准');
+        lines.push('来自「东油通」，以教务系统为准');
         out.push({
           title: String(c.name || '课程'),
           desc: lines.join('\n'),
@@ -5879,7 +5340,7 @@ function exportScheduleIcs() {
     toast('课表还空着，没有可以导出的课');
     return;
   }
-  const name = ('航院通-课表-' + ymd(startDate())).replace(/[\\/:*?"<>|]/g, '_') + '.ics';
+  const name = ('东油通-课表-' + ymd(startDate())).replace(/[\\/:*?"<>|]/g, '_') + '.ics';
   const text = icsTextMulti(r.events, '-//HangYuanTong//Schedule//CN', '课表');
   shareCalendar(name, text, '已生成 ' + r.events.length + ' 次课，可导出到日历');
   if (r.skipped.length) {
@@ -5913,7 +5374,7 @@ function dueEvents() {
     const name = String(it.t || '').trim() || kind;
     out.push({
       title: kind + ' · ' + name,
-      desc: (it.c ? String(it.c) + '\n' : '') + '来自「航院通」，以学习通为准',
+      desc: (it.c ? String(it.c) + '\n' : '') + '来自「东油通」，以学习通为准',
       loc: '',
       begin: end - 15 * 60000,
       end: end,
@@ -5931,14 +5392,14 @@ function exportDueIcs() {
     toast('没有写截止时间的作业');
     return;
   }
-  const name = ('航院通-作业-' + ymd(today0())).replace(/[\\/:*?"<>|]/g, '_') + '.ics';
+  const name = ('东油通-作业-' + ymd(today0())).replace(/[\\/:*?"<>|]/g, '_') + '.ics';
   const text = icsTextMulti(evs, '-//HangYuanTong//Due//CN', '作业');
   shareCalendar(name, text, '已生成 ' + evs.length + ' 条，可导出到日历');
 }
 
 /** 网页版：把 .ics 下载下来。 */function downloadIcs(ev) {
   const base = String(ev.title).replace(/^考试[:：]\s*/, '');
-  const name = ('航院通-' + base + '-' + icsDay(ev.begin))
+  const name = ('东油通-' + base + '-' + icsDay(ev.begin))
     .replace(/[\\/:*?"<>|]/g, '_') + '.ics';
   const blob = new Blob([icsText(ev)], { type: 'text/calendar;charset=utf-8' });
   const url = URL.createObjectURL(blob);
@@ -6033,12 +5494,16 @@ function studyTerms() {
 
 /** 考试页的学期 chip 列表 = 在读的那几个学期（和课表页共用一份筛选）。 */
 function examTerms() {
+  if (DATA && DATA.source === 'nepu') {
+    const ex = DATA.exams || {};
+    return [{id: ex.semesterId || '', label: DATA.semester || '已同步学期'}];
+  }
   return studyTerms();
 }
 
 /** 某一学期的考试数据：当前学期用同步下来的那份，其余查缓存。 */
 function examBucket(sid) {
-  const ex = (DATA && DATA.exams) || null;
+  const ex = (DATA && DATA.source === 'nepu' && DATA.exams) || null;
   const curId = (ex && ex.semesterId) || '';
   if (!sid || sid === curId) return ex;
   return ((DATA && DATA.examsBySem) || {})[sid] || null;
@@ -6084,16 +5549,13 @@ function renderExamChips(terms) {
  * 🔴 选中的视图记进 CFG（`examView`）：连着看成绩的那几天，
  *    不该每次进来都先点一下「成绩」。默认是「学习通」。
  */
-const EX_VIEWS = ['cx', 'mooc', 'exam', 'grade', 'credit'];
-// 这个映射就是「分类」本身。改分类只改这里，不用动渲染。
+const EX_VIEWS = ['cx', 'exam', 'grade', 'credit'];
 const EX_GROUP = {
-  cx: '外部平台', mooc: '外部平台',
+  cx: '外部平台',
   exam: '学校平台', grade: '学校平台', credit: '学校平台',
 };
-const EX_NAME = { cx: '学习通', mooc: '中国大学 MOOC',
-                  exam: '考试', grade: '成绩', credit: '学分' };
-// 页面标题跟着选中的那一格走；外部平台那两格都叫「学习」
-const EX_HEAD = { cx: '学习', mooc: '学习', exam: '考试', grade: '成绩', credit: '学分' };
+const EX_NAME = { cx: '学习通', exam: '考试', grade: '成绩', credit: '学分' };
+const EX_HEAD = { cx: '学习', exam: '考试', grade: '成绩', credit: '学分' };
 
 /** 导航条：同一组里的连着画，组与组之间画一道竖线。
  *
@@ -6150,9 +5612,6 @@ function renderExamView() {
   $('exHead').textContent = EX_HEAD[v] || '学习';
   renderExNav(v);
   if (v === 'cx') cxPaint();
-  // 进这一格就顺手读一次（moocEnter 内部自己防重入、按新鲜度决定要不要重扫）。
-  // 🔴 这里不能只写 moocPaint：那只会把「正在读」画出来，没人去读。
-  if (v === 'mooc') moocEnter();
   if (v === 'grade') renderGrades();
   if (v === 'credit') renderCredit();
 }
@@ -6164,7 +5623,7 @@ function setExamView(v) {
 }
 
 function renderExams() {
-  const ex = (DATA && DATA.exams) || null;
+  const ex = (DATA && DATA.source === 'nepu' && DATA.exams) || null;
   const curId = (ex && ex.semesterId) || '';
   const terms = examTerms();
   if (!examTerm) examTerm = curId;
@@ -6189,14 +5648,14 @@ function renderExams() {
 
   if (!has) {
     if (loading) return;
-    const bound = !!(DATA && DATA.profile && DATA.profile.studentId);
+    const bound = !!(DATA && DATA.profile && DATA.profile.studentId) || !!(DATA && DATA.source === 'nepu');
     const title = $('exEmptyTitle');
     const text = $('exEmptyText');
     $('goBind3').hidden = bound;
     $('exRetry').hidden = !(bound && err);
     if (!bound) {
       title.textContent = '还没绑定账号';
-      text.textContent = '绑定教务处账号后，会自动同步这个学期的考试安排。';
+      text.textContent = '前往账号管理登录学校 WebVPN，再同步考试安排。';
     } else if (err) {
       title.textContent = which ? (which + '的考试没取到') : '考试安排没取到';
       text.textContent = '教务系统那边出了点问题：' + err;
@@ -6204,11 +5663,11 @@ function renderExams() {
       title.textContent = which ? (which + '没有考试安排') : '这一学期没有考试安排';
       text.textContent = '教务系统本学年无排考数据，请切换学期查看。';
     } else {
-      title.textContent = '学校还没发布考试安排';
+      title.textContent = DATA && DATA.source === 'nepu' ? '该学期暂无考试安排' : '学校还没发布考试安排';
       // 0.39.1：原来这句后半截是「这不是漏同步 —— 等学校排好考，点右上角刷新
       // 就有了」。前半截是在解释**我们的同步没坏**，用户没怀疑过这件事；
       // 后半截才是他要做的。留后半截（「点右上角刷新」给了动作）。
-      text.textContent = '等学校排好考，点右上角刷新。';
+      text.textContent = DATA && DATA.source === 'nepu' ? '学校发布后，点右上角刷新同步。' : '等学校排好考，点右上角刷新。';
     }
     return;
   }
@@ -6340,7 +5799,7 @@ function selectExamTerm(sid) {
  *     下次进考试页会重新试一遍。
  */
 async function loadExamTerm(sid) {
-  if (!sid) return;
+  if (!sid || (DATA && DATA.source === 'nepu')) return;
   // 单飞：一次只发一个请求，别把学校服务器打成并发的。
   // 取数期间又点了别的学期就记下来，这一次结束再补。
   if (examLoading) { examPending = sid; return; }
@@ -6854,6 +6313,8 @@ function renderRoomResult() {
 }
 
 function renderRooms() {
+  toast('东油适配中');
+  return;
   const bound = !!(DATA && DATA.profile && DATA.profile.studentId);
   $('rmEmpty').hidden = bound;
   $('rmMain').hidden = !bound;
@@ -6958,6 +6419,8 @@ async function queryRooms() {
 // ------------------------------------------------------------------ 我的
 
 function renderMe() {
+  const oldLogin = document.querySelector('#meUnbound .bindcard');
+  if (oldLogin) oldLogin.hidden = true;
   // 版本号在 HTML 里只留一个占位（「—」），真值从 APP_VERSION 来。
   // 写死在 HTML 里的话，改版本号就会漏掉这一处。
   // 测试版单独标出来：装的是手上这版、还是商店/群里那个正式版，
@@ -7012,12 +6475,6 @@ function renderMe() {
   //    「为什么还是已连三个」。数字和账号页必须是同一份数据，否则加一行
   //    账号就必然漏一次，且不报错、没人发现。
   paintAccCount();
-  // 🔴 财务处的状态是**本机存的**（读一下就有，不打学校服务器），
-  //    但它默认要等开机预热 1.2 秒才读。人一点进「我的」，这行就已经画完了，
-  //    数字里少一个财务处 —— 判据就是这么红的（'已连 2 个'，该是 3 个）。
-  //    没读过就顺手读一次，读完把数字补上。
-  if (!CW.at) cwStateRefresh(false).then(paintAccCount);
-
   if (!bound) return;
 
   const p = DATA.profile;
@@ -7251,7 +6708,7 @@ async function loadTodo(force) {
       //    免修」四项开放状态（`{key,name,state,text,detail}`），一条 endAt
       //    都没有。0.47.8 起误把它当作业源喂给 dueCacheSave，过滤后恒为空，
       //    而且每次都把这个空表**写回去**——学习通刚存好的作业被它抹掉。
-      //    作业来自 `/api/cx/todo` / `/api/mooc/todo`，在那两处存。
+      //    作业来自 ``/api/cx/todo`，在那两处存。
       remindPush();
     }
   } catch (e) {
@@ -8023,28 +7480,21 @@ function widgetPush() {
  * 🔴 只留**还没过期**的，每个来源最多 60 条。整份扫描结果有几百 KB，
  *    塞进 localStorage 会跟课表抢空间（存储满了要牺牲公告缓存）。
  *
- * 🔴 `src` 是必需的，不是可选装饰：学习通和中国大学 MOOC 各自扫各自的，
- *    谁先扫完谁就先写。不按来源分，后扫完的那个会把前一个整体盖掉 ——
- *    两边的作业只留得下一边，而且不报错，看起来就像「有的作业没标出来」。
- *    老缓存没有 `s` 字段，一律当学习通（它是最早也是主要的来源）。
+ * 🔴 截止时间缓存只保存学习通的数据；旧缓存中其他来源的条目会随本次写入清除。
  *
- * 🔴 数据源只能是**带 endAt 的作业项**（`/api/cx/todo` 的 `data.items`、
- *    `/api/mooc/todo` 的 `data.items`）。`/api/todo` 那个接口给的是教务的
+ * 🔴 数据源只能是**带 endAt 的作业项**（`/api/cx/todo` 的 `data.items`）。`/api/todo` 那个接口给的是教务的
  *    「选课 / 评教 / 免听 / 免修」四项开放状态，里面根本没有 endAt ——
  *    0.47.8 起误接到这里，过滤后恒为空串，于是作业提醒一次都没响过、
  *    课表上一颗刻度也没有，而且全程不抛异常（2026-11-13 用户报「刷新了
  *    学习通还是没有」才翻出来）。别看着「todo」两个字就往回接。
  */
-function dueCacheSave(items, src) {
+function dueCacheSave(items) {
   try {
     const now = Date.now() / 1000;
-    const who = src === 'mooc' ? 'mooc' : 'cx';
+    const who = 'cx';
     const keep = (items || []).filter((it) =>
       it && it.kind !== 'sign' && it.endAt && Number(it.endAt) > now
-      // 已经交过的不要：两个来源都有 `state`（done / todo / expired），
-      // 只按「没到截止」筛的话，交了但还没到期的作业照样会在课表上标一颗
-      // 刻度、照样提前两小时提醒 —— 标了却不用交，比不标更让人不放心。
-      // 没有 state 的老数据当「没交」留着（宁可多标一条，不丢）。
+      // Keep submitted items hidden; retain older rows without a state.
       && it.state !== 'done'
     ).slice(0, 60).map((it) => ({
       t: String(it.title || '').slice(0, 40),
@@ -8058,15 +7508,10 @@ function dueCacheSave(items, src) {
       // 2026-11-14：条目自己的页面地址（学习通给的，带 courseId/activeId）。
       // 课表上点开「这条作业」时拿它跳过去 —— 不带路径的话只能落到课程列表，
       // 用户还得自己翻到第几章，那等于没帮上忙。
-      // 只在**学习通那一路**有；MOOC 和教务的考试留空。
+      // Only Learning通 provides a destination URL.
       u: String(it.url || '').slice(0, 300),
     }));
-    // 另一来源的、还没过期的原样留着（见上面「按来源分」那段）。
-    const old = store.get(KEY.due, null);
-    const other = ((old && old.list) || []).filter((it) =>
-      it && (it.s || 'cx') !== who && Number(it.e) > now);
-    const list = other.concat(keep).sort((a, b) => Number(a.e) - Number(b.e));
-    store.set(KEY.due, { at: Math.floor(now), list: list.slice(0, 90) });
+    store.set(KEY.due, { at: Math.floor(now), list: keep.sort((a, b) => Number(a.e) - Number(b.e)).slice(0, 90) });
     // 课表那边的「哪天有截止」索引跟着作废（见 dueIndex）。
     try { _dueIdx = null; } catch (e) {}
     // 🔴 数据是**晚到**的：课表在开机那一瞬就画完了，`/api/todo` 要十几秒才回来。
@@ -8312,7 +7757,7 @@ $('btnWidget').addEventListener('click', () => {
     '<ol class="howto">' +
     '<li>回到手机桌面，长按空白处（不要长按图标）</li>' +
     '<li>点「小组件」（部分手机叫「小部件」）</li>' +
-    '<li>在列表里找「航院通」，按住拖到桌面上</li>' +
+    '<li>在列表里找「东油通」，按住拖到桌面上</li>' +
     '</ol>' +
     '<p class="tip note">列表里找不到的话，先打开一次本应用再回来找 —— ' +
     '系统要等应用跑过一次，才会把它列进去。</p>' +
@@ -8385,47 +7830,7 @@ function openTimeEdit() {
   });
 }
 
-/* 余额提醒：阈值 + 开关。
- *
- * 2026-10-22 用户要求从「我的 → 设置」搬进「校园」页的一卡通余额卡里。
- * 原来那句「校园页是看数据的，放开关会让人以为提示能点」的判断，用户推翻了 ——
- * 想调阈值的时候人正看着余额，却要跑去另一个页面找，那才是别扭。
- * 所以现在它就在余额卡里，和它管的那个数字同屏。
- */
-$('yktAlert').addEventListener('click', () => {
-  const on = !!CFG.alertOn;
-  const cur = Number(CFG.alertLow) > 0 ? Number(CFG.alertLow) : 20;
-  $('sheetBody').innerHTML =
-    '<div class="sh-title">余额提醒</div>' +
-    '<div class="sh-sub">一卡通余额低于这个数时，「校园」页会提醒你。</div>' +
-    '<label class="field"><span>阈值（元）</span>' +
-    '<input id="alVal" type="number" inputmode="decimal" min="1" max="999" step="1" ' +
-    'value="' + cur + '"></label>' +
-    '<div class="sheetbtns">' +
-    '<button class="btn" id="alToggle">' + (on ? '关闭提醒' : '恢复提醒') + '</button>' +
-    '<button class="btn primary" id="alSave">保存</button></div>' +
-    '<p class="tip" id="alTip"></p>';
-  $('sheetMask').hidden = false;
-  const tip = (s) => { $('alTip').textContent = s || ''; };
-  $('alToggle').addEventListener('click', () => {
-    CFG.alertOn = !on;
-    store.set(KEY.settings, CFG);
-    $('sheetMask').hidden = true;
-    renderCampus(); renderMe();
-    toast(CFG.alertOn ? '已开启余额提醒' : '已关闭余额提醒');
-  });
-  $('alSave').addEventListener('click', () => {
-    const v = Number($('alVal').value);
-    // 🔴 不兜底：填了个看不懂的值就说看不懂，别悄悄当成 20
-    if (!isFinite(v) || v <= 0 || v > 999) { tip('填 1 到 999 之间的数'); return; }
-    CFG.alertLow = v;
-    CFG.alertOn = true;
-    store.set(KEY.settings, CFG);
-    $('sheetMask').hidden = true;
-    renderCampus(); renderMe();
-    toast('余额低于 ' + v + ' 元时提醒');
-  });
-});
+
 
 /* ---------------------------------------------------------------- 账号管理
  *
@@ -8443,22 +7848,15 @@ $('yktAlert').addEventListener('click', () => {
 
 /** 三套系统的状态，只在这里归一，别在渲染里各判一遍。 */
 function accState() {
-  const bound = !!(DATA && DATA.profile && DATA.profile.studentId);
   return {
-    jw: bound ? 'on' : 'off',
-    // expired = 连过、门票过期。它还认这个人（身份证在），所以算「已连接」，
-    // 只是要重新验一次 —— 别显示成「没连」，那会让人以为白连了。
-    portal: CAMPUS.state === 'ok' ? 'on'
-      : (CAMPUS.state === 'expired' ? 'expired'
-        : (CAMPUS.state === 'none' ? 'off' : 'unknown')),
+    school: nepuSession ? 'on' : 'off',
     cx: CX.state === 'ok' ? 'on' : (CX.state === 'none' ? 'off' : 'unknown'),
   };
 }
 
 const ACC_SYS = [
-  { id: 'jw', k: '教务系统', host: 'jwglxt.zua.edu.cn' },
+  { id: 'school', k: '东油教务', host: '' },
   { id: 'cx', k: '学习通', host: 'chaoxing.com' },
-  { id: 'portal', k: '智慧门户', host: 'rhmh.zua.edu.cn' },
 ];
 
 /* 慧生活那两个账号的状态是 `/api/water/state` 给的，以前只有进「功能」页
@@ -8492,66 +7890,21 @@ async function wtStateRefresh(force) {
  */
 function accRows() {
   const st = accState();
-  const p = (DATA && DATA.profile) || {};
-  // 每一行的「状态文字」和「按钮文字」。unknown 不写成「没连」——
-  // 还没问到和确实没连是两件事（红线：不许把未知兜底成正常/异常）。
   const say = {
-    jw: st.jw === 'on'
-      ? '已绑定' + (p.name ? ' · ' + p.name : '') + (p.studentId ? ' · ' + p.studentId : '')
-      : '还没绑定',
+    school: st.school === 'on' ? '本次同步已验证会话' : (DATA && DATA.source === 'nepu' ? '有本地数据 · 未验证会话' : '尚未登录'),
     cx: st.cx === 'on'
       ? '已登录' + (CX.user ? ' · ' + CX.user : '')
       : (st.cx === 'unknown' ? '还没查过' : '还没登录'),
-    portal: st.portal === 'on'
-      ? '已连接' + (CAMPUS.user ? ' · ' + CAMPUS.user : '')
-      : (st.portal === 'expired' ? '已连接 · 登录过期了'
-        : (st.portal === 'unknown' ? '还没查过' : '还没连接')),
   };
-  const act = {
-    jw: st.jw === 'on' ? '解绑' : '去绑定',
-    cx: st.cx === 'on' ? '断开' : '连接',
-    portal: st.portal === 'on' ? '断开' : (st.portal === 'expired' ? '重连' : '连接'),
-  };
-
-  /* 六行 = 三个学校系统 + 完美校园 + 慧生活的两个账号。
-   *
-   * 🔴 2026-11-13 用户原话：「账号管理改回类似 3/4 的样子，惠生活的两个登录
-   *    视为两个账号」。以前慧生活那两行单独占一张卡、还带一句「两个账号各管一半」，
-   *    看上去像「一个东西的两个部分」；其实它们是**两个独立账号**
-   *    （设备账号管接水和余额、积分账号管积分任务），各有自己的登录和退出。
-   *    现在和别的账号在同一张卡里，一行一个，各登各退。
-   */
+  const act = { school: st.school === 'on' ? '同步' : '登录', cx: st.cx === 'on' ? '断开' : '连接' };
   const rows = ACC_SYS.map((s) => ({
     id: s.id, k: s.k,
     on: st[s.id] === 'on', warn: st[s.id] === 'expired',
-    text: say[s.id], act: act[s.id],
+    text: say[s.id], act: act[s.id] || '',
   }));
 
-  // 财务处（2026-11-16 用户：「把登录财务处的账号也归入账号管理」）。
-  // 它的密码和教务、学习通都不是一套，本来就是**第四个学校账号**，
-  // 却只在「校园服务 → 缴费」那条路上要人临时输一次 —— 输完就没处管了。
-  // 🔴 排在三个学校系统后面、第三方前面：用户是靠位置认这几行的。
-  // 🔴 学号显示用后端打过码的那份（`CW.st.xh`），别在这儿再拼一遍。
-  rows.push({
-    id: 'cw', k: '财务处',
-    on: !!CW.on,
-    // 🔴 `broken` = 本机存着登录、但这次读不出来了（Keystore 换过 / 数据被清）。
-    //    以前这种情况被当成「没登录」，界面和真没登录一模一样 ——
-    //    用户的体验就是「我明明登过，为什么又要登」，而且一句解释都没有。
-    warn: !!CW.broken,
-    text: CW.on
-      ? ('已连接' + (CW.st && CW.st.xh ? ' · ' + CW.st.xh : ''))
-      : (CW.broken ? '本机存着登录，这次读不出来 · 请重新登录'
-                   : '还没登录 · 查欠费、电费要用它'),
-    act: CW.on ? '断开' : (CW.broken ? '重新登录' : '登录'),
-  });
-
-  // 完美校园（v15）
-  const w = wxRow();
-  rows.push({ id: 'wx', k: '完美校园', on: w.on, text: w.text, act: w.act });
-
-
   // 慧生活：两个账号，各自独立
+  if (typeof CX === 'undefined' || typeof WT === 'undefined') return;
   const wtDev = (WT.accounts && WT.accounts.device) || null;
   const wtSco = (WT.accounts && WT.accounts.score) || null;
   const wtKnown = wtStateAt > 0 || !!wtDev || !!wtSco;
@@ -8562,8 +7915,6 @@ function accRows() {
                 : (wtKnown ? '还没登录 · 接水、余额要用它' : '还没查过'),
     act: wtDev ? '退出' : '登录',
   });
-  // 财务处那行整行也能点（2026-11-16）：用户在那儿看到「已连接」，下一步
-  // 想看的是欠费和用电明细，不是另一个「断开」按钮。按钮仍然只管断开。
   rows.push({
     id: 'wt-score', k: '慧生活 · 积分',
     on: !!wtSco,
@@ -8613,22 +7964,15 @@ function renderAccounts() {
 
 $('accList').addEventListener('click', (e) => {
   const b = e.target && e.target.closest ? e.target.closest('[data-acc]') : null;
-  if (!b) {
-    // 财务处那行**整行可点**：点内容看欠费和明细，点右边按钮才断开。
-    // 🔴 按钮优先判（上面那道 if）—— 点「断开」时不能顺手把明细弹出来。
-    const row = e.target && e.target.closest ? e.target.closest('[data-row="cw"]') : null;
-    if (row) cwOpenMine();
-    return;
-  }
+  if (!b) return;
   const who = b.dataset.acc;
   if (who === 'wt-device' || who === 'wt-score') {
     // 已登录 → 退出；没登录 → 就地展开登录表（和以前那两个按钮同一个动作）
     wtAccTap(who === 'wt-score' ? 'score' : 'device');
     return;
   }
-  if (who === 'jw') {
-    // 未绑定时没有可解绑的东西 ⇒ 回「我的」让他在那张表单上绑
-    if (accState().jw === 'on') unbindJw(); else switchTab('me');
+  if (who === 'school') {
+    (nepuSession ? doSync() : doNepuLogin());
     return;
   }
   if (who === 'cx') {
@@ -8642,196 +7986,31 @@ $('accList').addEventListener('click', (e) => {
     renderExamView();
     return;
   }
-  if (who === 'portal') {
-    if (CAMPUS.state === 'ok') { unbindPortal(); return; }
-    openPortalSheet();     // expired 也是这条路：重连只要一道验证码
-  }
-  if (who === 'cw') {
-    // 已连接 → 断开（清掉本机存的财务处凭据）；没连 → 就地登录。
-    // 🔴 不进另一屏：账号管理这一屏的目标就是「在这儿把账号管完」。
-    if (CW.on) { cwDisconnect().then(renderAccounts); return; }
-    cwLoginSheet(CW.broken ? '本机存着上次的登录，这次读不出来，请重新登录。' : '');
-    return;
-  }
-  if (who === 'wx') {
-    const api = wxApi();
-    if (!api) return;
-    const st = api.state();
-    // 已登录时点「查看」进详情（余额 + 身份），退出收进详情里 ——
-    // 主入口和「退出」并排是最容易误触的一种摆法。
-    if (st && st.on) { openWxInfo(); return; }
-    openWxSheet();
-  }
 });
 
 $('rowAccounts').addEventListener('click', () => switchTab('accounts'));
 
-/* ------------------------------------------------- 完美校园（校园卡，v15）
- *
- * 这里只做一件事：用**用户自己的账号**登一次，把「我是谁」显示出来。
- * 余额和流水不走这条路 —— 完美校园的账目接口没有公开，靠猜找不到；
- * 账单在通知里（消费/充值都会推一条，带金额和余额），见公告页那块。
- *
- * 🔴 网页版（浏览器）没有 window.Android ⇒ NativeApi.wx.state() 返回 null，
- *    整张卡片直接不显示。不能显示成「没登录」，那会让浏览器用户
- *    去点一个永远登不上的表单。
- */
-function wxApi() {
-  // 🔴 必须走 window.NativeApi 并判空：网页版里 native.js 整块**不执行**
-  //    （它开头就是 `if (!window.Android) return;`），`NativeApi` 这个标识符
-  //    根本不存在 —— 直接写 `NativeApi.wx` 会抛 ReferenceError，
-  //    连带把 renderAccounts 一起打断，「账号」页在浏览器里就是白屏。
-  const n = window.NativeApi;
-  return (n && n.wx) ? n.wx : null;
-}
-
-/** 完美校园那一行现在是什么状态。
- *
- *  返回 null = 这个壳没有账号能力（网页版 / 老 APK）。这时那一行**仍然要画**，
- *  只是不给按钮、写「要在手机上登录」—— 不能放一个点了没反应的「登录」，
- *  更不能整行藏起来（网页版和 App 的页面高度就一样了，`check_one_screen`
- *  量到的才是真机的高度）。
- */
-function wxRow() {
-  const api = wxApi();
-  // 🔴 判空不够，还要判**方法在不在**（2026-11-16）：老壳 / 测试替身里
-  //    `NativeApi.wx` 可能是个 {}，直接 `api.state()` 会抛
-  //    「api.state is not a function」，整屏账号管理跟着崩。
-  //    而 `paintAccCount()` 每次都要过这里，等于把「我的」页也拖下水。
-  const st = (api && typeof api.state === 'function') ? api.state() : null;
-  if (!st) return { on: false, text: '要在手机上登录', act: '' };
-  if (!st.on) return { on: false, text: '还没登录', act: '登录' };
-  // 学号也摆出来：这是「真登上了」最直接的一条证据 ——
-  // 只写一个名字的话，用户没法确认它拿到的是不是他那个人。
-  return { on: true,
-           text: '已登录' + (st.name ? ' · ' + st.name : '') +
-                 (st.stuNo ? ' · ' + st.stuNo : ''),
-           act: '查看' };
-}
-
-/* ---------------- 顶部两张小卡：饮水 / 宿舍电费（2026-11-16） ----------------
- *
- * 2026-11-13 这里原本是「饮水 / 校园卡」，用户 2026-11-16 换掉了右边那张：
- *   「把功能页面顶部那个校园卡余额默认隐藏在其他地方吧，太没用了，
- *     在航院通登录完美校园会和官方 APP 抢登录，把那个位置换成宿舍电费」。
- * ⇒ 校园卡入口只剩「我的 → 账号管理 → 完美校园」那一行（点「查看」进弹层），
- *   而且进页面时**不再自动查余额** —— 完美校园单会话，查一次就把用户手机上
- *   官方 App 顶下去。
- *
- * 🔴 这两张是**入口**，不是账本：一眼看到两个钱包各剩多少，点哪张进哪边。
- *    所以余额只在卡上写一个数，明细一律进弹层 —— 功能页已经很长，
- *    把消费记录再铺一张卡上去，用户又要滑三屏。
- * 🔴 完美校园的余额**当场查**、查完缓存 10 分钟：钱会变，缓存太久就是假话；
- *    但每次进页面都打一次接口也没必要（学校那边一次要一两秒）。
- * 🔴 查不到绝不写 ¥0.00，写「点开查看」/「没读到」。
- */
-const WXC = { bal: null, err: '', at: 0, busy: false, tried: false };
-const WXC_TTL = 10 * 60 * 1000;
-
-/** 金额统一两位小数。原生的余额可能是个字符串（"123.4"），别 toFixed 到崩溃。 */
-function money2(v) {
-  const n = Number(v);
-  return (isFinite(n) ? n : 0).toFixed(2);
-}
-
+/* 饮水钱包摘要；点击后进入慧生活798的账单页面。 */
 function paintMiniWallets() {
   const wv = $('mcWaterV');
   if (!wv) return;
   const ws = $('mcWaterS');
-
-  // ---- 饮水（慧生活798 的饮水钱包）----
   if (typeof WT.bal === 'number' && isFinite(WT.bal)) {
     wv.textContent = '¥' + WT.bal.toFixed(2);
     wv.className = 'mc-v';
-    // 副标题写「多久之前更新的」——这个数是当场读回来的，不是存下来的，
-    // 用户得知道它有多新。没读过就退回说这里点开是什么。
     ws.textContent = WT.loadedAt
       ? '接水 · ' + agoText(WT.loadedAt / 1000) + '更新'
       : '接水 · 消费记录';
   } else {
-    // 「没登录」和「登录了但没读到」是两件事，该做的事相反。
-    // 🔴 这里看的是**设备账号**（余额属于设备那个账号），不是「两个里有一个」：
-    //    只登了积分账号时余额当然读不出来，但那是「没登这个账号」——
-    //    要说「登录后看余额」，不能说「没读到」（用户会去刷新，回来还是空）。
     const dev = !!(WT.accounts && WT.accounts.device);
     wv.textContent = dev ? '没读到' : '未登录';
     wv.className = 'mc-v unknown';
     ws.textContent = dev ? '点开重试' : '登录后看余额';
   }
-
-  // ---- 宿舍电费（财务处，2026-11-16 顶掉校园卡那一格）----
-  // 🔴 为什么换人：用户原话「在航院通登录完美校园会和官方 APP 抢登录」。
-  //    完美校园是**单会话**，我们查一次余额，手机上官方 App 就被顶下去 ——
-  //    一张「看看还剩多少钱」的小卡不值得让人在别的 App 里重新登录。
-  //    电费是财务处的账，同一个学期里不会因为谁登了一下就失效。
-  const ev = $('mcElecV');
-  const es = $('mcElecS');
-  if (!ev) return;
-  const rm = (CW.on && CW.st && CW.st.room) || null;
-  if (!CW.on) {
-    ev.textContent = '未登录';
-    ev.className = 'mc-v unknown';
-    es.textContent = '登录后看电量';
-  } else if (rm && rm.balance != null && rm.balance !== '') {
-    // 🔴 这个数是**度**，不是元（2026-11-16 用户纠正：「那个剩余的是度，不是元」）。
-    //    平台给的是剩余电量，充值才按元算。写「¥」会让人以为余额还能刷两顿。
-    ev.textContent = money2(rm.balance) + ' 度';
-    ev.className = 'mc-v';
-    // 房间名写在这里：同一栋楼两个房间的余量差得远，不写清楚会看错。
-    // 2026-11-16 精简：下面再补一句「剩余电量」是重复 —— 上面那个「度」
-    // 已经说明这是电量，第三行只留房间号（用户在弹层里也是这么排的）。
-    es.textContent = rm.label || '点开选房间';
-  } else {
-    // 登录了但还没选房间 ⇒ 这不是「没读到」，是**还没告诉我们是哪间**。
-    ev.textContent = '选房间';
-    ev.className = 'mc-v unknown';
-    es.textContent = '电量按房间算';
-  }
-}
-
-/** 查一次校园卡余额（带缓存）。force=true 时无视缓存。 */
-async function wxCardLoad(force) {
-  const api = wxApi();
-  if (!api || typeof api.card !== 'function') return;
-  const st = api.state();
-  if (!st || !st.on) { WXC.bal = null; WXC.err = ''; paintMiniWallets(); return; }
-  if (WXC.busy) return;
-  if (!force && WXC.tried && (Date.now() - WXC.at) < WXC_TTL) return;
-  WXC.busy = true;
-  try {
-    const r = await api.card();
-    WXC.tried = true;
-    WXC.at = Date.now();
-    if (r && r.ok) {
-      const n = Number(r.balance);
-      WXC.bal = isFinite(n) ? n : null;
-      WXC.err = isFinite(n) ? '' : '余额那边回的不是数字';
-    } else {
-      WXC.bal = null;
-      WXC.err = (r && r.msg) || '余额没查到';
-    }
-  } catch (e) {
-    WXC.tried = true;
-    WXC.at = Date.now();
-    WXC.bal = null;
-    WXC.err = (e && e.message) || '余额没查到';
-  }
-  WXC.busy = false;
-  paintMiniWallets();
-  // 弹层如果正开着，把里面的余额也刷成同一个数（别一处新一处旧）
-  const v = $('wxBalV');
-  if (v) {
-    v.textContent = (typeof WXC.bal === 'number') ? '¥ ' + money2(WXC.bal) : '查不到';
-    const tip = $('wxBalTip');
-    if (tip && WXC.err) { tip.textContent = WXC.err; tip.hidden = false; }
-  }
 }
 
 if ($('mcWater')) {
   $('mcWater').addEventListener('click', () => {
-    // 还没登慧生活 → 直接把登录卡滚到眼前（那一块里写着去哪登）；
-    // 登了就把「消费记录」那一行滚过来 —— 余额已经在这张卡上了，
-    // 点开的下一步永远是「这个月花了多少」，不是再看一眼同一个数。
     const target = ($('waterOn') && !$('waterOn').hidden)
       ? ($('wtBillOpen') || $('waterOn')) : $('wtNeedLogin');
     if (target && target.scrollIntoView) {
@@ -8839,329 +8018,7 @@ if ($('mcWater')) {
     }
   });
 }
-if ($('mcElec')) {
-  // 点这一格的下一步**永远是具体那一间**：没登录先登，登录了没选房间先选，
-  // 都有了才给明细。三级都在一个动作上，别让人先想「我现在缺哪一步」。
-  $('mcElec').addEventListener('click', () => {
-    if (!CW.on) {
-      cwLoginSheet(CW.broken ? '本机存着上次的登录，这次读不出来，请重新登录。' : '');
-      return;
-    }
-    const rm = CW.st && CW.st.room;
-    if (!rm) { cwPickRoom(); return; }
-    cwBillSheet(CW.st);
-  });
-}
 
-
-/** 完美校园登进去之后能干什么。
- *
- *  🔴 只在那行写「已登录」等于什么也没给 —— 用户会问「然后呢」。
- *     这一层回答三件事：我是谁（学号/学校/班级）、卡里还剩多少钱、
- *     消费提醒在哪儿看。
- *
- *  🔴 余额是**当场查**的，不是登录时存下来的数：钱会变，存下来的那个数
- *     第二天就是假话。查的过程中写「查询中…」，查不到就写查不到 + 原因，
- *     绝不拿「0.00」兜底（那会让人以为卡里没钱）。
- */
-function openWxInfo() {
-  const api = wxApi();
-  const st = (api && api.state()) || {};
-  const row = (k, v) => (v
-    ? '<div class="wxr"><span>' + esc(k) + '</span><b>' + esc(v) + '</b></div>' : '');
-  // 消费记录：完美校园自己推的校园卡通知（消费 / 充值）。
-  // 🔴 原文照抄，不解析金额 —— 各校文案不一样，抠错一个数字就是假账。
-  const notes = wanxiaoNotes();
-  const notesHtml = notes.length
-    ? '<div class="wxnlist">' + notes.slice(0, 8).map((it) =>
-        '<div class="wxn"><span class="wxn-t">' + dingWhen(it.w) + '</span>' +
-        '<span class="wxn-x">' + esc(String(it.x || it.t || '')) + '</span></div>').join('') +
-      '</div>'
-    : '';
-  $('sheetBody').innerHTML =
-    '<div class="sh-title">完美校园</div>' +
-    '<div class="wxbal"><span class="wxbal-k">一卡通余额</span>' +
-      '<b class="wxbal-v" id="wxBalV">查询中…</b></div>' +
-    '<div class="wxinfo">' +
-      row('姓名', st.name) + row('学号', st.stuNo) + row('学校', st.school) +
-      row('班级', st.className) +
-      row('绑定手机', st.phone4 ? '尾号 ' + st.phone4 : '') +
-    '</div>' +
-    '<div class="sh-h2">消费记录</div>' +
-    (notesHtml ||
-      '<p class="tip">还没有消费记录；在完美校园开启「消费通知」、' +
-      '允许通知后，消费与充值记在这里（仅本机）</p>') +
-    '<p class="tip wx-note">余额来自学校的校园卡查询；消费记录来自完美校园' +
-    '推送的通知，都在本机，不上传。</p>' +
-    '<p class="tip" id="wxBalTip" hidden></p>' +
-    '<div class="sheetbtns">' +
-      '<button class="btn" id="wxOut">退出登录</button>' +
-      '<button class="btn primary" id="wxOk">好</button>' +
-    '</div>';
-  $('sheetMask').hidden = false;
-
-  $('wxOk').addEventListener('click', () => { $('sheetMask').hidden = true; });
-  $('wxOut').addEventListener('click', () => {
-    const a = wxApi();
-    if (a) a.logout();
-    WXC.bal = null; WXC.err = ''; WXC.tried = false;
-    $('sheetMask').hidden = true;
-    renderAccounts();
-    paintMiniWallets();
-    toast('已退出');
-  });
-
-  const tv = $('wxBalV');
-  const tip = $('wxBalTip');
-  const say = (v, why) => {
-    if (tv) tv.textContent = v;
-    if (tip && why) { tip.textContent = why; tip.hidden = false; }
-  };
-  if (!api || typeof api.card !== 'function') {
-    say('这个版本查不了', '');
-    return;
-  }
-  // 10 分钟内查过的直接用（同一个数，别两处显示不一样），过期就当场重查。
-  if (typeof WXC.bal === 'number' && WXC.tried &&
-      (Date.now() - WXC.at) < WXC_TTL) {
-    say('¥ ' + money2(WXC.bal), WXC.err);
-    return;
-  }
-  wxCardLoad(true).then(() => {
-    // wxCardLoad 自己会把结果写进 #wxBalV / #wxBalTip；这里只兜它没写的情形
-    if (tv && tv.textContent === '查询中…') {
-      say(typeof WXC.bal === 'number' ? '¥ ' + money2(WXC.bal) : '查不到',
-          WXC.err || '余额没查到');
-    }
-  });
-}
-
-/** 完美校园推来的校园卡通知（只在本机）。没有能力时回空数组。 */
-function wanxiaoNotes() {
-  const api = dingApi();
-  if (!api) return [];
-  let items = [];
-  try { items = api.list() || []; } catch (e) { return []; }
-  return items.filter((it) => String(it.s || '') === 'wanxiao');
-}
-
-/** 登录弹层。
- *
- *  🔴 表单为什么不摆在这一页：账号页的硬约束是「一屏装下」，只剩 20px 余量。
- *     两个输入框加一条说明是 300px，摆上去这一页就要滑 —— 而这一页是
- *     「看一眼账号状态」的地方，不是登录页。
- */
-function openWxSheet() {
-  // 上一次可能停在验证码那一步：倒计时器别留着，重开就是新的一张表单。
-  clearInterval(wxSmsTimer);
-  wxSmsTimer = null;
-  // 上次没成功是卡在哪一步。放在弹层最下面一行小字：用户重开弹层时
-  // 先看到它，就知道这次该改的是网络、密码，还是等我们更新 ——
-  // 而不是第五次原样重输。
-  const s0 = wxApi() ? wxApi().state() : null;
-  $('sheetBody').innerHTML =
-    '<div class="sh-title">登录完美校园</div>' +
-    '<div class="sh-sub">完美校园是全国平台，用它注册的<b>手机号</b>登录，' +
-    '学号登不了；只存登录凭证，不存密码</div>' +
-    // 🔴 这句是实情，也是用户 2026-11-13 问的那件事的答案：那个平台
-    //    **一次只认一台设备**，两边各自登录就互相顶。不写在这儿，
-    //    他只会看到「余额又查不到了」，然后去怪这个按钮。
-    '<p class="tip wx-note">一次只认一台设备：这里登录，手机上会退出；' +
-    '那边登录，这边需重连；两边不能同时用</p>' +
-    '<label class="field"><span>手机号</span>' +
-    '<input id="wxPhone" type="tel" inputmode="numeric" autocomplete="tel" maxlength="11" ' +
-    'placeholder="完美校园注册的 11 位手机号"></label>' +
-    '<label class="field"><span>密码</span><span class="pwdbox">' +
-    '<input id="wxPwd" type="password" autocomplete="current-password" ' +
-    'placeholder="完美校园的登录密码">' + pwdEyeHtml('wxPwd') + '</span></label>' +
-    '<div class="sheetbtns"><button class="btn primary" id="wxLogin">登录</button></div>' +
-    '<p class="tip" id="wxTip"></p>' +
-    '<p class="tip wx-last" id="wxLast"></p>';
-  $('sheetMask').hidden = false;
-  paintWxLast(s0);
-
-  $('wxLogin').addEventListener('click', () => {
-    const phone = ($('wxPhone').value || '').trim().replace(/\s+/g, '');
-    const pwd = $('wxPwd').value || '';
-    const tip = $('wxTip');
-    const btn = $('wxLogin');
-    tip.hidden = true;
-    // 🔴 11 位手机号是主路径，但完美校园也认学号。只认手机号的话，
-    //    拿学号登录的人会卡在「手机号得是 11 位数字」——那句提示还暗示
-    //    他填错了地方，而真正的问题是我们在门口拦了他。
-    // 🔴 完美校园是**全国**的平台，账号就是它自己注册的那个手机号；
-    //    学号只在学校自己的系统（教务 / 智慧门户）里存在。
-    //    以前这里也放行学号，用户拿学号一试就失败，还会以为密码错了 ——
-    //    在门口拦下来，比让他白撞一次风控要好。
-    if (!/^1\d{10}$/.test(phone)) {
-      tip.textContent = '只认它注册的 11 位手机号，学号登不了';
-      tip.hidden = false;
-      return;
-    }
-    if (!pwd) {
-      tip.textContent = '密码没填';
-      tip.hidden = false;
-      return;
-    }
-    const api = wxApi();
-    if (!api) {
-      tip.textContent = '这个版本还不支持，更新后再试';
-      tip.hidden = false;
-      return;
-    }
-    // 防连点：完美校园有风控，同一个账号短时间连撞几次会被锁。
-    btn.disabled = true;
-    btn.textContent = '登录中…';
-    api.login(phone, pwd).then((r) => {
-      if (!r || !r.ok) {
-        // 🔴 新设备：密码是对的，完美校园要一次短信验证码才认这台手机。
-        //    这不是失败到尽头，是流程多一步 —— 必须当场把下一步摆出来，
-        //    不然用户会把它读成「密码错了」，然后一遍遍改那个没错的密码。
-        if (r && r.needSms) { wxSmsStep(phone, r.phone4, r.msg); return; }
-        tip.textContent = (r && r.msg) || '登录没成功，稍后再试';
-        tip.hidden = false;
-        // 原生的诊断是「卡在哪一步」，和上面那句服务端原话不是一回事：
-        // 一句说原因，一句说位置。两句都摆出来，下次才不用猜。
-        paintWxLast(api.state());
-        return;
-      }
-      $('sheetMask').hidden = true;
-      // 🔴 必须当场重画：弹层关了但那一行还是「还没登录」的话，用户会以为没登上。
-      renderAccounts();
-      // 刚登上的账号第一次能查余额：清掉上次的缓存，让顶上那张卡自己补数。
-      WXC.bal = null; WXC.err = ''; WXC.tried = false;
-      paintMiniWallets();
-      wxCardLoad(true);
-      toast('登上了');
-    }).catch((e) => {
-      tip.textContent = (e && e.message) || '登录没成功，稍后再试';
-      tip.hidden = false;
-    }).then(() => {
-      btn.disabled = false;
-      btn.textContent = '登录';
-    });
-  });
-}
-
-/** 「这台手机它没见过」那一步：短信验证码。
- *
- *  完美校园按设备号认设备，第一次登录一律要验证码（2026-11-13 真账号实测：
- *  「您正在新设备上使用完美校园，请使用验证码进行验证登录」）。
- *  验证过一次之后设备号就记在原生那边，以后不再问。
- *
- *  🔴 一个按钮只许发一次：服务端对发码有日限，连点换来的不是更快，
- *     是「今天没得发了」。所以发完就 60 秒倒计时，期间按钮真的禁用。
- */
-let wxSmsTimer = null;
-
-function wxSmsStep(phone, phone4, note) {
-  clearInterval(wxSmsTimer);
-  wxSmsTimer = null;
-  const tail = phone4 ? ('尾号 ' + phone4 + ' 的手机') : '这台手机';
-  $('sheetBody').innerHTML =
-    '<div class="sh-title">输入验证码</div>' +
-    '<div class="sh-sub">完美校园首次在本机登录，需短信验证。' +
-      '验证码会发到' + esc(tail) + '上。' +
-      (note ? '<br>' + esc(note) : '') + '</div>' +
-    '<label class="field"><span>验证码</span>' +
-    '<input id="wxSms" type="tel" inputmode="numeric" autocomplete="one-time-code" ' +
-    'maxlength="8" placeholder="短信里的数字"></label>' +
-    '<div class="sheetbtns">' +
-      '<button class="btn" id="wxResend">重新发送</button>' +
-      '<button class="btn primary" id="wxSmsGo">登录</button>' +
-    '</div>' +
-    '<p class="tip" id="wxTip"></p>';
-  $('sheetMask').hidden = false;
-
-  const tip = () => $('wxTip');
-
-  const countdown = () => {
-    let left = 60;
-    const rb = $('wxResend');
-    if (!rb) return;
-    rb.disabled = true;
-    rb.textContent = left + ' 秒后可重发';
-    clearInterval(wxSmsTimer);
-    wxSmsTimer = setInterval(() => {
-      const b = $('wxResend');
-      if (!b) { clearInterval(wxSmsTimer); wxSmsTimer = null; return; }
-      left -= 1;
-      if (left <= 0) {
-        clearInterval(wxSmsTimer); wxSmsTimer = null;
-        b.disabled = false;
-        b.textContent = '重新发送';
-      } else {
-        b.textContent = left + ' 秒后可重发';
-      }
-    }, 1000);
-  };
-
-  const send = async () => {
-    const t = tip();
-    const rb = $('wxResend');
-    if (t) t.hidden = true;
-    if (rb) { rb.disabled = true; rb.textContent = '发送中…'; }
-    try {
-      const r = await wxApi().sendSms(phone);
-      if (!r || !r.ok) {
-        if (t) { t.textContent = (r && r.msg) || '验证码未发出，请稍后再试'; t.hidden = false; }
-        if (rb) { rb.disabled = false; rb.textContent = '重新发送'; }
-        return;
-      }
-      if (t) { t.textContent = '验证码发出去了，收到就填进来'; t.hidden = false; }
-      countdown();
-    } catch (e) {
-      if (t) { t.textContent = (e && e.message) || '验证码没发出去'; t.hidden = false; }
-      if (rb) { rb.disabled = false; rb.textContent = '重新发送'; }
-    }
-  };
-
-  const go = async () => {
-    const code = ($('wxSms').value || '').trim();
-    const t = tip();
-    const btn = $('wxSmsGo');
-    if (t) t.hidden = true;
-    if (!/^\d{4,8}$/.test(code)) {
-      if (t) { t.textContent = '验证码是短信里那几位数字'; t.hidden = false; }
-      return;
-    }
-    if (btn) { btn.disabled = true; btn.textContent = '登录中…'; }
-    try {
-      const r = await wxApi().loginSms(phone, code);
-      if (!r || !r.ok) {
-        if (t) { t.textContent = (r && r.msg) || '验证码不对'; t.hidden = false; }
-        if (btn) { btn.disabled = false; btn.textContent = '登录'; }
-        return;
-      }
-      clearInterval(wxSmsTimer); wxSmsTimer = null;
-      $('sheetMask').hidden = true;
-      renderAccounts();
-      WXC.bal = null; WXC.err = ''; WXC.tried = false;
-      paintMiniWallets();
-      wxCardLoad(true);
-      toast('登上了');
-    } catch (e) {
-      if (t) { t.textContent = (e && e.message) || '登录没成功'; t.hidden = false; }
-      if (btn) { btn.disabled = false; btn.textContent = '登录'; }
-    }
-  };
-
-  const rb = $('wxResend');
-  if (rb) rb.addEventListener('click', send);
-  const gb = $('wxSmsGo');
-  if (gb) gb.addEventListener('click', go);
-  // 进来就自动发一条：用户刚点了「登录」，再让他点一次「发送」是多一下。
-  send();
-}
-
-/** 把「上次卡在哪一步」写进弹层最后那行小字。没有就留空、不占位。 */
-function paintWxLast(st) {
-  const el = $('wxLast');
-  if (!el) return;
-  const last = (st && st.last) || '';
-  el.textContent = last ? ('上次没成功：' + last) : '';
-  el.hidden = !last;
-}
 
 $('accBack').addEventListener('click', () => switchTab('me'));
 
@@ -9599,269 +8456,8 @@ async function cxLiveRun(force) {
   cxLiveBusy = false;
 }
 
-/* ---------------- 中国大学 MOOC（0.45.0） ----------------
- *
- * 外部平台的第二个。以后接第三个、第四个学习网站，都往 EX_VIEWS 里加一项，
- * 这一块的结构不用动 —— 这正是用户说的「以后可能会适配更多平台」。
- *
- * 🔴 登录**不做我们自己的账号密码表单**，走 App 内嵌的官方登录页。
- *    原因（2026-11-04 实测）：MOOC 走网易通行证，点「获取验证码」之前要过
- *    `captcha.reg.163.com/v2` 的滑块，脚本过不去、也不该去过 ——
- *    硬破的话某次能用、下次就失效，还会因为频繁尝试把账号弄得更麻烦。
- *    改成「打开官方网页 → 你自己登（滑块的活你来）→ App 读 cookie」，
- *    这条路和智慧门户登录是同一套机制，合法且稳定。
- *
- * ⚠️ 网页版（NATIVE=false）连不了，而且是**物理上**连不了：
- *    cookie 在浏览器里、属于 icourse163.org 这个域，电脑上的 bridge.py
- *    读不到别的域的 cookie。不是没做，是做不到 —— 界面上如实说，
- *    不许显示成「还没登录」让人以为点一下就能连。
- */
-const MOOC = {
-  state: null,        // null 没问过 / 'none' 没登录 / 'ok'
-  user: '',
-  data: null,
-  age: -1,
-  err: '',
-  busy: false,        // 正在读课程
-  showDone: false,    // 是否连「已交」的一起看
-};
+// CX login and connection states are rendered below.
 
-const MOOC_HOME = 'https://www.icourse163.org/';
-const MOOC_LOGIN = 'https://www.icourse163.org/member/login.htm';
-// 超过这么久就顺手重读一次。MOOC 一门课一个请求，几秒就完，
-// 不像学习通要两分钟 —— 所以这里可以积极一点。
-const MOOC_STALE = 600;
-
-/** 读登录态 + 缓存；需要时顺手扫一遍。 */
-async function moocRefresh(silent, force) {
-  try {
-    const st = await api('/api/mooc/status');
-    MOOC.state = st.linked ? 'ok' : 'none';
-    MOOC.user = st.user || '';
-    if (MOOC.state !== 'ok') { MOOC.data = null; MOOC.age = -1; return true; }
-    // 网页版拿不到 MOOC 的 cookie，后端会明说 webOnly
-    if (st.webOnly) return true;
-    const t = await api('/api/mooc/todo');
-    MOOC.data = t.data || null;
-    MOOC.age = (typeof t.age === 'number') ? t.age : -1;
-    // 和进「学习」页拿到学习通那份一样：读到就并进截止缓存（按来源分开存，
-    // 见 dueCacheSave —— 两个来源谁后到都不会把对方盖掉）。
-    if (MOOC.data) dueCacheSave(MOOC.data.items, 'mooc');
-    if (force || !MOOC.data || MOOC.age < 0 || MOOC.age > MOOC_STALE) {
-      await moocScanNow();
-    }
-    return true;
-  } catch (e) {
-    MOOC.err = e.message || String(e);
-    if (!silent) toast('读不到中国大学 MOOC：' + MOOC.err);
-    return false;
-  }
-}
-
-/** 真的去读一遍。失败要说清是「要重新登录」还是「网络或服务端出问题」。 */
-async function moocScanNow() {
-  MOOC.busy = true;
-  try {
-    const r = await api('/api/mooc/scan', {});
-    if (!r.ok) {
-      if (r.needLogin) { MOOC.state = 'none'; MOOC.data = null; return false; }
-      throw new Error(r.error || '读取失败');
-    }
-    MOOC.data = r.data || null;
-    MOOC.age = 0;
-    MOOC.state = 'ok';
-    MOOC.err = '';
-    if (MOOC.data) dueCacheSave(MOOC.data.items, 'mooc');
-    return true;
-  } catch (e) {
-    MOOC.err = e.message || String(e);
-    return false;
-  } finally {
-    MOOC.busy = false;
-  }
-}
-
-async function moocEnter() {
-  // 网页版物理上连不了（读不到浏览器里另一个域的 cookie，见 bridge.py 那段注释）。
-  // 🔴 先退出去再谈读数据：不然这里会白发两条请求 ——
-  //    一条问状态、一条 404，然后画出来还是同一张说明卡。
-  if (!NATIVE) { moocPaint(); return; }
-  if (MOOC.state === null) {
-    moocPaint();                 // 先出「正在读」，别让人对着空白等
-    await moocRefresh(true, false);
-  }
-  moocPaint();
-}
-
-function moocPaint() {
-  const box = $('moocBody');
-  if (!box) return;
-  moocBind();
-  // 网页版先说清楚做不到，别让人对着一个点不动的按钮发呆
-  if (!NATIVE) { box.innerHTML = moocWebOnlyHtml(); return; }
-  if (MOOC.busy) { box.innerHTML = moocBusyHtml(); return; }
-  if (MOOC.state === null) {
-    box.innerHTML = '<p class="tip">正在读中国大学 MOOC 的状态…</p>';
-    return;
-  }
-  if (MOOC.state !== 'ok') { box.innerHTML = moocLoginHtml(); return; }
-  box.innerHTML = moocTodoHtml();
-}
-
-function moocWebOnlyHtml() {
-  return '<div class="card cx-login">' +
-    '<h2 class="cx-h">中国大学 MOOC</h2>' +
-    // 不说「请在手机上使用」那种打发人的话 —— 说清楚为什么，
-    // 用户才知道这不是坏了。
-    '<p class="cx-p">要登录才能读课程，只能在手机 App 里完成。'
-    + '手机上打开「学习 → 外部平台 → 中国大学 MOOC」</p>' +
-    '</div>';
-}
-
-function moocBusyHtml() {
-  return '<div class="card cx-login">' +
-    '<h2 class="cx-h">正在读课程…</h2>' +
-    '<div class="cx-bar"><i style="width:60%"></i></div>' +
-    '<p class="cx-note">每门课一次请求，约几秒完成。</p>' +
-    '</div>';
-}
-
-function moocLoginHtml() {
-  return '<div class="card cx-login">' +
-    '<h2 class="cx-h">连接中国大学 MOOC</h2>' +
-    '<p class="cx-p">官方登录页，登录一次即可。' +
-    '只读课程和作业，不会替你学或交</p>' +
-    '<button class="btn primary block" id="moocGo">去官方页面登录</button>' +
-    '<p class="cx-note">登录态绑定本机，换账号后退出并重新登录即可</p>' +
-    '</div>';
-}
-
-/** MOOC 的条目 → 学习通那套渲染要的形状。
- *
- *  🔴 借 `cxItemHtml` 而不是另写一份：那一份已经把「还剩多久 / 绝对截止时间 /
- *     过期标灰 / 分类标」都调好了，另写必然两套观感、两处 bug。
- *     这里只把 state 翻译成人话状态。 */
-function moocAsCxItem(it) {
-  const left = it.endAt ? Math.round((it.endAt - Date.now() / 1000) / 60) : null;
-  let status = '未交';
-  if (it.state === 'done') status = '已交';
-  else if (it.state === 'expired') status = '已过截止';
-  return {
-    kind: it.kind,
-    title: it.title,
-    course: it.course,
-    status: status,
-    state: it.state,
-    endAt: it.endAt,
-    leftMin: left,
-    url: it.url,
-  };
-}
-
-function moocTodoHtml() {
-  const d = MOOC.data;
-
-  if (!d || !Array.isArray(d.items)) {
-    return '<div class="card cx-login">' +
-      '<h2 class="cx-h">还没读到课程</h2>' +
-      '<p class="cx-p">' + (MOOC.err ? esc(MOOC.err) : '点击一次读取一次。') + '</p>' +
-      '<button class="btn primary block" id="moocRe">读一次</button>' +
-      '</div>';
-  }
-
-  const all = d.items;
-  const todo = all.filter((it) => it.state === 'todo');
-  const over = all.filter((it) => it.state === 'expired');
-  const done = all.filter((it) => it.state === 'done');
-
-  let html = '<div class="card cx-login">' +
-    '<h2 class="cx-h">中国大学 MOOC' +
-      (MOOC.user ? '<span class="cx-note"> · ' + esc(MOOC.user) + '</span>' : '') +
-    '</h2>' +
-    '<p class="cx-p">' +
-      (d.courses ? d.courses.length + ' 门课 · ' : '') +
-      '待交 ' + todo.length + ' 条' +
-      (over.length ? ' · 已过截止 ' + over.length + ' 条' : '') +
-      ' · 已交 ' + done.length + ' 条' +
-    '</p>' +
-    (MOOC.age >= 0
-      ? '<p class="cx-note">' +
-        timeAgo(Math.floor(Date.now() / 1000) - MOOC.age) + '</p>' : '') +
-    (d.failed && d.failed.length
-      ? '<p class="cx-note">有 ' + d.failed.length + ' 门课没读到：' +
-        esc(d.failed.map((x) => x.course).join('、')) + '</p>' : '') +
-    '<div class="cx-acts">' +
-      '<button class="btn primary" id="moocRe">重新读一次</button>' +
-      // 🔴 两颗按钮在 .cx-acts 里是 flex:1 1 0，360dp 上各分到 ~135px。
-      //    「连已交的一起看」7 个字装不下，会折成两行（截图里就是
-      //    「连已交的一起」/「看」）。这里压到 5 个字，两种状态都刚好一行。
-      '<button class="btn" id="moocDone">' +
-        (MOOC.showDone ? '只看没交的' : '算上已交的') + '</button>' +
-    '</div>' +
-    '</div>';
-
-  const picked = MOOC.showDone ? all.slice() : todo.concat(over);
-  if (!picked.length) {
-    html += '<div class="card cx-login"><p class="cx-p">' +
-      (all.length ? '该交的都交了。' : '这几门课暂时没有作业和测验。') +
-      '</p></div>';
-    return html;
-  }
-  // 按紧急程度排；已交的沉到最后，不跟没交的抢注意力。
-  const rank = (x) => (x.state === 'done' ? 1 : 0);
-  picked.sort((a, b) => (rank(a) - rank(b)) || ((a.endAt || 1e12) - (b.endAt || 1e12)));
-  html += '<div class="cx-list">' +
-    picked.map((it) => cxItemHtml(moocAsCxItem(it), true, true)).join('') +
-    '</div>';
-  return html;
-}
-
-function moocBind() {
-  const box = $('moocBody');
-  if (!box || box.dataset.moocBound) return;
-  box.dataset.moocBound = '1';
-  box.addEventListener('click', async (e) => {
-    const btn = (e.target.closest ? e.target.closest('#moocGo,#moocRe,#moocDone') : null);
-    if (btn) {
-      if (btn.id === 'moocGo') {
-        // 🔴 必须在这个 App 自己的网页里登录：登录态就是它的 cookie 罐，
-        //    甩到系统浏览器去登，我们一点都读不到（2026-11-04 实测）。
-        // 🔴 调的是 window.NativeApi：NATIVE 只是个布尔（见文件开头），
-        //    写成 NATIVE.openWeb 会直接 TypeError —— 点一下什么都没发生。
-        const api0 = window.NativeApi;
-        if (!api0 || typeof api0.openWeb !== 'function') {
-          toast('这个版本的 App 打不开内置网页，请更新后再试');
-          return;
-        }
-        api0.openWeb(MOOC_LOGIN, '登录中国大学 MOOC', false);
-        toast('登录完成后回到这个页面，会自动读');
-        return;
-      }
-      if (btn.id === 'moocDone') {
-        MOOC.showDone = !MOOC.showDone;
-        moocPaint();
-        return;
-      }
-      moocPaint();                       // 先切成「正在读」
-      const ok = await moocScanNow();
-      if (!ok && MOOC.err && MOOC.state === 'ok') toast(MOOC.err);
-      moocPaint();
-      return;
-    }
-    // 点条目 → 在 App 内打开那门课的作业页
-    const it = (e.target.closest ? e.target.closest('.cx-item[data-url]') : null);
-    if (it) {
-      const u = it.getAttribute('data-url');
-      if (u && window.NativeApi && typeof window.NativeApi.openWeb === 'function') {
-        window.NativeApi.openWeb(u, it.getAttribute('data-title') || '中国大学 MOOC', false);
-      }
-    }
-  });
-}
-
-// -- 未登录 --------------------------------------------------------
-//
-// 这里只在**从来没连过**时出现（后端的 linked 就是「本机有没有存过凭证」）。
 // 「连过但登录态过期」不走这里，走 cxPaintTodo 里的「重连」按钮 ——
 // 那种情况下账号密码都还在本机，让人再输一遍正是用户 2026-10-22 抱怨的事。
 
@@ -11868,7 +10464,6 @@ async function cxScanStart(manual, force, auto) {
         // 清掉的话用户重连完还得再等一整轮扫描才有东西看。
         cxPaint();
       }
-      reportProblem('cx_scan', r.kind || (r.needLogin ? 'needLogin' : ''), r.error, 'exams');
       toast(r.error || '启动失败');
       return;
     }
@@ -12024,7 +10619,6 @@ async function doBind() {
     if (!res.ok) {
       // 上报「哪一档失败」。⚠️ 只报分类和**已经是我们写给用户看的那句话**，
       // 不报用户名 —— 学号在用户名框里，一个字节都不许带出去。
-      reportProblem('eams_bind', reportCode(res), res.error, 'me');
       tip.textContent = res.error || '绑定失败';
       return;
     }
@@ -12057,7 +10651,6 @@ async function doBind() {
       toast('登录成功，但密码没存住：' + sv.why + '。下次打开要重新输入', 6000);
     } else if (res.timetableError) {
       // 绑上了但课表没读到 —— 这是那几天最费解的一类（辅修那次就是它）。
-      reportProblem('eams_timetable', '', res.timetableError, 'me');
       toast('绑定成功了，但课表这次没读到：' + res.timetableError +
             '。成绩和考试照常能看', 7000);
     } else if (sv.soft) {
@@ -12069,7 +10662,6 @@ async function doBind() {
     // 这时候问「要不要提醒你上课」是句空话。
     if (sv.ok && !res.timetableError) askRemindAfterBind();
   } catch (e) {
-    reportProblem('eams_bind', 'throw', e.message, 'me');
     tip.textContent = e.message || envText('连不上电脑上的服务', '连不上教务系统，请检查网络后重试');
   } finally {
     setBusy(btn, false, '绑定并同步');
@@ -12077,74 +10669,90 @@ async function doBind() {
 }
 
 async function doSync(goSchedule) {
-  // 🔴 全局单飞。现在有四个入口能触发整份同步（我的→同步教务处数据、
-  //    成绩页刷新、考试页刷新、课表页刷新），连点两下就是两次登录 ——
-  //    学校那边要 3 秒防抖，还会把「点太快」当成登录失败。
-  if (syncing) { toast('正在同步，请稍候'); return; }
-  syncing = true;
-  $('schRefresh').classList.add('busy');
-  const btn = $('btnSync');
-  const v = $('meSyncTime');
-  btn.disabled = true;
-  const old = v.textContent;
-  v.textContent = '同步中…';
+  return doNepuSync(goSchedule);
+}
+
+async function doNepuLogin() {
+  const status = $('nepuStatus');
+  status.textContent = '正在打开学校登录…';
   try {
-    const res = await api('/api/sync', {});
-    if (!res.ok) {
-      if (res.needBind) {
-        // 「没凭据」不等于「没绑定」。数据在的时候说「还没绑定账号」，
-        // 用户看着满屏课表会觉得这软件在胡说 —— 而且他也找不到重输的地方。
-        BOUND = false;
-        renderMe();
-        if (DATA) {
-          toast('密码没存住，重新输一次就能自动同步', 3200);
-          switchTab('me');                   // 直接把输入框摆到眼前
-        } else {
-          toast('还没绑定账号', 2600);
-          switchTab('me');
-        }
-        v.textContent = old;
-        return;
-      }
-      // 凭据存着但教务系统不认了（改过密码、会话过期）⇒ 让用户重输。
-      if (res.authFail) {
-        BOUND = false;
-        renderMe();
-        toast('教务系统登录失败，密码可能改过了，请重新输入', 3600);
-        switchTab('me');
-        v.textContent = old;
-        return;
-      }
-      reportProblem('eams_sync', reportCode(res), res.error, 'me');
-      toast(res.error || '同步失败', 2600);
-      v.textContent = old;
-      return;
-    }
-    applyPayload(res);
-    BOUND = true;
-    // 🔴 2026-11-13：同步「成功」不等于每一块都读到了。没读到的那几块
-    //    会把本机上一份留着（见 applyPayload），但必须当面说一声 ——
-    //    不然用户以为这就是最新的，或者反过来以为数据丢了。
-    if (res.timetableError || res.profileError) {
-      const what = [res.timetableError ? '课表' : '',
-                    res.profileError ? '个人信息' : ''].filter(Boolean).join('和');
-      toast('同步完成，但' + what + '这次没读到，仍为上次数据，请稍后刷新', 5000);
-    } else {
-      toast('同步完成');
-    }
-    if (goSchedule) switchTab('schedule');
+    if (!window.AndroidNepu || typeof window.AndroidNepu.openLogin !== 'function') throw new Error('请在东油通 App 内打开教务登录');
+    window.AndroidNepu.openLogin();
+    nepuSession = false;
+    status.textContent = '已打开学校登录页；完成登录后，返回此页同步以验证会话';
+    renderAccounts();
   } catch (e) {
-    reportProblem('eams_sync', 'throw', e.message, 'me');
-    toast(e.message || envText('连不上电脑上的服务', '连不上教务系统，请检查网络后重试'), 2600);
-    v.textContent = old;
-  } finally {
-    syncing = false;
-    $('schRefresh').classList.remove('busy');
-    btn.disabled = false;
-    renderMe();
+    status.textContent = e.message || '登录未完成';
   }
 }
 
+async function doNepuSync(goSchedule) {
+  if (syncing) { toast('正在同步，请稍候'); return; }
+  if (!window.Nepu || typeof Nepu.normalize !== 'function') {
+    toast('教务数据模块尚未加载'); return;
+  }
+  syncing = true;
+  const status = $('nepuStatus');
+  const select = $('nepuTerm');
+  const id = select ? select.value : '';
+  const btn = $('btnSync');
+  const v = $('meSyncTime');
+  const old = v ? v.textContent : '';
+  if (btn) btn.disabled = true;
+  const panelBtn = $('nepuSync');
+  if (panelBtn) panelBtn.disabled = true;
+  if (v) v.textContent = '同步中…';
+  if (status) status.textContent = '正在同步课表、成绩、考试和公告…';
+  const generation = CACHE_GEN;
+  try {
+    const result = await nepuBridgeCall('sync', String(id || ''));
+    if (generation !== CACHE_GEN) return;
+    const raw = result.data || {};
+    const payload = Nepu.normalize(raw);
+    nepuTerms = payload.terms || nepuTerms;
+    if (select && nepuTerms.length) {
+      select.innerHTML = '<option value="">当前学期</option>' + nepuTerms.map((t) => '<option value="' + esc(t.id) + '">' + esc(t.name) + '</option>').join('');
+      select.value = id;
+    }
+    payload.source = 'nepu';
+    payload.nepuTerms = nepuTerms;
+    payload.week1Monday = raw.week1Monday || '';
+    if (payload.businessHours.length >= payload.unitCount && Array.from(payload.businessHours).every(r => Array.isArray(r) && r.length === 2)) CFG.times = payload.businessHours;
+    if (payload.week1Monday) {
+      // The selected term replaces the displayed snapshot, so dates must follow it too.
+      CFG.startDate = String(payload.week1Monday).slice(0, 10);
+      CFG.semester = payload.semester;
+      CFG.weeks = payload.totalWeeks;
+    }
+    applyPayload(payload);
+    saveNepuNotices(raw);
+    nepuSession = true;
+    if (status) status.textContent = '已同步 ' + (payload.semester || '') + ' · ' + (payload.courses || []).length + ' 条课程安排';
+    renderAccounts();
+    toast('教务数据同步完成');
+    if (goSchedule) switchTab('schedule');
+  } catch (e) {
+    if (/auth|login|session/i.test(e.kind || '')) nepuSession = false;
+    if (status) status.textContent = (e.message || '同步失败') + '；本地数据已保留';
+    toast(e.message || '教务同步失败', 3000);
+  } finally {
+    syncing = false;
+    if (btn) btn.disabled = false;
+    if (panelBtn) panelBtn.disabled = false;
+    if (v) v.textContent = old;
+    renderMe(); renderAccounts();
+  }
+}
+
+$('nepuLogin').addEventListener('click', doNepuLogin);
+$('nepuSync').addEventListener('click', () => doNepuSync());
+if (DATA && DATA.source === 'nepu') {
+  nepuTerms = Array.isArray(DATA.nepuTerms) ? DATA.nepuTerms : [];
+}
+if (DATA && DATA.source === 'nepu' && $('nepuTerm')) {
+  $('nepuTerm').innerHTML = '<option value="">当前学期</option>' + nepuTerms.map((t) => '<option value="' + esc(t.id) + '">' + esc(t.name) + '</option>').join('');
+  $('nepuStatus').textContent = '本地缓存 · 登录状态需本次打开后验证';
+}
 function applyPayload(res, isBind) {
   // 换账号了就别留着上一个人的「其他学期考试」缓存。
   // 同一个人的话留着：切来切去不用重新打教务系统。
@@ -12182,12 +10790,13 @@ function applyPayload(res, isBind) {
   const keepEX = !!(res.exams && res.exams.error) &&
     !!(prev && prev.exams && prev.exams.exams && prev.exams.exams.length);
 
+  const keepManualCourses = res.source === 'nepu' && prev && !keepTT
+    ? (prev.courses || []).filter((c) => isMyCourse(c)) : [];
   DATA = {
     profile: (keepPF ? prev.profile : res.profile) || {},
     semester: keepTT ? prev.semester : res.semester,
     unitCount: keepTT ? prev.unitCount : res.unitCount,
     totalWeeks: keepTT ? prev.totalWeeks : res.totalWeeks,
-    courses: keepTT ? prev.courses : res.courses,
     grades: keepGR ? prev.grades : res.grades,
     // 考试可能整块缺失（老版本服务、或后端兜底失败）—— 存 null 而不是 {}，
     // 让 renderExams 能区分「没这块数据」和「查了但学校没排考」
@@ -12195,9 +10804,15 @@ function applyPayload(res, isBind) {
     // 培养计划。取不到时是个带 error 的空壳（native.js 里兜的），
     // 所以这里存 null 还是 {} 要分清：null = 老服务根本没有这块，
     // {} = 有这块但没取到，两种情况的提示语不一样。
+    courses: (keepTT ? prev.courses : (res.courses || [])).concat(keepManualCourses),
     plan: res.plan || null,
     // 按学期缓存的考试（考试页切学期用），只存取成功的
     examsBySem: keepBySem,
+    source: res.source || '',
+    termId: res.termId || '',
+    terms: res.terms || [],
+    nepuTerms: res.nepuTerms || [],
+    week1Monday: res.week1Monday || '',
     syncedAt: res.syncedAt,
     // 课表这次**没读到**的原因（学校没给 / 没分班 / 没读到）。
     // 没有这个键 = 读到了。空课表 + 这个键 ⇒ 界面要说「没读到」，不能说「没课」。
@@ -12215,16 +10830,16 @@ function applyPayload(res, isBind) {
   // 空教室查一次要打一次学校服务器，没换人就没必要再查一遍。
   if (oldSid !== newSid) resetRooms();
   store.set(KEY.data, DATA);
-  if (migrateStartDate(DATA.semester)) { /* 旧默认值已纠正 */ }
+  if (res.source !== 'nepu' && migrateStartDate(DATA.semester)) { /* 旧默认值已纠正 */ }
   if (!CFG.startDate) CFG.startDate = ymd(defaultStart(DATA.semester));
   CFG.week = currentWeek();
   store.set(KEY.settings, CFG);
   renderSchedule(); renderGrades(); renderExams(); renderMe(); renderCredit();
   // 该办的事在后台查（十几秒），不挡住首屏。12 小时内不重复查。
-  loadTodo(false);
+  if (res.source !== 'nepu') loadTodo(false);
   // 不 await：课表先画出来。补取是给「考试页切学期」铺路的，
   // 用户可能压根不去考试页，不能为它挡住首屏。
-  prefetchExams();
+  if (res.source !== 'nepu') prefetchExams();
 }
 
 $('btnBind').addEventListener('click', doBind);
@@ -12269,15 +10884,15 @@ $('btnReauth').addEventListener('click', async () => {
     setBusy(btn, false, '保存并同步');
   }
 });
-$('btnSync').addEventListener('click', doSync);
+$('btnSync').addEventListener('click', () => doSync());
 $('schRefresh').addEventListener('click', () => {
+  if (!DATA || DATA.source === 'nepu') { doNepuSync(); return; }
   // 课表页的刷新和「我的 → 同步教务处数据」是同一件事：
   // 课表、成绩、考试一起重新拉，不是只刷课表。
-  if (!DATA) { toast('先绑定账号'); return; }
   doSync();
 });
 $('examRefresh').addEventListener('click', () => {
-  if (!DATA) { toast('先绑定账号'); return; }
+  if (!DATA || DATA.source === 'nepu') { doNepuSync(); return; }
   // 看的是成绩 ⇒ 只能整份同步（成绩是随整份同步下来的，没有单取接口）
   // 成绩没有单取接口，只能整份同步。学校平台的「成绩」那一格才走这条路。
   if (CFG.examView === 'grade') { doSync(); return; }
@@ -12317,6 +10932,9 @@ function clearLocalCaches() {
   store.del(KEY.card);
   store.del(KEY.apps);
   store.del(KEY.notice);
+  store.del(NEPU_NOTICE_KEY);
+  nepuNoticeCache = null; nepuNoticeError = ''; nepuNoticeSheetToken++;
+  renderNepuNotices();
   examTerm = '';
   Object.keys(EXAM_ERR).forEach((k) => { delete EXAM_ERR[k]; });
   resetRooms();
@@ -12332,7 +10950,7 @@ function clearLocalCaches() {
   renderCampus();
   // 公告：tried=false 时 ntPaintState 会整块收起来（不当成「没有记录」），
   // 下次点进公告 tab 会自己重新取。
-  renderNotice();
+  renderNepuNotices();
 }
 
 /* 解绑教务。抽成具名函数是为了让「账号管理」页也能调它 ——
@@ -12430,11 +11048,10 @@ async function clearCacheAsk() {
   toast(freed ? '已清除，空间会在几秒后释放' : '已清除，下次进来会重新同步');
 }
 
-$('goBind').addEventListener('click', () => switchTab('me'));
-$('goBind2').addEventListener('click', () => switchTab('me'));
-$('goBind3').addEventListener('click', () => switchTab('me'));
+$('goBind').addEventListener('click', doNepuLogin);
+$('goBind2').addEventListener('click', () => switchTab('accounts'));
+$('goBind3').addEventListener('click', () => switchTab('accounts'));
 $('goBind4').addEventListener('click', () => switchTab('me'));
-$('goBind5').addEventListener('click', () => switchTab('me'));
 $('exRetry').addEventListener('click', () => {
   const sid = examTerm;
   delete EXAM_ERR[sid];
@@ -12523,7 +11140,7 @@ async function probeBound() {
 
 $('btnQuick').addEventListener('click', () => { doSync(true); });
 $('goQuick').addEventListener('click', () => { switchTab('me'); doSync(true); });
-$('btnUpdate').addEventListener('click', () => { openUpdateSheet(); });
+if ($('btnUpdate')) $('btnUpdate').hidden = true;
 
 /* ---------------- 关于本项目（0.41.0） ----------------
  *
@@ -12553,7 +11170,7 @@ const ABOUT_GH = 'https://github.com/Hobson2233/hangyuantong';
 //    dpdns.org 是免费动态域名，国内网络对它做 TLS 层干扰（实测同 IP 换 SNI，
 //    带 dpdns.org 的 10 次断 3 次，hobson.cc 10 次全通），
 //    表现就是「偶尔打不开」。旧域名继续可用，但不再对外露出。
-const ABOUT_SITE = 'https://hobson.cc/hangyuantong/';
+const ABOUT_SITE = 'https://cnb.cool/Hobson2233/hangyuantong';
 
 /* ---------------- 联系方式：放在站上，不写进包 ----------------
  *
@@ -12572,7 +11189,7 @@ const ABOUT_SITE = 'https://hobson.cc/hangyuantong/';
  * 🔴 远端内容是**不可信输入**：它会被拼进 innerHTML。所以三层都过
  *    （类型 → 长度 → 链接协议和域名），见 aboutClean / aboutSafeUrl。
  */
-const ABOUT_URL = 'https://hobson.cc/hangyuantong/about.json';
+
 const ABOUT_CACHE = 'hyt.about.v1';   // 上次从站上拿到的，下次先拿它顶上
 const ABOUT_WAIT = 4000;              // 4 秒没回来就不等了，用手上这份
 // 包里那份兜底：没有联系方式（整块不出现），也没有额外那句提示。
@@ -12584,19 +11201,19 @@ const ABOUT_HOSTS = ['qm.qq.com', 'hobson.cc', 'hobson2233.dpdns.org',
 
 const ABOUT_REFS = [
   {
+    name: '航院通',
+    by: 'Hobson2233 · MIT 许可',
+    why: '东油通基于航院通改造；按 MIT 许可保留版权与许可声明。',
+    go: '查看项目',
+    url: 'https://cnb.cool/Hobson2233/hangyuantong',
+  },
+  {
     name: 'WaterWidget',
     by: 'nocookies111 · MIT 许可',
     why: '饮水机部分照公开说明自写，未用其代码。'
        + '它和慧生活798 官方都没参与这个 App。',
     go: '在 GitHub 打开',
     url: 'https://github.com/nocookies111/life-798',
-  },
-  {
-    name: 'ZUA Wiki',
-    by: '在校学生自建 · wiki.zua.fan',
-    why: '校内百科，只放入口，内容在它自己的站上',
-    go: '打开 wiki.zua.fan',
-    url: 'https://wiki.zua.fan',
   },
   {
     name: '校园前端模板',
@@ -12653,31 +11270,7 @@ function aboutCached() {
 /** 去站上取一次。拿不到一律返回 null —— 这个功能**不许有错误提示**：
  *  用户点「关于」是为了看署名，不是来看「网络异常的」。 */
 function aboutFetch() {
-  if (typeof fetch !== 'function') return Promise.resolve(null);
-  const ctl = (typeof AbortController === 'function') ? new AbortController() : null;
-  const timer = ctl ? setTimeout(() => { try { ctl.abort(); } catch (e) {} }, ABOUT_WAIT) : 0;
-  // 每分钟换一个 t：CDN 上这条是 no-store，但中间还可能有别的缓存层。
-  const url = ABOUT_URL + '?t=' + Math.floor(Date.now() / 60000);
-  return fetch(url, { cache: 'no-store', signal: ctl ? ctl.signal : undefined })
-    .then((r) => (r && r.ok ? r.json() : null))
-    .then((j) => {
-      if (timer) clearTimeout(timer);
-      // 🔴 没拿到（404 / 空响应 / 不是对象）必须返回 null，**不能**返回一个
-      //    「空配置」。返回空配置等于告诉调用方「站上把联系方式撤掉了」，
-      //    于是缓存里那个号被擦掉、界面从「有号」变成「没号」——
-      //    而这只是因为这一次没连上。这个区别就是「拿不到」和「拿到了是空的」。
-      if (!j || typeof j !== 'object') return null;
-      const d = aboutClean(j);
-      // 只在**真拿到东西**时落盘。把空结果存下来，等于下次误以为
-      // 「用户把联系方式撤了」，而其实只是这一次没拉到。
-      if (d.contact || d.notice) {
-        try {
-          localStorage.setItem(ABOUT_CACHE, JSON.stringify({ at: Date.now(), data: d }));
-        } catch (e) { /* 存不了就算了，下次再拉 */ }
-      }
-      return d;
-    })
-    .catch(() => { if (timer) clearTimeout(timer); return null; });
+  return Promise.resolve(null);
 }
 
 /** 「联系我」那一块。**没有群号必须返回空串**，不能返回一个只有标题的空壳 ——
@@ -12720,32 +11313,13 @@ function aboutContactHtml(c) {
 function aboutHtml(state) {
   const st = state || ABOUT_FALLBACK;
 
-  // 「密码只存在这台手机/电脑上」—— 网页版和 APK 不是同一句话，别混着说。
-  const where = NATIVE ? '这台手机' : '这台电脑';
-
   return '<div class="sh-title">关于本项目</div>'
     + '<div class="sh-sub">学生自制的校园助手：免费、无广告</div>'
     + (st.notice ? '<div class="ab-tip">' + esc(st.notice) + '</div>' : '')
     + '<div class="ab-hd">这个项目</div>'
     + '<div class="ab-item">'
-    + '<div class="ab-name">航院通 · MIT 许可</div>'
-    + '<p>网页版与 App 同一份代码，公开可查，'
-    + '也可改造为其他学校的版本。</p>'
-    + '<button class="ab-go" data-url="' + escAttr(ABOUT_SITE) + '">打开网站'
-    + '<svg viewBox="0 0 24 24"><path d="M9 6l6 6-6 6"/></svg></button>'
-    + '<button class="ab-go" data-url="' + escAttr(ABOUT_REPO) + '">看源码'
-    + '<svg viewBox="0 0 24 24"><path d="M9 6l6 6-6 6"/></svg></button>'
-    + '<button class="ab-go" data-url="' + escAttr(ABOUT_GH) + '">GitHub'
-    + '<svg viewBox="0 0 24 24"><path d="M9 6l6 6-6 6"/></svg></button>'
-    + '</div>'
-    // 求 Star（2026-11-14）。放在「这个项目」下面而不是弹窗里：
-    // 看关于页的人本来就对项目有兴趣，这时候说一句不算打扰。
-    + '<div class="ab-star">'
-    + '<svg class="ab-star-i" viewBox="0 0 24 24" aria-hidden="true">'
-    + '<path d="M12 3.6l2.6 5.3 5.8.8-4.2 4.1 1 5.8-5.2-2.7-5.2 2.7 1-5.8L3.6 9.7l5.8-.8z"/></svg>'
-    + '<div class="ab-star-t"><b>给个 Star</b>'
-    + '<span>Star 越多，其他学校越容易发现</span></div>'
-    + '<button class="ab-star-go" id="abStar" type="button">去 GitHub</button>'
+    + '<div class="ab-name">东油通</div>'
+    + '<p>面向东北石油大学的本地校园助手。</p>'
     + '</div>'
     + aboutContactHtml(st.contact)
     // 参考的项目：压成一行，点开是二级页面。署名本身**没有删**，
@@ -12755,21 +11329,6 @@ function aboutHtml(state) {
     + '<span class="ab-refs-v">' + ABOUT_REFS.length + ' 个'
     + '<svg viewBox="0 0 24 24"><path d="M9 6l6 6-6 6"/></svg></span>'
     + '</button>'
-    + '<div class="ab-note">不是学校做的，与慧生活798 无关。'
-    + '教务只读，不代提交；学号密码只存在' + where + '上。</div>'
-    // 匿名上报的开关（0.47.6）。放在这里而不是「我的」第一屏：
-    // 那一页的预算已经卡到只剩个位数像素（见 check_one_screen），
-    // 加一行就要从别处抠几十 px；而这个开关一年也未必点一次。
-    // 🔴 它必须**用户看得懂、找得到**：文案里明说了发什么、不发什么，
-    //    关掉之后一条都不发（连攒都不攒）。
-    + '<div class="ab-sw">'
-    + '<div class="ab-sw-t"><b>匿名问题上报</b>'
-    + '<span>哪一步没成功、什么版本、它当时说的那句话。'
-    + '不带账号、学号、姓名和手机号。</span></div>'
-    + '<button class="switch' + (reportWanted() ? ' on' : '') + '" id="abReport"'
-    + ' role="switch" aria-checked="' + (reportWanted() ? 'true' : 'false') + '"'
-    + ' aria-label="匿名问题上报"></button>'
-    + '</div>'
     // 2026-11-10 晚（第三版）：「清除本机缓存」搬到这里 —— 用户原话
     // 「清理本机缓存平常很少用，你放深一些」。现在要两步才点得到
     // （我的 → 关于本项目 → 最底下），配得上「一年点不了两次」这个频率。
@@ -12860,12 +11419,6 @@ function aboutBind() {
     });
   }
   const back = $('abBack');
-  const star = $('abStar');
-  if (star) {
-    star.addEventListener('click', () => {
-      if (!openExternal(ABOUT_GH)) toast('打不开浏览器，可以复制链接手动打开');
-    });
-  }
   if (back) {
     back.addEventListener('click', () => {
       aboutView = 'main';
@@ -12877,63 +11430,6 @@ function aboutBind() {
   const cc = $('btnClearCache');
   if (cc) cc.addEventListener('click', clearCacheAsk);
 
-  // 匿名上报的开关。改完只动这颗按钮自己的样子，**不重画整个弹层** ——
-  // 重画会把人从滚到一半的位置弹回顶上。
-  const sw = $('abReport');
-  if (sw) {
-    sw.addEventListener('click', () => {
-      // 现在的状态以**界面上**为准（aria-checked），不猜 CFG 的默认值
-      const off = sw.getAttribute('aria-checked') === 'true';
-      CFG.reportOn = !off;
-      store.set(KEY.settings, CFG);
-      sw.classList.toggle('on', !off);
-      sw.setAttribute('aria-checked', off ? 'false' : 'true');
-      if (off) {
-        // 关掉就是关掉：攒着的那几条也一起删，不留到「下次打开再发」。
-        store.set('zt.reportQ', []);
-        store.set('zt.reportSeen', {});
-      } else {
-        reportFlush();          // 刚打开：把之前攒的（如果有）补发出去
-      }
-      toast(off ? '已关闭，不会再发任何信息' : '已打开，出问题时会自动反馈');
-    });
-  }
-}
-
-/** 求一次 Star（2026-11-14，用户：「在 APP 里面求 star」）。
- *
- *  三条规矩：
- *   ① **只问一次**。答过（点了或跳过）就记下，永远不再弹 —— 反复问是最快
- *      让人卸载的做法；
- *   ② 只问**已经用起来的人**：第 2 次以后打开、而且课表已经同步到了。
- *      第一次打开就伸手是要糖，不是道谢；
- *   ③ 不进原生弹窗、不用系统 Toast：走 App 自己的底部弹层，和别处一致。
- *
- *  ⚠️ 时机放在首屏画完 4 秒之后：开机那一下正在排闹钟、补作业考试，
- *     这时候盖一张卡上去，用户第一反应是「怎么一打开就推销」。
- */
-function starAskOnce() {
-  if (CFG.starAsked) return;
-  if ((CFG.launchN || 0) < 2) return;
-  if (!DATA || !(DATA.courses || []).length) return;
-  // 正在看别的弹层（关于 / 消息 / 确认框）就别抢：等下次打开再说。
-  if (!$('sheetMask').hidden) return;
-  CFG.starAsked = true;
-  store.set(KEY.settings, CFG);
-  $('sheetBody').innerHTML =
-    '<div class="sh-title">这个 App 帮上忙了吗</div>' +
-    '<div class="sh-sub">学生自己做的，免费、无广告。' +
-      '在 GitHub 上标一颗 Star，其他学校才能找到。</div>' +
-    '<div class="sheetbtns">' +
-    '<button class="btn" id="starNo">以后再说</button>' +
-    '<button class="btn primary" id="starYes">去 GitHub</button>' +
-    '</div>';
-  $('sheetMask').hidden = false;
-  $('starNo').addEventListener('click', closeSheet);
-  $('starYes').addEventListener('click', () => {
-    closeSheet();
-    if (!openExternal(ABOUT_GH)) toast('打不开浏览器，可以复制链接手动打开');
-  });
 }
 
 /** 打开「关于本项目」。
@@ -12966,9 +11462,46 @@ async function openAboutSheet() {
 
 $('rowAbout').addEventListener('click', openAboutSheet);
 
+/* 「检查更新」（2026-11-24）—— 版本行右边那颗胶囊。
+ *
+ * 为什么放在这里：版本号本身就是「我现在是几版」，查更新是对它最自然的一个动作，
+ * 用户不用先去别的地方找入口（老版本是把开关藏在一个「检查更新」二级页里，
+ * 而那个页面这一版已经不在了）。
+ *
+ * 🔴 手动查和自动查（checkUpdate(false)）的区别只有两点：
+ *    ① 手动不认 `CFG.updSkip`（用户自己点的，不能被上次的「以后再说」拦掉）；
+ *    ② 手动**必须说话** —— 没新版就 toast 一句「已经是最新」，
+ *       失败就得把 error 原文端出来。自动查失败静默是对的（用户没在等），
+ *       手动查失败静默就是「点了没反应」，那比报错还糟。
+ * 🔴 站起来的时候按钮变「检查中」并置 disabled：那个请求最长 8 秒，
+ *    没有任何反馈的话用户会连点，而连点在 checkUpdate 里会合并到同一个
+ *    inflight 上 —— 点五次只发一次请求，但界面上看起来像是五次都没成。
+ */
+$('meUpd').addEventListener('click', async () => {
+  const b = $('meUpd');
+  if (!b || b.disabled) return;
+  const idle = b.textContent;
+  b.disabled = true;
+  b.textContent = '检查中';
+  try {
+    const r = await checkUpdate(true);
+    if (!r || !r.ok) {
+      toast((r && r.error) || '更新服务暂时不可用', 2600);
+      return;
+    }
+    // 有新版时 checkUpdate 自己已经弹了更新弹层，这里不再多说一句。
+    if (!r.newer) toast('已经是最新版本 v' + MYVER, 2000);
+  } catch (e) {
+    toast('检查更新失败，稍后再试', 2600);
+  } finally {
+    b.disabled = false;
+    b.textContent = idle;
+  }
+});
+
 /* ================= 权限自检（我的 → 权限，2026-11-15） =================
  *
- * 用户：「在我的界面加一个能看航院通需要的权限是否都打开的界面，方便查看」。
+ * 用户：「在我的界面加一个能看东油通需要的权限是否都打开的界面，方便查看」。
  *
  * 为什么需要这一页：这个 App 最要紧的两件事 —— 到点提醒、后台自动跑 ——
  * 全靠系统放行。而国产 ROM 的省电策略会在装完几天后把它悄悄掐掉，
@@ -13086,39 +11619,23 @@ document.addEventListener('visibilitychange', () => {
   if (!document.hidden && CUR_PAGE === 'perm') renderPerm();
 });
 
-/* 「问题反馈」（2026-11-10）。入口在「我的 → 关于」卡里，和「清除本机缓存」并排。
-   ⚠️ 这几颗必须在**页面已经解析完**之后绑 —— app.js 在 </body> 前加载，天然满足。 */
-$('btnFeedback').addEventListener('click', () => { switchTab('feedback'); });
-$('fbBack').addEventListener('click', () => { switchTab('me'); });
-$('fbSend').addEventListener('click', fbSend);
-$('fbPreview').addEventListener('click', fbPreview);
+/* Campus account, service portal, and reference-page bindings. */
 
 // 这一行右边的灰字在**开机时**就要对：用户可能先看到「我的」页，
 // 再决定点不点进去。等打开弹层才更新的话，那里会先显示「参考的项目与链接」，
 // 然后在他眼前变成「… · 联系方式」—— 一次没必要的跳动。
 aboutSummary(aboutCached());
-// 办事入口默认折着（19 个一年用不了几次）。展开状态不存盘：
-// 下次进来还是折着 —— 它本来就是低频的东西，记住了反而让首页变长。
-$('cpAppsToggle').addEventListener('click', () => {
-  const box = $('cpAppsBox');
-  const open = box.hidden;
-  box.hidden = !open;
-  $('cpAppsToggle').setAttribute('aria-expanded', open ? 'true' : 'false');
-});
-// 「校园服务」（一卡通 / 办事入口 / 门户）2026-11-08 起是**二级页**，不再就地展开。
-// 用户原话：「校园服务做成二级界面也做一下吧」——展开后是半屏，而这一页的
-// 主体是接水。id 仍叫 cpMoreToggle（判据和入口都按它走），但动作已经从
-// 「切换 hidden」改成「进那一页」。
+// 校园公告和校园服务从「校园」页进入；服务仍作为独立二级页呈现。
 $('cpMoreToggle').addEventListener('click', () => { switchTab('services'); });
-$('svBack').addEventListener('click', () => { switchTab('campus'); });
-// 二级页的刷新只管门户那一半（一卡通 / 办事）。接水那半在这一页看不见，
-// 刷它等于白打一次服务器 —— 功能页右上角那颗才两样都刷。
-$('svRefresh').addEventListener('click', () => {
-  if (CAMPUS.busy) return;
-  $('svRefresh').classList.add('busy');
-  loadCampus(true).catch(() => {}).then(() => {
-    $('svRefresh').classList.remove('busy');
-  });
+$('svBack').addEventListener('click', () => { switchTab('wiki'); });
+$('cpOpenPortal').addEventListener('click', () => {
+  const url = 'https://portal.nepu.edu.cn/#/index4';
+  if (window.Android && typeof Android.openPortal === 'function') {
+    const result = Android.openPortal();
+    if (result !== 'ok') toast('暂时打不开学校门户');
+    return;
+  }
+  window.open(url, '_blank', 'noopener');
 });
 
 /* ---------------- 要去微信里办（2026-11-16） ----------------
@@ -13176,417 +11693,18 @@ function dirSheet(title, sub, steps, copyName) {
 // 🔴 地址是 **http**：学校这台没开 443（和教务一样）。别顺手改成 https，
 //    那会白屏。WebView 允许明文，教务早就这么用。
 // 🔴 `warn` 传 true（默认值）：这站要登录，进去时**该**提醒，别按「公开站」处理。
-const PAY_URL = 'http://cwcfw.zua.edu.cn/xysf/aAppPage/index.aspx?type=1#/homeMain/MainPageQfShow';
+const PAY_URL = '';
 
-/* ---------------- 财务处：查欠费、查电费（2026-11-16） ----------------
- *
- * 公众号「学生缴费」点开的就是这个平台，而且它有**对外接口**（`mobile/cwcfw.py`
- * 与 native.js 的 `CwApi` 各一份）。所以这一格不再是「教人翻公众号」，
- * 而是直接给出那个数：`欠 800.00` / `没有欠费`。
- *
- * 🔴 只读。充值、下单、支付一律不做 —— 那是真钱。「去缴费」是把官方页面打开，
- *    不是我们代付。
- * 🔴 「没读到」不许写成 0：查失败就保留上一次的数并说出来，绝不能显示「没有欠费」。
- *    这条比好看重要：一个假的 0 会让人以为不用交钱。
- * 🔴 这一格的小字是**唯一**放欠费金额的地方。弹层里只列明细，不再重复合计 ——
- *    同一个数在两处出现，用户会以为看到的是两笔。
- */
-
-const CW = { on: false, st: null, at: 0, busy: false, broken: false };
-
-function cwCell() {
-  return $('dirPay') && $('dirPay').querySelector('span');
-}
-
-/** 把 `欠 800.00` 写到格子的小字上。没登录 / 没读到就维持「直接打开」。 */
-function cwPaintCell(warn) {
-  const el = cwCell();
-  if (!el) return;
-  const b = CW.on && CW.st && CW.st.bill;
-  if (!b) { el.textContent = '直接打开'; return; }
-  const n = parseFloat(b.total);
-  // 🔴 只有真读到 0 才写「没有欠费」；读失败走不到这里（CW.st.bill 保持原样）。
-  el.textContent = (n > 0) ? ('欠 ' + b.total) : '没有欠费';
-  if (warn) el.textContent += ' · 没刷新';
-}
-
-/** 读本机状态。60 秒内不重复读（切进切出服务页很频繁）。 */
-async function cwStateRefresh(force) {
-  if (!force && Date.now() - CW.at < 60000) { cwPaintCell(); return; }
-  try {
-    const r = await api('/api/cw/state');
-    CW.at = Date.now();
-    CW.on = !!(r && r.state === 'ok');
-    // 🔴 2026-11-16：「存着但这次读不出来」必须和「没登录」分开。
-    //    用户原话「财务处登录状态为什么不保存，再次打开还是要重新登陆」——
-    //    读不回来的时候，界面写的是「还没登录」，等于把他上次登录这件事
-    //    从记忆里抹掉了，还一句解释都不给。
-    CW.broken = !!(r && r.state === 'broken');
-    CW.st = CW.on ? r : null;
-  } catch (e) {
-    // 读状态失败不改结论：留上次的，别让数字忽然消失
-  }
-  cwPaintCell();
-}
-
-/** 弹层底下那行字。**默认灰色**，只有真出错才转红。
- *
- *  🔴 `.tip` 这个类天生是红字（给报错用的）。财务处这两屏一开始全用它，
- *     于是「密码只存在这台手机里」和「学费和住宿费都交了」都是红的 ——
- *     一句话明明是好消息，颜色却在报警，看着像这儿出了问题。
- */
-function cwTipSet(txt, bad) {
-  const p = $('cwTip');
-  if (!p) return;
-  p.textContent = txt;
-  p.className = 'tip note' + (bad ? ' bad' : '');
-}
-
-function cwLoginSheet(msg) {
-  // 🔴 2026-11-16：两个框里各写一句「填什么」。用户原话「账号就是学号，
-  //    密码默认是身份证号后六位」—— 这句话不写出来，第一次用的人只会拿
-  //    教务那套密码去试，试错几次平台就开始要图形验证码，比不填提示更糟。
-  //    提示写成框下面的小字而不是 placeholder：placeholder 一输入就没了，
-  //    而这个信息输到一半也还要看。
-  $('sheetBody').innerHTML =
-    '<div class="sh-title">查学费和住宿费</div>' +
-    '<div class="sh-sub">只查，不扣钱。</div>' +
-    '<label class="field"><span>学号</span>' +
-    '<input id="cwXh" inputmode="numeric" autocomplete="username" ' +
-    'placeholder="学号"></label>' +
-    '<p class="tip cwhint">和教务登录用的是同一个号。</p>' +
-    '<label class="field"><span>密码</span><span class="pwdbox">' +
-    '<input id="cwPwd" type="password" autocomplete="current-password" ' +
-    'placeholder="财务处的密码">' + pwdEyeHtml('cwPwd') + '</span></label>' +
-    // 密码这句要把「财务处的」也带上：账号和教务同一个，密码**不是** ——
-    // 只说「默认身份证后六位」，改过教务密码的人会以为这里是教务那套。
-    '<p class="tip cwhint">财务处的，默认是身份证号后六位。</p>' +
-    '<div class="sheetbtns"><button class="btn primary" id="cwGo">登录</button></div>' +
-    '<p class="tip note' + (msg ? ' bad' : '') + '" id="cwTip">' +
-    esc(msg || '密码只存在这台手机里。') + '</p>';
-  $('sheetMask').hidden = false;
-  $('cwGo').addEventListener('click', () => cwDoLogin());
-  $('cwPwd').addEventListener('keydown', (e) => { if (e.key === 'Enter') cwDoLogin(); });
-}
-
-/** 断开财务处：清掉服务端存的那份（cookie + 密码），本机状态一起归零。
- *
- *  🔴 别只清 `CW` 不调接口 —— 那样下次进页面 `cwStateRefresh` 又会把
- *     服务端那份读回来，"断开"看起来毫无作用。
- */
-async function cwDisconnect() {
-  try { await api('/api/cw/logout', {}); } catch (e) { /* 清不掉也照样归零 */ }
-  CW.on = false;
-  CW.st = null;
-  CW.broken = false;
-  CW.at = Date.now();
-  cwPaintCell();
-  if (typeof paintMiniWallets === 'function') paintMiniWallets();
-}
-
-async function cwDoLogin() {
-  const xh = ($('cwXh').value || '').trim();
-  const pwd = $('cwPwd').value || '';
-  if (!xh || !pwd) { cwTipSet('学号和密码都要填。', true); return; }
-  if (CW.busy) return;
-  CW.busy = true;
-  $('cwGo').textContent = '登录中…';
-  try {
-    const r = await api('/api/cw/login', { xh, pwd });
-    if (!r || !r.ok) {
-      cwTipSet((r && r.error) || '登录没通过：学号或密码不对。', true);
-      return;
-    }
-    CW.on = true; CW.st = r; CW.at = Date.now(); CW.broken = false;
-    cwPaintCell();
-    if (typeof paintMiniWallets === 'function') paintMiniWallets();
-    // 🔴 后端存完会当场回读一次（`kept`）。存不住就在这里说 ——
-    //    以前要等用户下次打开、发现又要登录才知道，那时已经没法归因了。
-    //    本次会话照常可用（凭据在内存里），只是别让他以为已经记住了。
-    if (r && r.kept === false) {
-      toast('这次登录没记在本机，下次打开要再登一次', 4500);
-    }
-    // 从「账号管理」登进来的：人等的是「这一行变成已连接」，不是一张账单。
-    // 账单要看得从电费那张小卡进 —— 那里本来就是它的位置。
-    if (CUR_PAGE === 'accounts') {
-      $('sheetMask').hidden = true;
-      renderAccounts();
-      return;
-    }
-    await cwBillSheet(r);
-  } catch (e) {
-    cwTipSet('登录失败：' + ((e && e.message) || e), true);
-  } finally {
-    CW.busy = false;
-    const g = $('cwGo');
-    if (g) g.textContent = '登录';
-  }
-}
-
-function cwOpenPay() {
-  if (NATIVE && window.NativeApi && typeof NativeApi.openWeb === 'function') {
-    let why = 'none';
-    // 🔴 第三个参数（warn）必须是 false，2026-11-16 用户原话：
-    //    「咱们 APP 里打开的页面看着这么老，还需要图形验证码，微信里打开就不需要」。
-    //    warn 不只是「要不要提示登录已过期」—— WebActivity 里它同时决定**电脑版**：
-    //    `applyMode(saved == 1 || (saved == -1 && warn && !isChaoxing(url)))`
-    //    ⇒ 传 true 就换成桌面 UA，平台那头给的是 PC 版登录页（`/xysf/`，
-    //    老 ASP.NET 界面，带 `txt_yzm` 图形验证码）；手机 UA 拿到的是移动版
-    //    H5（Angular，两个输入框，没有验证码）。
-    //    缴费平台跟门户登录态没有关系，本来也不该弹「登录已过期」。
-    try { why = NativeApi.openWeb(PAY_URL, '缴费', false); }
-    catch (e) { why = 'fail: ' + ((e && e.message) || e); }
-    if (why === '') return;
-  }
-  if (openExternal(PAY_URL)) return;
-  paySheet();
-}
-
-// 平台整个开不出来时（老 APK 没有 openWeb、网页版弹窗被拦）的兜底：
-// 至少让人知道公众号里怎么走，不卡在原地。
-function paySheet() {
-  dirSheet(
-    '去平台交钱',
-    '在浏览器里打开学校缴费平台，用学号和财务处的密码登录。',
-    ['微信搜索「郑州航空工业管理学院财务处」并关注',
-     '点底部「学生缴费」',
-     '登录后点「生活缴费」→「电费充值」',
-     '选自己的房间，付款'],
-    '郑州航空工业管理学院财务处');
-}
-
-/** 账号页点「财务处」那一行：已连接就给欠费和明细，没连接就地登录。
- *
- *  用户 2026-11-16 连问了三个问题，其中两个都指向这里：他在账号管理里
- *  看到「财务处 · 已连接」，下一步想看欠费和用电，但那行除了「断开」
- *  没有第二个动作，明细入口藏在电费小卡的弹层里 —— 等于没放。
- */
-function cwOpenMine() {
-  if (!CW.on) {
-    cwLoginSheet(CW.broken ? '本机存着上次的登录，这次读不出来，请重新登录。' : '');
-    return;
-  }
-  cwBillSheet(CW.st);
-}
-
-async function cwBillSheet(st) {
-  const b = (st && st.bill) || { total: '0.00', count: 0, items: [] };
-  const items = b.items || [];
-  const owed = parseFloat(b.total) > 0;
-
-  let h = '<div class="sh-title">待缴费用</div>' +
-    '<div class="sh-sub">' + (st && st.name ? esc(st.name) + ' · ' : '') +
-    (owed ? '共 ' + b.count + ' 笔' : '没有欠费') + '</div>';
-
-  if (items.length) {
-    h += '<ul class="cwlist">';
-    items.forEach((it) => {
-      h += '<li><span class="n">' +
-        esc((it.period ? it.period + ' · ' : '') + it.name) + '</span>' +
-        '<b>' + esc(it.due) + '</b></li>';
-    });
-    h += '</ul>';
-    // 明细比合计少的时候要说明，别让用户以为就这些
-    if (b.count > items.length) {
-      h += '<p class="tip note">还有 ' + (b.count - items.length) +
-        ' 笔在平台里没读到，去平台看全的。</p>';
-    }
-  } else if (owed) {
-    // 合计有、明细没有：只报合计，不编项目名
-    h += '<p class="tip note">合计 ' + esc(b.total) + ' 元，明细没读到。</p>';
-  } else {
-    h += '<p class="tip note">学费和住宿费都交了。</p>';
-  }
-
-  const rm = (st && st.room) || null;
-  // 🔴 2026-11-16 用户：「右边那个『换』为什么不用『更换』」。
-  //    同一个字在弹层里既当动词又当量词，读起来像「换一份」。按钮写全称。
-  // 这一行叫「宿舍电量」而不是「宿舍电费 · 剩余电量」：这个数是**度**，
-  // 叫电费再跟一个「度」是两套单位撞在一起；「电量 + 度」自己就说明白了。
-  h += '<div class="cwrow"><span class="k">宿舍电量</span>' +
-    (rm ? '<b class="v">' + esc(rm.balance) + ' 度</b>' : '') +
-    '<button class="linkbtn" id="cwRoom">' + (rm ? '更换' : '选房间') + '</button></div>';
-  if (rm && rm.label) h += '<p class="tip note cwroom">' + esc(rm.label) + '</p>';
-
-  // 记录入口（2026-11-16）：购电和用电在平台那头是两张表，这里合成一个弹层。
-  // 🔴 不写「充值」两个字 —— 那会让人以为这儿能充钱（只读，判据也咬这条）。
-  //    平台自己的用词是「购电」，照它说。
-  // 🔴 **入口常在**。以前只在 `rm.cxid` 有值时才画，而 cxid 要选过房间才有
-  //    ⇒ 第一次进来的人根本看不到这个入口，用户当天就问「用电和缴费明细
-  //    你又放哪去了」。没房间也能点，点开再引导他去选。
-  // 🔴 原来叫「缴费 · 用电明细」：`缴费` 和 `用电` 并列，看着像两件事，
-  //    点开却是一张表的两个分段。改成一个名字「电费记录」，分段放在里面。
-  h += '<div class="cwrow"><span class="k">电费记录</span>' +
-    '<button class="linkbtn" id="cwRec">查看</button></div>';
-
-  h += '<div class="sheetbtns">' +
-    '<button class="btn" id="cwGoPay">去缴费</button>' +
-    '<button class="btn primary" id="cwOk">知道了</button></div>' +
-    '<p class="tip note" id="cwTip"></p>';
-
-  $('sheetBody').innerHTML = h;
-  $('sheetMask').hidden = false;
-  $('cwOk').addEventListener('click', () => { $('sheetMask').hidden = true; });
-  $('cwGoPay').addEventListener('click', () => cwOpenPay());
-  $('cwRoom').addEventListener('click', () => cwPickRoom());
-  if ($('cwRec')) $('cwRec').addEventListener('click', () => cwRecordsSheet('pay'));
-}
-
-/** 电费记录：购电（钱）和用电（度）两张表，一个弹层两个分段。
- *
- *  🔴 两个口径**不能混**：购电是元、用电是度。混在一张表里，
- *     用户会把「这个月充了 50」看成「这个月用了 50 度」。
- *  🔴 只显示平台给的第一页（近 10 条），多的说清楚「去平台看」。
- *     不写「本月」—— 日期条件我们没传，窗口是平台自己定的，不能替它说。
- */
-async function cwRecordsSheet(kind) {
-  const rm = (CW.st && CW.st.room) || null;
-  if (!rm || !rm.cxid) {
-    // 🔴 以前这里是 `toast(...); return;` —— 人点进来只被说一句「先选房间」，
-    //    然后就站在原地。现在直接开工：选完房间、读完电量，自己回到这张表。
-    toast('记录按房间算，请先选房间');
-    cwPickRoom('rec');
-    return;
-  }
-  const k = kind === 'use' ? 'use' : 'pay';
-  // 读的过程中换来换去：只认最后一次点的那张表，早回来的丢掉。
-  const mine = (cwRecordsSheet.seq || 0) + 1;
-  cwRecordsSheet.seq = mine;
-
-  $('sheetBody').innerHTML =
-    '<div class="sh-title">电费记录</div>' +
-    '<div class="sh-sub">' + esc(rm.label || '宿舍电费') + '</div>' +
-    '<div class="cwsegs">' +
-    '<button type="button" data-k="pay" class="' + (k === 'pay' ? 'on' : '') + '">购电</button>' +
-    '<button type="button" data-k="use" class="' + (k === 'use' ? 'on' : '') + '">用电</button>' +
-    '</div>' +
-    '<ul class="cwlist" id="cwRecList"><li><span class="n">正在读…</span></li></ul>' +
-    '<p class="tip note" id="cwRecTip" hidden></p>' +
-    '<div class="sheetbtns"><button class="btn primary" id="cwRecOk">知道了</button></div>';
-  $('sheetMask').hidden = false;
-  $('cwRecOk').addEventListener('click', () => { $('sheetMask').hidden = true; });
-  $('sheetBody').querySelectorAll('.cwsegs button').forEach((b) => {
-    b.addEventListener('click', () => cwRecordsSheet(b.dataset.k));
-  });
-
-  let r = null;
-  let err = '';
-  try {
-    r = await api('/api/cw/records', { kind: k });
-    if (!r || !r.ok) err = (r && r.error) || '记录没读到';
-  } catch (e) {
-    err = '记录没读到：' + ((e && e.message) || e);
-  }
-  if (cwRecordsSheet.seq !== mine) return;      // 已经换了另一张表
-  const list = $('cwRecList');
-  if (!list) return;                            // 弹层已经关了
-
-  const tip = $('cwRecTip');
-  if (err) {
-    list.innerHTML = '';
-    if (tip) {
-      tip.hidden = false;
-      tip.className = 'tip note bad';
-      tip.textContent = err;
-    }
-    return;
-  }
-  const items = (r && r.items) || [];
-  if (!items.length) {
-    list.innerHTML = '<li><span class="n">' +
-      (k === 'use' ? '还没有用电记录' : '还没有购电记录') + '</span></li>';
-    return;
-  }
-  list.innerHTML = items.map((it) => {
-    // 购电带订单号（对账要用），用电只有日期和度数。
-    const sub = (k === 'pay' && it.sn)
-      ? '<i class="cwsub">订单 ' + esc(it.sn) + '</i>' : '';
-    return '<li><span class="n">' + esc(it.at || '') + sub + '</span>' +
-      '<b>' + esc(it.num || '') + (k === 'use' ? ' 度' : ' 元') + '</b></li>';
-  }).join('');
-  if (tip && r && r.more) {
-    tip.hidden = false;
-    tip.className = 'tip note';
-    tip.textContent = '只列出最近 10 条，更多的去平台看。';
-  }
-}
-
-/** 选楼栋 → 选房间 → 记住。两个都走应用自己的单选弹层（原生 <select> 太丑）。
- *
- *  `next` 是选完之后要去的地方：不给就回账单弹层；`'rec'` 表示人是从
- *  「缴费 · 用电明细」点进来的，选完直接落到那张表上（别让他再点一次）。
- */
-async function cwPickRoom(next) {
-  let bs;
-  try {
-    bs = await api('/api/cw/elec/options', {});
-  } catch (e) { toast('楼栋没读出来：' + ((e && e.message) || e)); return; }
-  if (!bs || !bs.ok) { toast((bs && bs.error) || '楼栋没读出来'); return; }
-  const bid = await openPick('选楼栋', '电费按房间算，先选宿舍楼', [{
-    items: (bs.options || []).map((o) => ({ id: o.value, name: o.label })),
-  }], '');
-  if (!bid) return;
-
-  let rs;
-  try {
-    rs = await api('/api/cw/elec/options', { buildid: bid });
-  } catch (e) { toast('房间没读出来：' + ((e && e.message) || e)); return; }
-  if (!rs || !rs.ok) { toast((rs && rs.error) || '房间没读出来'); return; }
-  const rid = await openPick('选房间', '选你住的那间', [{
-    items: (rs.options || []).map((o) => ({ id: o.value, name: o.label })),
-  }], '');
-  if (!rid) return;
-
-  const label = ((rs.options || []).find((o) => String(o.value) === String(rid)) || {}).label || '';
-  try {
-    const got = await api('/api/cw/elec', { buildid: bid, roomid: rid, label });
-    if (!got || !got.ok) { toast((got && got.error) || '电费没读出来'); return; }
-    if (CW.st) CW.st.room = got.elec;
-    if (next === 'rec') { await cwRecordsSheet('pay'); return; }
-    await cwBillSheet(CW.st);
-  } catch (e) {
-    toast('电费没读出来：' + ((e && e.message) || e));
-  }
-}
-
-$('dirPay').addEventListener('click', () => {
-  // 登录过就直接给数；没登录就当场登录（不另开一屏，账号页已经满了）
-  if (CW.on) { cwBillSheet(CW.st); return; }
-  cwLoginSheet(CW.broken ? '本机存着上次的登录，这次读不出来，请重新登录。' : '');
-});
-
-$('dirFix').addEventListener('click', () => dirSheet(
-  '宿舍报修',
-  '水管、门窗、灯坏了都从这里报，报完能看进度。',
-  ['微信搜索「郑航后勤」并关注',
-   '点底部「微服务」→「在线报修」',
-   '用学号登录，初始密码是六个 1',
-   '填楼栋和故障，可以传照片'],
-  '郑航后勤'));
-
-$('dirSeat').addEventListener('click', () => dirSheet(
-  '图书馆座位',
-  '在馆外先约好，到馆扫屏幕上的码签到。',
-  ['微信搜索「郑航图书馆」并关注',
-   '点底部「座位使用」→「预约系统」',
-   '第一次要绑学号和借书密码（默认同学号）',
-   '到馆后扫阅览室屏幕上的码签到，离座要点退座'],
-  '郑航图书馆'));
-
-// 图书馆官网是 https，能直接在应用内打开。进去再点「我的图书馆」，
-// 用学号和借书密码登录 —— 那一步要输密码，交给网页自己做，我们不碰。
-const LIB_URL = 'https://lib.zua.edu.cn/';
-$('dirLib').addEventListener('click', () => {
-  if (NATIVE && window.NativeApi && typeof NativeApi.openWeb === 'function') {
-    let why = 'none';
-    try { why = NativeApi.openWeb(LIB_URL, '图书馆', false); }
-    catch (e) { why = 'fail: ' + ((e && e.message) || e); }
-    if (why === '') return;
-  }
-  if (!openExternal(LIB_URL)) toast('打不开浏览器，可以复制链接手动打开');
-});
-// 公告并进了功能页：一行入口，点进完整列表（列表页还在，只是不占 tab）。
+// 公告使用 NEPU 教务会话与独立缓存。
 $('ntEnter').addEventListener('click', () => { switchTab('notice'); });
+$('nepuNoticeSync').addEventListener('click', syncNepuNotices);
+$('nepuNoticeList').addEventListener('click', e => {
+  const row = e.target.closest('[data-notice-id]');
+  if (!row) return;
+  const it = Nepu.normalizeNotices(nepuNoticeCache && nepuNoticeCache.items).find(n => n.id === row.dataset.noticeId);
+  if (it) openNepuNotice(it);
+});
+renderNepuNotices();
 // 没登慧生活时那颗按钮：账号在「我的 → 账号管理」，直接把人送过去并展开设备登录。
 $('wtGoLogin').addEventListener('click', () => {
   // 「重试」= 这一页没读到登录状态，重读一次就行，别把人拖去登录页
@@ -13733,9 +11851,6 @@ $('wtTermsOk').addEventListener('click', () => { wtTermsOk(); });
 // 返回回「校园」—— 百科 0.21.0 从「我的」搬到「校园」了（见 SUB_PARENT）。
 // ⚠️ 这里和 SUB_PARENT 必须一致：不一致的话，点返回去的页面和底部高亮的
 //    tab 是两个东西，用户会以为自己点错了。
-// 头卡上那个「打开原站首页」。走 openWiki 同一条路 —— 白名单、开不了时说一句，
-// 一个都不能少。别在这里另写 openApp / openExternal。
-$('wikiHome').addEventListener('click', () => { openWiki(WIKI_HOME + '/'); });
 
 /** 安卓返回键：先关浮层，再回课表，最后才退出 App。
  *
@@ -13762,7 +11877,7 @@ window.appBack = function () {
   return false;
 };
 
-// ------------------------------------------------------------------ 检查更新
+// ------------------------------------------------------------------ 本地版本信息
 /* 更新清单是一份静态 JSON，跟发布页放在同一个域名下，APK 和网页版查的是同一份。
  *
  * 为什么不用 GitHub Releases API：国内访问 github.com 时通时断（校网里尤其明显），
@@ -13774,14 +11889,23 @@ window.appBack = function () {
  *    两边都是跨域请求。少了这个头，fetch 会静默失败，
  *    表现成「永远显示已是最新版本」—— 又是一个把错误说成事实的坑。
  */
-// 🔴 顺序有意义：hobson.cc 稳定，排第一；旧域名留在第二位 ——
-//    它国内会偶发被断，但多一条路总比少一条强（正常情况根本走不到）。
-//
+/* 清单挂在 GitHub 仓库里（2026-11-24）：仓库 dsy-star/NepuPass 的 `version.json`
+ * 由发版工作流（.github/workflows/release.yml）在每次打 tag 时重写。
+ *
+ * 🔴 顺序有意义：GitHub Pages 更新最快（CDN 大约十分钟），排第一；
+ *    jsDelivr 和 raw 都是从同一个 gh-pages 分支读的**同一份文件**，
+ *    只是线路不同 —— 国内 jsDelivr 基本能连，raw 常被断，
+ *    但多一条路总比少一条强（主源成功时备源根本不会发出去，见 fetchManifest）。
+ * 🔴 三个地址的路径必须**一模一样**，否则备源拿到的可能是上一次发版的清单，
+ *    会被判成「已是最新」而把更新吃掉。
+ * 🔴 GitHub Pages 需要在仓库设置里开一次（Source: Deploy from a branch → gh-pages）。
+ *    没开的时候这一条会 404，fetchManifest 会落到 jsDelivr 那条，不算错。
+ */
 // 正式版清单 = 所有人「检查更新」读的那份。
 const UPD_STABLE = [
-  'https://hobson.cc/hangyuantong/version.json',
-  'https://hobson2233.dpdns.org/hangyuantong/version.json',
-  'https://raw.githubusercontent.com/Hobson2233/hangyuantong/main/version.json',
+  'https://dsy-star.github.io/NepuPass/version.json',
+  'https://cdn.jsdelivr.net/gh/dsy-star/NepuPass@gh-pages/version.json',
+  'https://raw.githubusercontent.com/dsy-star/NepuPass/gh-pages/version.json',
 ];
 /* 测试版清单（2026-11-07）：**不挂在任何页面上**，路径也不在公开页面、
    历史列表、正式版清单里出现 —— 只有测试版 App 自己知道这个地址。
@@ -13793,10 +11917,7 @@ const UPD_STABLE = [
    🔴 退回正式版清单是**兜底**，不是常态：正式版的 code 是发版那一刻重新
       打的、比测试版大，所以真退回去了会提示「有新版本」并装成正式版 ——
       比永远停在旧测试版强，但只该在测试版清单整个消失时发生。 */
-const UPD_BETA = [
-  'https://hobson.cc/hangyuantong/beta/manifest.json',
-  'https://hobson2233.dpdns.org/hangyuantong/beta/manifest.json',
-];
+const UPD_BETA = [];
 const UPD_SRC = (APP_CHANNEL === 'beta' ? UPD_BETA : []).concat(UPD_STABLE);
 
 /* 测试版那一层的口令（2026-11-10）。
@@ -13954,6 +12075,10 @@ async function fetchOne(base, ms) {
  *     （dpdns 只有兜底时才更新），拿错会被判成「有新版本」或「已是最新」。
  */
 async function fetchManifest() {
+  // 清单数组被清空（本地构建、没配源）时不要往后走：
+  // 原来这里会 fetchOne(undefined) 抛 TypeError，被 checkUpdate 兜成
+  // 「更新服务暂时不可用」—— 一句话既不说是什么问题，也没法排查。
+  if (!UPD_SRC.length) return { ok: false, error: '这个版本没有配置更新源' };
   const rest = UPD_SRC.slice(1);
   if (!rest.length) return fetchOne(UPD_SRC[0], UPD_MAIN_MS);
   // 主源成功就把备源按住不发 —— 备源里那两个国内基本连不上，
@@ -14032,10 +12157,6 @@ async function checkUpdate(manual) {
   if (manual && typeof navigator !== 'undefined' && navigator.onLine === false) {
     return { ok: false, error: '本机无网络，请检查连接' };
   }
-  // 顺手把「今天这台设备开着过」记一笔。发一次就够，后面自己会早返回。
-  // 放在这里而不是 boot()：这一处的语义就是「这台设备在检查更新」，
-  // 和日活的口径对得上；开机那一枪会被下面的 memo 判据重复挡掉，意义一样。
-  devPing();
   // 30 秒内刚查过：自动检查直接用上次的结果，不再打一遍网络。
   if (!manual && updMemo &&
       (Math.floor(Date.now() / 1000) - updMemo.at) < UPD_MEMO_SEC) {
@@ -14080,6 +12201,38 @@ async function checkUpdate(manual) {
     return await run;
   } finally {
     updInflight = null;
+  }
+}
+
+/* ------------------------------------------------------------ 自动检查（每日）
+ *
+ * 和手动那条路的分工：手动是用户自己点「检查更新」，**什么都要说出来**
+ * （没网、服务挂了、已经最新）。这条不是 —— 它只在确实有更新时才弹面板，
+ * 失败／没网／清单挂了统统闭嘴。没人喜欢开个 App 就被一个红字拦住。
+ *
+ * 节奏由设置里那三个值决定（CFG.updOn / updFreq / updLast）：
+ *   · updOn 关着就一次都不查（默认开）；
+ *   · 间隔 always / daily / weekly 见 UPD_FREQ_SEC；
+ *   · updLast 由 checkUpdate 在**成功拿到清单之后**自己写，
+ *     所以关网、服务挂了不会把计时器白白重置成「今天查过了」。
+ *
+ * 已经被「以后再说」的那个版本不再自动弹（CFG.updSkip，判断在 checkUpdate 里），
+ * 但用户手动点的时候照样弹 —— 那是他自己要看。
+ */
+const UPD_BOOT_DELAY_MS = 5000;
+
+async function updAutoCheck() {
+  try {
+    if (!CFG.updOn) return;
+    const freq = UPD_FREQ_SEC[CFG.updFreq];
+    if (typeof freq !== 'number') return;
+    const now = Math.floor(Date.now() / 1000);
+    // freq 为 0（always）表示不限间隔；其余按秒数卡。
+    // 少一分钟的容差是为了「刚查过又马上启动」时别立刻再来一轮。
+    if (freq > 0 && CFG.updLast && now - CFG.updLast < freq - 60) return;
+    await checkUpdate(false);
+  } catch (e) {
+    // 自动检查永远不许影响启动。
   }
 }
 
@@ -14175,10 +12328,15 @@ function updUrls(info) {
   return updLines(info).map((l) => l.url);
 }
 
-/** 下载到本机的文件名。只用 ASCII —— 中文名在有些 ROM 的下载目录里会变乱码。 */
+/** 下载到本机的文件名。只用 ASCII —— 中文名在有些 ROM 的下载目录里会变乱码。
+ *
+ *  2026-11-24 前缀从 `hangyuantong-` 改成 `dongyoutong-`：改名之后
+ *  清单里的安装包就叫 `dongyoutong-0.1.1.apk`，这里再写旧前缀，
+ *  用户手机里会同时躺着两种前缀的包，回滚的时候根本分不清哪个是新的。
+ *  ApkProvider 那边只认 `.apk` 结尾的 ASCII 名字，两边必须对得上。 */
 function updName(info) {
   const v = updKey(info).replace(/[^0-9A-Za-z._-]/g, '');
-  return 'hangyuantong-' + (v || 'new') + '.apk';
+  return 'dongyoutong-' + (v || 'new') + '.apk';
 }
 
 /** DownloadManager 的失败原因码。不翻译的话界面上就是一句「错误码 1008」。 */
@@ -14980,7 +13138,7 @@ const WT_HIDE_KEY = 'wt.hide.local';
 /* 0.52.1：贴纸编号 → 设备编号。
    机器上那张蓝环贴纸里是 `nfc.html?q=<贴纸芯片的序列号>`，不是设备号 ——
    用户 2026-11-11 两头都给了：贴纸上是 1D893A12171080（7 字节，正是 NFC
-   标签 UID 的长度），航院通里这台机器是 869810053542983。两个换算不出来，
+   标签 UID 的长度），东油通里这台机器是 869810053542983。两个换算不出来，
    只有慧生活的服务器认那个对应关系。
    所以：第一次碰见这张贴纸时问一句「是哪台」，记在这儿，以后一碰就出水。 */
 const WT_TAG_KEY = 'wt.tags.local';
@@ -15324,7 +13482,7 @@ async function wtScanOpen() {
     const n = (e && e.name) || '';
     if (n === 'NotAllowedError' || n === 'SecurityError') {
       wtScanFail('没给相机权限',
-        '去「设置 → 应用 → 航院通」开相机，或粘贴');
+        '去「设置 → 应用 → 东油通」开相机，或粘贴');
     } else if (n === 'NotFoundError') {
       wtScanFail('这台设备没有相机', '用「粘贴二维码内容」添加，效果一样。');
     } else {
@@ -16117,7 +14275,6 @@ async function wtLoadScore() {
     const r = await api('/api/water/score');
     if (!r || !r.ok) {
       if (r && r.kind === 'auth') { wtExpire('score'); }
-      reportProblem('water_score', r && r.kind, r && r.error, 'campus');
       WT.score = null;
       WT.scoreErr = (r && r.error) || '读不到';
     } else {
@@ -16493,7 +14650,6 @@ async function wtLoadMissions(keepRun) {
       if (r && r.kind === 'auth') { wtExpire('score'); }
       // 「积分任务一直失败」是 2026-11-06 那轮的主要问题。报上去才知道
       // 是所有人都失败（平台改版），还是只有某类账号失败。
-      reportProblem('water_task', r && r.kind, r && r.error, 'campus');
       WT.missions = [];
       WT.missionErr = (r && r.error) || '读不到';
       WT.missionSkipped = 0;
@@ -17305,7 +15461,6 @@ async function renderWater() {
   // 🔴 校园卡那张挪去「我的 → 账号管理」了，这里**不许再调 wxCardLoad**：
   //    完美校园单会话，一进页面就去查余额 = 把用户手机上的官方 App 顶下去。
   //    电费是财务处的，60 秒内重复进来不重读（节流在 cwStateRefresh 里）。
-  cwStateRefresh(false).then(paintMiniWallets);
   // 有会话就接着盯账单（切走时 switchTab 会停掉，回来这里再起）
   if (WT.live) wtLiveStartPoll();
 
@@ -17407,7 +15562,6 @@ async function wtSendSms() {
     const r = await api('/api/water/sms', { phone, key: WT.key, graph });
     if (!r || !r.ok) {
       // 发短信这一步失败（图形码不对 / 手机号被限 / 平台改版）。
-      reportProblem('water_bind', 'sms_' + (r && r.kind || ''), r && r.error, 'accounts');
       wtTip(wtErrText(r && r.kind, r && r.error), true);
       wtNewCaptcha();               // 图形验证码一次性，失败必须换
       return;
@@ -17498,7 +15652,6 @@ async function wtLogin() {
       // 慧生活登录失败。它最近改得勤（2026-11-06 那次「请升级最新版」），
       // 有上报才能看出是「版本墙」还是「码不对」还是「校验变了」。
       // ⚠️ 手机号和验证码都不报 —— 只报分类和平台自己说的话。
-      reportProblem('water_bind', r && r.kind, r && r.error, 'accounts');
       wtTip(wtErrText(r && r.kind, r && r.error), true);
       wtNewCaptcha();
       $('wtSms').value = '';
@@ -18066,196 +16219,14 @@ async function wtLogout(kind) {
   wtShowOff();
 }
 
-/* ---- 郑航百科（wiki.zua.fan）------------------------------------------
-   学长们写的非官方百科。**我们只做入口，不复制正文**：
-   站上「关于本项目」写着「任何复制、转载请注明出处！严禁用于商业用途！」，
-   而且它目前还没开源（原文：「预计近期上线 GitHub」）。
-   ⇒ 这里只存「标题 + 相对路径」，点了打开原站那一页。
-
-   ⚠️ 路径是手抄的，对方改结构就会 404。缓解办法：
-      · 全部写成 `/xxx` 相对路径拼在 WIKI_HOME 后面 —— 换域名只改一处
-      · `check_wiki_links.py` 盯着两件事：路径必须是相对路径、
-        拼出来的 URL 必须还在 wiki.zua.fan 里（离线跑，不联网）
-   ⚠️ 别用 `<a href>`：MainActivity 拦掉一切非 app.local 的跳转，
-      点了毫无反应、也不报错 —— 必须走 openWiki → openApp。 */
-const WIKI_HOME = 'https://wiki.zua.fan';
-const WIKI_GROUPS = [
-  ['关于郑航', [
-    ['学校简介', '/aboutZUA/'],
-    ['映像郑航', '/aboutZUA/videos'],
-    ['校园地图', '/map/'],
-  ]],
-  ['招生与入学', [
-    ['招生章程', '/enroll/brochure'],
-    ['招生计划', '/enroll/plan'],
-    ['新生入学须知', '/enroll/starting'],
-  ]],
-  ['校园生活', [
-    ['宿舍', '/life/hostel'],
-    ['日常消费', '/life/consumption'],
-    ['交通出行', '/life/transportation'],
-  ]],
-  ['人才培养', [
-    ['大类分流', '/education/MajorSelection'],
-    ['转专业', '/education/ChangingMajors'],
-  ]],
-  ['其他', [
-    ['社区（QQ 频道 / 贴吧群）', '/community/'],
-    ['关于这个站', '/aboutUs/'],
-  ]],
-];
-
-/** 把 4 组 13 条填进独立页（`#page-wiki`）。
- *
- *  🔴 为什么是页面不是弹层：11 条 + 4 个组标题在 `.sheet` 里放不下 ——
- *     实测内容 839px、可用高度 641px（`max-height:76%`），底部按钮被滚出屏幕
- *     （按钮底边 1009 / 视口 844）。一页装得下，也不用内部滚动。
- *     弹层那版是做完才量出来的，量完就改了 —— 「代码里写着对」和「画出来对」是两件事。
- */
 function renderWikiPage() {
-  // 组名在卡片**外面**、条目在一张白卡里 —— iOS 分组列表的样子。
-  // 旧版是「组名 + 13 行全塞进同一张卡」，组与组之间只靠一条 14px 的间距分开，
-  // 扫起来分不清哪几行是一组的（用户 2026-10-28 说的「审美」就是这个）。
-  //
-  // 🔴 0.33.0：组内改成**两列**（用户：「每个界面的内容都放在一页内」）。
-  //    单列 13 行 = 802px，一页 1026、可用只有 731，怎么压都装不下；
-  //    两列后 8 行装完。`lastrow` 是给 CSS 用的：最后一行不画分隔线 ——
-  //    两列时最后一个格子可能落在**左列**，`:last-child` 算不准。
-  $('wikiList').innerHTML = WIKI_GROUPS.map(([g, items]) => {
-    const lastRowStart = Math.max(0, (Math.ceil(items.length / 2) - 1) * 2);
-    return '<div class="wikigroup">' +
-      '<div class="gname">' + esc(g) + '</div>' +
-      '<div class="card wcard">' +
-        items.map(([name, path], i) =>
-          '<button class="wikilink' + (i >= lastRowStart ? ' lastrow' : '') +
-          '" data-path="' + escAttr(path) + '">' +
-          '<span class="t">' + esc(name) + '</span>' +
-          '<svg class="go" viewBox="0 0 24 24"><path d="M9 6l6 6-6 6"/></svg>' +
-          '</button>').join('') +
-      '</div>' +
-    '</div>';
-  }).join('');
-  // innerHTML 会把旧节点连同监听一起扔掉，所以每次重画都重新绑一遍。
-  // 不重绑的话第二次进来点了没反应，而且**不报错**。
-  $('wikiList').querySelectorAll('.wikilink').forEach((b) => {
-    b.addEventListener('click', () => { openWiki(WIKI_HOME + b.dataset.path); });
-  });
-}
-
-/** 百科的外链统一走这里 —— **只允许 wiki.zua.fan**，别的一律不开。
- *  白名单是必须的：URL 来自 DOM 的 `data-path`，将来有人往里塞绝对地址，
- *  `WIKI_HOME + x` 会拼出别的站（`https://wiki.zua.fan` + `https://evil`）。
- *  这也是「跨产品复用页面必断言外链白名单」那条红线的具体落点。 */
-function openWiki(url) {
-  if (!/^https:\/\/wiki\.zua\.fan\//.test(url)) {
-    toast('链接不对，没打开');
-    return;
+  const list = $('wikiList');
+  if (!list) return;
+  if (!$('ntEnter')) {
+    list.innerHTML = '<div class="card"><p class="tip note">东油适配中</p></div>';
   }
-  // 0.17.3 起在 App 内打开：这个站没有登录态，所以不是为了免登录 ——
-  // 纯粹是别把人踢出去再跳回来。外面那套（白名单 → 有反馈）一条都不少。
-  // warn=false：公开站，别弹「门户登录已过期」。
-  if (!openApp(url, '郑航百科', false)) toast('打不开，可以复制链接手动打开');
 }
 
-/** 「我的 → 检查更新」：开关 + 频率 + 立即检查，一屏放完。 */
-function openUpdateSheet() {
-  const on = CFG.updOn !== false;
-  const freq = UPD_FREQ_SEC[CFG.updFreq] === undefined ? 'daily' : CFG.updFreq;
-  $('sheetBody').innerHTML =
-    '<div class="sh-title">检查更新</div>' +
-    '<div class="sh-sub">当前版本 v' + esc(APP_VERSION) + ' · ' + updAgo(CFG.updLast) + '</div>' +
-    '<div class="setrows">' +
-      '<div class="setrow">' +
-        '<span class="sk">自动检查更新</span>' +
-        '<button class="switch' + (on ? ' on' : '') + '" id="updSw" role="switch" ' +
-        'aria-checked="' + (on ? 'true' : 'false') + '" aria-label="自动检查更新"></button>' +
-      '</div>' +
-    '</div>' +
-    '<div id="updFreqBox"' + (on ? '' : ' hidden') + '>' +
-      // 🔴 这里**不要**写「下次 15:40」—— 那是「后台运行」那一张的间隔行。
-      //    2026-11-14 改文案时把那段连同 `st.cxNext` 一起粘进来了，
-      //    `st` 在检查更新里根本不存在 ⇒ 一点就 ReferenceError，整张弹层打不开，
-      //    而页面其余部分照常（所以肉眼看着只是「点了没反应」）。
-      '<div class="setlabel">间隔</div>' +
-      '<div class="seg flat" id="updSeg">' +
-        UPD_FREQ_LIST.map((k) =>
-          '<button class="seg-btn' + (k === freq ? ' on' : '') + '" data-freq="' + k + '">' +
-          UPD_FREQ_CN[k] + '</button>').join('') +
-      '</div>' +
-    '</div>' +
-    '<div class="sheetbtns"><button class="btn primary" id="updNow">立即检查</button></div>' +
-    '<p class="tip note" id="updTip"></p>';
-  $('sheetMask').hidden = false;
-
-  $('updSw').addEventListener('click', () => {
-    CFG.updOn = !(CFG.updOn !== false);
-    store.set(KEY.settings, CFG);
-    openUpdateSheet();                 // 重画：频率那一块要跟着显示/隐藏
-  });
-
-  $('updSeg').querySelectorAll('.seg-btn').forEach((b) => {
-    b.addEventListener('click', () => {
-      CFG.updFreq = b.dataset.freq;
-      store.set(KEY.settings, CFG);
-      $('updSeg').querySelectorAll('.seg-btn').forEach((x) => {
-        x.classList.toggle('on', x.dataset.freq === CFG.updFreq);
-      });
-    });
-  });
-
-  $('updNow').addEventListener('click', async () => {
-    const btn = $('updNow');
-    if (btn.disabled) return;
-    // 就地变成「正在检查…」，不关弹层：关掉再弹一个 toast 会压在按钮上，
-    // 而且万一网络慢，用户会以为点了没反应。
-    btn.disabled = true;
-    btn.textContent = '正在检查…';
-    $('updTip').textContent = '';
-    const r = await checkUpdate(true).catch(() => ({ ok: false, error: '更新服务暂时不可用' }));
-    // 这里原来有一句 `if (r.busy) return;` —— 那意味着「正在查」时点一下，
-    // 按钮永远停在「正在检查…」（不再有人把它改回来）。现在 checkUpdate
-    // 不会再回 busy（它跟着已有的那次一起等），这条分支也就不需要了。
-    // 🔴 唯一的「收工」条件是**弹层真的换掉了**（按钮不在了）。
-    //    以前这里是 `if (r.ok && r.newer) return;` —— 2026-11-13 v18 用户报
-    //    「点了没结果」：被「以后再说」静音的那次结果也是 ok && newer，
-    //    弹层却没换，`return` 一走按钮就永远转下去。
-    //    现在「有新版就当场弹」由 checkUpdate 负责（见那里的注释），
-    //    这里只负责另一件事：**按钮必须有个下场**。
-    const b2 = $('updNow');
-    if (!b2) return;
-    b2.disabled = false;
-    b2.textContent = '立即检查';
-    const tip = $('updTip');
-    if (!tip) return;
-    if (!r.ok) {
-      tip.textContent = '检查失败：' + r.error;
-      tip.classList.add('bad');
-    } else if (r.newer) {
-      // 走到这里说明面板没换成功。别写成「已是最新」——那是假话。
-      tip.classList.remove('bad');
-      tip.textContent = '有新版本，再点一次';
-    } else {
-      tip.classList.remove('bad');
-      tip.textContent = '已经是最新版本 v' + MYVER + ' · ' + updAgo(CFG.updLast);
-      // 顺手把顶部那行「上次检查」也刷新一下
-      const sub = document.querySelector('.sh-sub');
-      if (sub) sub.textContent = '当前版本 v' + MYVER + ' · ' + updAgo(CFG.updLast);
-    }
-  });
-}
-
-/** 后台自动（0.50.0 v5）。
- *
- *  用户 2026-11-09：「让软件能够后台运行，每隔一段时间扫一次学习通」
- *  「每天自动做积分任务，不用一直待在这个页面」。
- *
- *  🔴 一句话说清它怎么工作：**到点才醒，跑完就睡**。
- *     不是常驻后台挂着（那样费电、占内存），而是设一个「几点该看一眼」，
- *     到点起来跑一两分钟，跑完就关。所以手机上不会一直挂着一条通知。
- *  🔴 两个开关**默认都是关的**。后台联网、替用户动账号，得他自己点。
- *  🔴 跑积分任务是真会动账号的（包括签到），中途不会弹确认 ——
- *     这一点必须在开关下面写出来，不能只藏在第一次的风险说明里。
- */
 function autoCfg() {
   if (!CFG.auto || typeof CFG.auto !== 'object') CFG.auto = {};
   const a = CFG.auto;
@@ -18527,29 +16498,6 @@ function openAutoSheet() {
 }
 
 /** 打开 App 时按设置自动查一次。默认「每次打开」。 */
-function autoCheckUpdate() {
-  if (CFG.updOn === false) return;
-  const gap = UPD_FREQ_SEC[CFG.updFreq];
-  const sec = (gap === undefined) ? 0 : gap;
-  if (sec > 0 && CFG.updLast && (Math.floor(Date.now() / 1000) - CFG.updLast) < sec) return;
-  // 等首屏画完再查：别跟同步、跟首屏渲染抢带宽。
-  setTimeout(() => { checkUpdate(false); }, 1500);
-}
-
-/* 弹层关掉的瞬间，把排队的新版本提示补上。
- *
- * 用 MutationObserver 盯 hidden 属性，而不是在每个关闭的地方加一句 ——
- * 关弹层的写法散在十几处（点遮罩、点按钮、安卓返回键……），
- * 漏一处就是「更新提示永远不会出现」，而且很难发现。
- */
-new MutationObserver(() => {
-  if (!$('sheetMask').hidden || !updPending) return;
-  const info = updPending;
-  updPending = null;
-  // 等收起动画走完再弹，否则两张弹层会叠在一起
-  setTimeout(() => { showUpdateSheet(info, true); }, 260);
-}).observe($('sheetMask'), { attributes: true, attributeFilter: ['hidden'] });
-
 // ------------------------------------------------------------------ 校历
 /* 数据来源：学校发布的《2026–2027 学年校历》（外国语学院转载的公开页面
    https://wyx.zua.edu.cn/info/1051/8303.htm），关键日期逐条人工核对过。
@@ -18649,6 +16597,12 @@ function calCurrent(today) {
 }
 
 function renderCalendar() {
+  $('calLab').textContent = '东油校历适配中';
+  $('calWeek').textContent = '待接入';
+  $('calRange').textContent = '';
+  $('calFill').style.width = '0%';
+  $('calBody').innerHTML = '<div class="card"><p class="tip note">东油适配中，请以学校发布的校历为准。</p></div>';
+  return;
   const today = today0();
   const cur = calCurrent(today);
   const term = cur.term;
@@ -18921,177 +16875,15 @@ function yktStats() {
   };
 }
 
-/** 校园服务（二级页）。**只做一件事**：把原先折在功能页里的那一块露出来，
- *  然后照旧画门户那一半。
- *  🔴 `#cpMoreBox` 自己的 `hidden` 是**进页面才去掉**的 —— 它不是折叠开关了，
- *     而是「这一页有没有准备好」的记号；留在 HTML 里是为了让初始状态
- *     （页面还没进过）不闪一下半屏内容。 */
+/** Render the verified school-portal entry without claiming unsupported local data. */
 function renderServices() {
-  const box = $('cpMoreBox');
-  if (box) box.hidden = false;
   renderCampus();
-  // 缴费那一格的小字是「欠 800.00」，得知道本机有没有登录态。
-  // 60 秒节流在 cwStateRefresh 里 —— 切进切出这一页很频繁，不必每次都读。
-  if (typeof cwStateRefresh === 'function') cwStateRefresh(false);
 }
 
 function renderCampus() {
-  // 🔴 关键：有没有数据，和「门户通不通」是两件事。
-  //    以前只按 state 判断，于是门户一过期就把数据也藏了。
-  const hasData = cpHasData();
-  const on = CAMPUS.state === 'ok';
-  const expired = CAMPUS.state === 'expired';
-  // 🔴 `null` = **还没问过**（开机后头一两百毫秒 / 刚进这一页）。
-  //    以前它和「没登录」走同一条路 ⇒ 整块先塌成「连接智慧门户」，
-  //    等 state 回来再弹开。用户 2026-11-16：「打开时内容不完整，
-  //    一两秒后展开变成全部界面」—— 一半是这里。
-  //    现在：本机有数据就照数据画完整，同时去问一次真的；没数据才按没登录画。
-  const unknown = CAMPUS.state === null;
-  const show = on || (expired && hasData) || (unknown && hasData);
-  if (unknown && hasData && !CAMPUS.busy) loadCampus(false, true);
-
-  $('cpOff').hidden = show;
-  $('cpOn').hidden = !show;
-  $('cpExpired').hidden = !(expired && hasData);
-
-  // 连上了、手里却一条数据都没有（典型情况：刚点过「清除本机缓存」）
-  // ⇒ 进这一页时自己去取一次。否则会留一个「余额 —、没有明细」的空壳，
-  //   而且因为 state 还是 'ok'，它再也不会自己取。
-  // 🔴 只在页面可见时取：清缓存那一刻页面是藏着的（在「我的」里点），
-  //    那时候取等于立刻把缓存写回去，「清除」就成了摆设。
-  //    busy 判断是防重入 —— loadCampus 一进来就把它置 true，不会打两遍。
-  if (CUR_PAGE === 'services' && on && !hasData && !CAMPUS.busy) loadCampus(false);
-
-  if (!show) {
-    $('cpOff').querySelector('h2').textContent = expired ? '门户登录过期了' : '连接智慧门户';
-    $('cpConnect').textContent = expired ? '重新连接' : '连接门户';
-    // 存着密码就把话说准：这一步到底要人做什么，别让人以为还得翻密码本
-    $('cpNote').textContent = expired
-      ? (CAMPUS.saved
-        ? '门户会过期，重连一次只要算一道题，数据不会丢。'
-        : '门户登录会过期，重输密码和验证码即可，数据不丢')
-      : (CAMPUS.saved
-        ? '数据取自学校门户，只看不改；密码存本机'
-        : '数据取自学校门户，只看不改。');
-    // 第一次进来才去问状态：每切一次 tab 就打一次服务器属于白打
-    if (CAMPUS.state === null) loadCampus(false);
-    return;
-  }
-
-  if (expired && hasData) {
-    $('cpExpiredTxt').textContent = (CAMPUS.at
-      ? '这份数据是' + agoText(CAMPUS.at) + '拿到的，余额可能已经不是这个数了。'
-      : '下面是上次拿到的数据，余额可能已经不是这个数了。')
-      + (CAMPUS.saved ? '重新连接只要算一道验证码。' : '');
-  }
-
-  $('yktBal').textContent = CAMPUS.bal == null ? '—' : CAMPUS.bal.toFixed(2);
-  $('yktTime').textContent = CAMPUS.user || '';
-  const st = yktStats();
-  // 右侧那格原来是「共 33 笔」—— 那是「手里有几条」，不是「这个月花了多少」。
-  // 换成本月小结（明细条数在展开后还在，不丢信息）。
-  // ⚠️ 不完整时**不写「本月」**：只看到最近 33 笔，说「本月」就是编。
-  $('yktCount').textContent = st.empty
-    ? (CAMPUS.total ? '共 ' + CAMPUS.total + ' 笔' : '')
-    : ((st.full ? '本月 ' : '') + '¥' + st.total.toFixed(2));
-  // 余额提醒那一行的说明。关掉时说「已关闭」，别让人以为还是默认的 20 元。
-  // 它和下面那条常驻提示是同一件事的两种形态：一个是开关，一个是结果。
-  const alv = Number(CFG.alertLow) > 0 ? Number(CFG.alertLow) : 20;
-  $('yktAlertV').textContent = CFG.alertOn
-    ? '低于 ' + alv + ' 元时提醒'
-    : '已关闭';
-  // 余额低：常驻一条，不弹窗。没读到余额（null）时什么都不说 ——
-  // 「没读到」不等于「没钱了」。
-  const thr = Number(CFG.alertLow);
-  const low = !!CFG.alertOn && CAMPUS.bal != null && thr > 0 && CAMPUS.bal < thr;
-  $('yktLow').hidden = !low;
-  if (low) {
-    $('yktLow').innerHTML = '余额只剩 <b>' + CAMPUS.bal.toFixed(2) +
-      '</b> 元，请及时充值。';
-  }
-  // 余额是会变的数字。没在这一次连网刷新过，就必须标明它是什么时候的。
-  $('yktAt').hidden = !(CAMPUS.at && CAMPUS.fromCache);
-  if (!$('yktAt').hidden) {
-    $('yktAt').textContent = '余额更新于 ' + agoText(CAMPUS.at) + '，点右上角刷新';
-  }
-
-  $('yktList').hidden = !CAMPUS.open;
-  if (CAMPUS.open) {
-    if (!CAMPUS.rows.length) {
-      $('yktList').innerHTML = '<p class="sub small">这次没读到消费记录。</p>';
-    } else {
-      let head = '';
-      if (!st.empty) {
-        head = '<div class="ykt-stat">' +
-          '<div class="ykt-s1"><b>¥' + st.total.toFixed(2) + '</b><span>' +
-          (st.full
-            ? '本月 ' + st.count + ' 笔 · 日均 ¥' + st.avg.toFixed(2)
-            : st.since + ' 起 ' + st.count + ' 笔') +
-          '</span></div>';
-        const bits = [];
-        if (st.topPlace) {
-          bits.push('常去 ' + esc(st.topPlace) + '（' + st.topN + ' 次）');
-        }
-        if (st.maxAmt > 0) {
-          bits.push('最大一笔 <em>¥' + st.maxAmt.toFixed(2) + '</em>' +
-            (st.maxPlace ? '（' + esc(st.maxPlace) + '）' : ''));
-        }
-        if (bits.length) head += '<div class="ykt-s2">' + bits.join(' · ') + '</div>';
-        if (!st.full) {
-          // 说的是「手里一共几条记录」，不是「几条支出」—— 别把两个数混了
-          head += '<div class="ykt-note">门户只给最近 ' + CAMPUS.rows.length + ' 笔，' +
-            st.since + ' 之前的没算进来。</div>';
-        }
-        head += '</div>';
-      }
-      $('yktList').innerHTML = head + CAMPUS.rows.map((r) => {
-        const amt = Number(r.amount) || 0;
-        return '<div class="ykt-row">' +
-          '<div class="ykt-r1"><span class="ykt-place">' + esc(r.place || '—') + '</span>' +
-          '<b class="ykt-amt ' + (amt < 0 ? 'out' : 'in') + '">' +
-          (amt > 0 ? '+' : '') + amt.toFixed(2) + '</b></div>' +
-          '<div class="ykt-r2">' + esc(r.time || '') +
-          (r.kind ? ' · ' + esc(r.kind) : '') + '</div>' +
-          '</div>';
-      }).join('');
-    }
-  }
-
-  if (!CAMPUS.apps.length) {
-    $('cpApps').innerHTML = '<p class="sub small">这次没读到应用列表。</p>';
-    // 「没读到」和「一个都没有」要分开说（红线 58），所以这里不写 0 个。
-    $('cpAppsN').textContent = '没读到';
-  } else {
-    $('cpAppsN').textContent = CAMPUS.apps.length + ' 个';
-    $('cpApps').innerHTML = CAMPUS.apps.map((a) =>
-      '<button class="appitem" data-url="' + escAttr(a.url || '') +
-      '" data-name="' + escAttr(a.name || '') + '">' +
-      '<span class="appname">' + esc(a.name || '') + '</span>' +
-      '<span class="appdept">' + esc(a.dept || '') + '</span>' +
-      '</button>').join('');
-    $('cpApps').querySelectorAll('.appitem').forEach((b) => {
-      b.addEventListener('click', async () => {
-        // 🔴 0.17.3：这里以前把 openApp 的返回值丢掉了 —— 于是两种失败都不出声：
-        //    ① 退到系统浏览器（用户以为「又要重登」是设计如此）
-        //    ② 两条路都不通（用户看到「点了没反应」）
-        // 现在降级和失败都各说一句，而且带上原生给的原因。
-        // 🔴 0.17.4：改成**先换票再开**（见 openService）。只搬 cookie 不够 ——
-        //    APK 的登录根本不产生 CASTGC 那张 cookie，所以进门必然是 CAS 登录页。
-        let ok = false;
-        try {
-          ok = await openService(b.dataset.url, b.dataset.name);
-        } catch (e) {
-          toast('打不开这个入口（' + ((e && e.message) || e) + '）');
-          return;
-        }
-        if (!ok) {
-          toast('打不开这个入口（' + OPEN_WHY + '），可以复制链接到浏览器里打开');
-        } else if (OPEN_WHY !== 'app') {
-          toast('这次没能在 App 内打开（' + OPEN_WHY + '），已交给浏览器');
-        }
-      });
-    });
-  }
+  const box = $('cpMoreBox');
+  if (box) box.hidden = false;
+  if ($('cpNote')) $('cpNote').textContent = '办事服务目录已在学校门户验证；应用内目录读取待接入。';
 }
 
 /** 取校园页数据。
@@ -19106,6 +16898,7 @@ function renderCampus() {
  *     而消费记录和办事入口其实几小时前的完全够用。
  */
 async function loadCampus(force, quiet) {
+  return { ok: false, kind: 'school_not_configured', error: '东油适配中' };
   if (CAMPUS.busy) return;
   // 刚清过缓存、用户还没点进校园页 ⇒ 一次请求都不发（force=用户点了刷新除外）。
   if (!force && CAMPUS.noAuto) { renderCampus(); return; }
@@ -19439,26 +17232,7 @@ async function openService(url, name) {
   return true;
 }
 
-$('cpConnect').addEventListener('click', openPortalSheet);
-$('cpReconnect').addEventListener('click', openPortalSheet);
-// 右上角刷新 = 用户明确要求「现在就去门户看一眼」，这时候必须联网。
-// 以前这里把 state 清成 null 再调 loadCampus()，现在 state 的含义变了
-// （它同时决定「数据显不显示」），不能随便清。
-$('cpRefresh').addEventListener('click', () => {
-  if (CAMPUS.busy) return;
-  $('cpRefresh').classList.add('busy');
-  // 这一页有两块数据：门户（一卡通 / 办事）和慧生活（余额 / 设备 / 积分）。
-  // 用户点刷新是想「现在就看最新的」，只刷一半会让人以为另一半不会更新。
-  const jobs = [loadCampus(true).catch(() => {})];
-  if (WT.accounts.device || WT.accounts.score) {
-    jobs.push(wtRefreshAll().catch(() => {}));
-  }
-  Promise.all(jobs).finally(() => $('cpRefresh').classList.remove('busy'));
-});
-$('yktMore').addEventListener('click', () => {
-  CAMPUS.open = !CAMPUS.open;
-  renderCampus();
-});
+
 /* 断开门户。同样抽成具名函数给「账号管理」页复用。 */
 async function unbindPortal() {
   if (!(await askConfirm('断开门户？',
@@ -19616,44 +17390,25 @@ function schExtrasRefresh() {
  *     因为某一页没连账号就在启动时弹一句错误。
  */
 function warmCommonPages() {
-  // 功能页：饮水那屏的显隐全靠这一份。拿到了进页面就能直接画整页。
   if (!wtSnap) {
     api('/api/water/state').then((st) => {
       if (st) wtSnap = st;
-      // 用户正好已经在这一页：让他立刻用上（renderWater 的那次请求随后会纠正）。
       if (CUR_PAGE === 'campus' && st) wtApplyState(st, true);
     }).catch(() => {});
   }
-  // 校园页：门户状态没问过就先问一次（本地那份，不联网）。
-  // 🔴 必须 quiet：开机那会儿用户还没问过任何事，读不到就弹一句
-  //    「校园数据没读上来」是他没要的 —— 还会顶掉同一时刻该说的别的提示
-  //    （2026-11-16 `check_bind_state` 就是这么红的）。
-  if (CAMPUS.state === null && !CAMPUS.busy) loadCampus(false, true);
-  // 财务处：本地存的那份，读一下就让电费那张卡有数。
-  cwStateRefresh(true).then(() => {
-    paintMiniWallets();
-    if (CUR_PAGE === 'accounts') renderAccounts();
-    // 「我的」那行的「已连 N 个」也要跟着补一个 —— 它可能在这份状态之前就画完了。
-    else paintAccCount();
-  }).catch(() => {});
 }
 
 async function boot() {
-  // APK 内置了数据层，不需要电脑给的那个 ?k= 凭证
-  if (!TOKEN && !NATIVE) {
-    toast('没有访问凭证：请用电脑上启动窗口给的地址打开', 5000);
-  }
-  // 开机那一行：反馈时靠它认出「哪个版本、哪套系统」。只写在本机。
+  // 本地课表直接使用本机数据；联网服务由 Android 原生层处理。
+  // 开机那一行：版本和运行环境只记在本机。
   appLog('启动 v' + APP_VERSION + ' code ' + APP_CODE + ' ' +
-         (NATIVE ? 'android' : 'web') + ' ' + fbOsText());
-  // 打开次数。只给「求 Star」判「这个人是不是已经用过一阵了」用（见 starAskOnce）。
-  CFG.launchN = (CFG.launchN || 0) + 1;
-  store.set(KEY.settings, CFG);
+         (NATIVE ? 'android' : 'web'));
+  // CX、WT 在脚本末尾初始化后才可访问，先用基础数据画出首屏。
   // 老版本存的默认开学日期比真实开学早一周（见 migrateStartDate），先修再画
-  if (DATA && migrateStartDate(DATA.semester)) store.set(KEY.settings, CFG);
+  if (DATA && DATA.source !== 'nepu' && migrateStartDate(DATA.semester)) store.set(KEY.settings, CFG);
   applyEnvTexts();
   renderExamView();
-  renderSchedule(); renderGrades(); renderExams(); renderRooms(); renderMe();
+  renderSchedule(); renderMe();
   renderCalendar();                          // 纯本地算，零成本，开机就画好
   // 校历的学期头可点（0.33.0）。#calBody 这个元素本身不随重画换掉
   // （换的只是 innerHTML），所以挂一次就够 —— 挂在里面会越积越多。
@@ -19677,11 +17432,11 @@ async function boot() {
   // 两份「后台自动」设置对齐一次（原生那份才是真在跑的那份）。
   // 只在这一刻做，点开关那条路照旧 —— 每开一次 App 都重推会重置计时器。
   autoBootSync();
-  autoCheckUpdate();                         // 也不 await：查更新不许拖慢启动
-  // 上次没发出去的上报，等首屏画完再补发（3 秒后，不抢带宽）。
-  setTimeout(() => { reportFlush(); }, 3000);
   // 常用页预热：等首屏画完、也不跟查更新抢那点带宽（1.2 秒后）。
   setTimeout(() => { try { warmCommonPages(); } catch (e) { /* 预热失败不该影响启动 */ } }, 1200);
+  // 查更新（2026-11-24）：5 秒后，等首屏、课表、闹钟都排完，也不跟预热抢带宽。
+  // 开关关着时 updAutoCheck 第一行就返回，这里不用再判断一遍。
+  setTimeout(() => { updAutoCheck(); }, UPD_BOOT_DELAY_MS);
 
   // 通知 / 小组件点进来的落点（0.47.8）。`p` 由 MainActivity 拼在 URL 上，
   // 应用已经开着时走 onNewIntent，直接调 window.__hytPage，不经过这里。
@@ -19714,29 +17469,11 @@ async function boot() {
     // 一分钟节流在 cxLiveRun 里，切来切去不会变成连发请求。
     if (CUR_PAGE === 'exams') cxLiveRun();
   });
-  // 公告：先把本机那份摆好（立刻有内容），需要新鲜就顺手刷一次 ——
-  // 这就是「点打开软件自动更新公告」。同样不 await。
-  enterNotice();
-  // 0.44.0：标签栏红点撤了，这里不再画点。
-  // 校园页也预热：这条只问一次本地状态（不探网），然后把本机缓存画出来。
-  // 等用户点进「校园」时就是现成的，不用再等一次往返。
-  loadCampus(false);
-  // 学习通：只问本地状态（不联网、不扫描），让「我的」那一行显示得对。
-  // 真正的扫描要 40 秒，必须用户点了才跑。
-  cxRefresh(true);
   // 首屏画完之后再补作业和考试（两秒后，别和首屏抢带宽）。
   // 不这么补的话，用户不进「考试」页、不进「学习」页，课表上永远没有刻度和带子。
   setTimeout(schExtrasRefresh, 2000);
 
-  // 求 Star：首屏画完 4 秒之后，只问一次（判据在 starAskOnce 里）。
-  setTimeout(starAskOnce, 4000);
 
-  if (DATA && DATA.syncedAt && (Date.now() / 1000 - DATA.syncedAt) > 12 * 3600) {
-    try {
-      const res = await api('/api/sync', {});
-      if (res.ok) applyPayload(res);
-    } catch (e) { /* 静默失败 */ }
-  }
 }
 
 
