@@ -84,8 +84,8 @@ const DAY_CN = ['一', '二', '三', '四', '五', '六', '日'];
    build_apk.py 里，两处各写一遍，迟早会出现「软件里显示 0.1.0、装上去是 0.1.1」
    这种没法解释的事。现在 build_apk.py 和 version.json 都从这里读。
    code 是整数，只增不减：比版本号字符串靠谱（"0.10.0" < "0.9.0" 是字符串比较的经典坑）。 */
-const APP_VERSION = '0.1.6';
-const APP_CODE = 197;
+const APP_VERSION = '0.1.7';
+const APP_CODE = 198;
 
 /* 功能说明书的地址（2026-11-15）。
  *
@@ -321,6 +321,13 @@ let CFG = Object.assign(
     // 🔴 只问一次：每次绑定都弹一遍就成了骚扰，用户会直接点「先不用」
     //    然后永远不再看它。问过、答过，这个标记就置 true，跟开关无关。
     remindAsked: false,
+    // 「求一次 Star」问过没有（2026-11-25）。和 remindAsked 一个道理：
+    // 只问一次，答过（点了或跳过）就永不再提 —— 反复问是最快让人卸载的做法。
+    // 🔴 记的是「问过」，不是「点过」：跳过也是回答。
+    starAsked: false,
+    // 这个 App 被打开过几次（只数真正画界面的那种，后台那个隐藏页面不算）。
+    // 求 Star 的时机靠它：第一次打开就伸手是要糖，不是道谢。
+    launchN: 0,
     // 后台自动（0.50.0 v5）：默认**两个都关**。
     // 后台联网、替用户动账号这种事，不能自己替他打开。
     //   cxOn   学习通每隔 cxMin 分钟自己查一次
@@ -4478,16 +4485,88 @@ $('meAuto').addEventListener('click', () => openAutoSheet());
 $('rowSettings').addEventListener('click', () => { renderSettingsPage(); switchTab('settings'); });
 $('settingsBack').addEventListener('click', () => { switchTab('me'); });
 
-/* 「说明」（2026-11-15）：打开功能说明书。
+/* 「说明」（2026-11-25）：本地版使用说明。
  *
- * 优先在 App 内开（WebActivity 有 ‹ ↻ ⋮ 那套顶栏，用户不会「出去就回不来」）；
- * 壳里起不来（网页版、或者更老的 APK）就退回系统浏览器 ——
- * 宁可多切一次应用，也不能点了没反应。
- * 第三个参数 false = 这个地址**不用登录**，进去时别弹「登录已过期」。
+ * 用户：「以前是网页版，现在我们改成本地版，介绍一下这五个板块怎么使用」。
+ * 老版本这里是 HELP_URL —— 先 docs.qq.com、后 hobson.cc/help/ 的那份远端网页，
+ * 那套随更新器那轮重构整个删掉了，点了只剩一句 toast（「暂未提供在线说明」）。
  *
- * ⚠️ 必须先判 `window.NativeApi`：网页版里 native.js 整块不执行
- *    （首行就是 `if (!window.Android) return;`），直接调会让整段点击处理器断掉。 */
-$('meHelp').addEventListener('click', () => toast('本地版本暂未提供在线说明'));
+ * 🔴 现在说明书就写在这个文件里，随包走：不联网、不打远端、离线也读得到。
+ *    顺序固定跟底部 tab 从左到右一致：课表 → 学习 → 校园 → 功能 → 我的。
+ *    以后改文案只改这里，别再挂一个地址回来。
+ */
+function openHelpSheet() {
+  const where = NATIVE ? '这台手机' : '这台电脑';
+  $('sheetBody').innerHTML =
+    '<div class="sh-title">使用说明</div>' +
+    '<div class="sh-sub">从最左边第一个板块开始。</div>' +
+
+    '<div class="hlp-sec">' +
+      '<div class="hlp-h"><b>课表</b><span>第一个</span></div>' +
+      '<ul class="hlp-list">' +
+        '<li>打开就是<b>本周</b>。左右滑动翻周，也可以点上面的 ‹ ›。</li>' +
+        '<li>点中间「第 N 周」能直接跳到任意一周；那个弹层最底下还有<b>看校历</b>和<b>学期设置</b>。</li>' +
+        '<li>右上「空教室」查这会儿哪间教室没课，按日期和节次查。</li>' +
+        '<li>最右「周 / 日」切换视图。日视图会多一条「现在这节 / 下一节」。</li>' +
+        '<li>点任何一节课看详情：能改颜色，也能把不想看的课<b>隐藏</b>掉；自己加的课还能改和删。</li>' +
+        '<li>课表得从教务同步。没绑过的话，先去「我的 → 账号管理」绑一次。</li>' +
+      '</ul>' +
+    '</div>' +
+
+    '<div class="hlp-sec">' +
+      '<div class="hlp-h"><b>学习</b><span>第二个</span></div>' +
+      '<ul class="hlp-list">' +
+        '<li>顶上四段：<b>学习通</b>、<b>考试</b>、<b>成绩</b>、<b>学分</b>。</li>' +
+        '<li>学习通只读作业和截止时间，<b>不替你交作业</b>。自己交完点一下「我交过了」就记下，不再催。</li>' +
+        '<li>考试按学期列安排，临近的会在截止前提醒。</li>' +
+        '<li>成绩出分后自动同步。这次没读到会单独说一句，那不等于「没有成绩」。</li>' +
+        '<li>学分按培养计划算已修学分和绩点。</li>' +
+      '</ul>' +
+    '</div>' +
+
+    '<div class="hlp-sec">' +
+      '<div class="hlp-h"><b>校园</b><span>第三个</span></div>' +
+      '<ul class="hlp-list">' +
+        '<li><b>校园公告</b>：同步教务处近三个月的公告，点开看原文。</li>' +
+        '<li><b>校园服务</b>：学校服务门户的入口。</li>' +
+        '<li>这一页还在补，现在能用的就是上面这两行。</li>' +
+      '</ul>' +
+    '</div>' +
+
+    '<div class="hlp-sec">' +
+      '<div class="hlp-h"><b>功能</b><span>第四个</span></div>' +
+      '<ul class="hlp-list">' +
+        '<li>现在这里是<b>直饮水</b>（慧生活798）。</li>' +
+        '<li>饮水要<b>单独登录</b>一次，跟学校那套账号不是一回事。</li>' +
+        '<li>第一张卡是余额和「刚才那次」；点「消费记录」能翻历史。</li>' +
+        '<li>第二张卡管自己的饮水机：手输编号、扫码、碰一碰都能加。</li>' +
+        '<li>积分和每日任务也在这一页下面。</li>' +
+      '</ul>' +
+      '<div class="ab-tip">接水是真的出水扣钱：点了就开始，<b>不弹确认</b>；「停止」同样立刻生效。费用按设备上显示的为准。</div>' +
+    '</div>' +
+
+    '<div class="hlp-sec">' +
+      '<div class="hlp-h"><b>我的</b><span>第五个</span></div>' +
+      '<ul class="hlp-list">' +
+        '<li><b>账号管理</b>：教务、学习通、慧生活都在这儿，右边写着连了几个。</li>' +
+        '<li>「同步教务处数据」「学期设置」「校历」也在这一屏。</li>' +
+        '<li><b>上课时间和提醒</b>：改作息，提醒照这个时间走。</li>' +
+        '<li><b>桌面小组件</b>：教你怎么把它加到桌面，本身不是开关。</li>' +
+        '<li><b>课程调整</b>：自己加课，或者把不想看的课藏起来。</li>' +
+        '<li>最下面依次是<b>设置</b>（配色、上课时间）、版本、检查更新、关于本项目。</li>' +
+      '</ul>' +
+    '</div>' +
+
+    '<div class="ab-note">学号密码只加密存在' + where + '上，不上传，也不会跟着账号跑到别处。' +
+      '教务那边只读，不代提交。这个 App 是学生自己做的，免费、无广告，和学校没有关系。</div>' +
+    '<div class="sheetbtns"><button class="btn primary" id="helpOk">知道了</button></div>';
+  $('sheetMask').hidden = false;
+  // `.sheet` 自己是滚动容器，上一张弹层可能把位置留在半截。
+  $('sheet').scrollTop = 0;
+  $('helpOk').addEventListener('click', closeSheet);
+}
+
+$('meHelp').addEventListener('click', openHelpSheet);
 $('rmBack').addEventListener('click', () => switchTab('schedule'));
 
 // ------------------------------------------------------------------ 成绩
@@ -6554,6 +6633,7 @@ function renderSettingsPage() {
 }
 
 function renderMe() {
+  renderUpdSettingsState();
   const oldLogin = document.querySelector('#meUnbound .bindcard');
   if (oldLogin) oldLogin.hidden = true;
   // 版本号在 HTML 里只留一个占位（「—」），真值从 APP_VERSION 来。
@@ -11301,18 +11381,22 @@ if ($('btnUpdate')) $('btnUpdate').hidden = true;
  *    而且把「照着做了什么」写细，只会给对方添麻烦。
  * 🔴 链接一律走 openExternal：APK 里交系统浏览器，网页版新开标签。
  *    这样两个版本行为一致（WebView 里直接跳会把 App 变成那个网站）。
- * 🔴 参考项目清单**只增不删**。删掉一条署名，等于把「注明出处」这件事撤回，
- *    而 ZUA Wiki 那边明确写着「转载请注明出处」。
+ * 🔴 2026-11-25（用户明确要求）：原来那三条「参考的项目」署名、它们各自的
+ *    「查看项目」/「在 GitHub 打开」跳转，连同整个二级页面都删掉了。
+ *    这里原来写着「参考项目清单只增不删」—— 那条规矩**已经被用户推翻**，
+ *    别再照它把清单加回来。署名的事现在只剩仓库根目录的 LICENSE 和 README
+ *    （MIT 的版权与许可声明在那边随分发保留）。
  */
 const ABOUT_REPO = 'https://cnb.cool/Hobson2233/hangyuantong';
-/* GitHub 镜像（用户 2026-11-14：「加上咱们的 github 项目地址跳转链接，
+/* GitHub 仓库（用户 2026-11-14：「加上咱们的 github 项目地址跳转链接，
  * 要求跳转到系统默认浏览器，在 APP 里面求 star」）。
  *
- * 🔴 国内访问 github.com 时通时断，所以它**不是**主仓库地址（主仓库是 CNB，
- *    见上面那条）；「看源码」仍然指 CNB，「GitHub」单独一颗，专门给 Star 用。
- * 🔴 两个地址都用 openExternal ⇒ 交系统浏览器。APK 里塞进 WebView 会让
+ * 🔴 2026-11-25：地址换成 dsy-star/NepuPass（用户：「把 Github 的链接替换为
+ *    https://github.com/dsy-star/NepuPass」）。同一次还要求把关于页里那两颗
+ *    跳转按钮删掉，所以这个常量现在**只剩「求 Star」弹窗一处在用**。
+ * 🔴 一律走 openExternal ⇒ 交系统浏览器。APK 里塞进 WebView 会让
  *    App 变成 GitHub 的页面，而且没法登录点赞。 */
-const ABOUT_GH = 'https://github.com/Hobson2233/hangyuantong';
+const ABOUT_GH = 'https://github.com/dsy-star/NepuPass';
 // 网页版。和 App 是同一份前端代码（`mobile/web`），所以「网站」也是这个项目本身，
 // 不是另做一个 —— 写进关于页是为了让人能在电脑上直接用，也能转给同学。
 // 🔴 0.44.2：主域名从 dpdns.org 换成 hobson.cc。
@@ -11331,10 +11415,6 @@ const ABOUT_SITE = 'https://cnb.cool/Hobson2233/hangyuantong';
  *    改联系方式因此从「发版」变成「改一个文件重新上传网站」——
  *    已经装出去的所有旧版本下次打开就都是新的。
  *
- * 🔴 参考项目那几个链接**不上远端**，仍然写死在下面。
- *    不是偷懒：MIT 要求在分发时保留版权声明，放到远端就等于
- *    「网站一挂、或者哪天忘了续域名，署名就没了」。署名必须跟着包走。
- *
  * 🔴 远端内容是**不可信输入**：它会被拼进 innerHTML。所以三层都过
  *    （类型 → 长度 → 链接协议和域名），见 aboutClean / aboutSafeUrl。
  */
@@ -11348,30 +11428,9 @@ const ABOUT_FALLBACK = { contact: null, notice: '' };
 const ABOUT_HOSTS = ['qm.qq.com', 'hobson.cc', 'hobson2233.dpdns.org',
                      'github.com', 'cnb.cool', 'wiki.zua.fan'];
 
-const ABOUT_REFS = [
-  {
-    name: '航院通',
-    by: 'Hobson2233 · MIT 许可',
-    why: '东油通基于航院通改造；按 MIT 许可保留版权与许可声明。',
-    go: '查看项目',
-    url: 'https://cnb.cool/Hobson2233/hangyuantong',
-  },
-  {
-    name: 'WaterWidget',
-    by: 'nocookies111 · MIT 许可',
-    why: '饮水机部分照公开说明自写，未用其代码。'
-       + '它和慧生活798 官方都没参与这个 App。',
-    go: '在 GitHub 打开',
-    url: 'https://github.com/nocookies111/life-798',
-  },
-  {
-    name: '校园前端模板',
-    by: 'khkdfsj · campus-frontend-template',
-    why: '界面的配色、圆角和层次参考了它。',
-    go: '在 GitHub 打开',
-    url: 'https://github.com/khkdfsj/campus-frontend-template',
-  },
-];
+// 2026-11-25：ABOUT_REFS（「参考的项目」那三条署名、以及它们各自的
+// 「查看项目」/「在 GitHub 打开」跳转）按用户要求整块删掉了，二级页面
+// aboutRefsHtml 和 aboutView 那个状态一起下线。关于页现在只有一屏。
 
 /** 远端来的地址：只放 https，而且只认白名单里的站（含子域）。
  *  返回 '' 表示这个链接不能用 —— 调用方据此**不画那颗按钮**，
@@ -11454,10 +11513,9 @@ function aboutContactHtml(c) {
  *  ① 内容没变就不重画 —— 重画会把用户正在看的滚动位置弹回顶部；
  *  ② 判据可以直接比字符串，不用去数 DOM。
  *
- *  🔴 0.44.0 调了顺序。用户 2026-11-03：「应当把咱们的项目，网站，之类的
- *     放到前面，把参考的项目压缩为 参考的项目并做成二级界面，点开后才会显示」。
- *     改之前第一屏是「帮过这个项目的」（三条别人的项目），自己的网站和源码
- *     排在最后 —— 一个人点开「关于本项目」，最想先看到的是「这是什么」。
+ *  🔴 0.44.0 调过顺序（用户 2026-11-03：自己的项目、网站放前面，
+ *     「参考的项目」压成一行点开再看）。2026-11-25 那份清单整个删了，
+ *     现在这一屏是：这是什么 → 联系方式 → 清除本机缓存。
  */
 function aboutHtml(state) {
   const st = state || ABOUT_FALLBACK;
@@ -11471,13 +11529,9 @@ function aboutHtml(state) {
     + '<p>面向东北石油大学的本地校园助手。</p>'
     + '</div>'
     + aboutContactHtml(st.contact)
-    // 参考的项目：压成一行，点开是二级页面。署名本身**没有删**，
-    // 只是不再占着第一屏（MIT 要求的是「随分发保留」，不是「放最上面」）。
-    + '<button class="ab-refs" id="abRefs">'
-    + '<span>参考的项目</span>'
-    + '<span class="ab-refs-v">' + ABOUT_REFS.length + ' 个'
-    + '<svg viewBox="0 0 24 24"><path d="M9 6l6 6-6 6"/></svg></span>'
-    + '</button>'
+    // 2026-11-25：这里原来有一行「参考的项目 N 个」，点开是二级页面。
+    // 用户要求把那一屏连同「查看项目」「在 GitHub 打开」两颗按钮一起删掉，
+    // 所以整行没了 —— 关于页现在只有这一屏，滚到底就是「清除本机缓存」。
     // 2026-11-10 晚（第三版）：「清除本机缓存」搬到这里 —— 用户原话
     // 「清理本机缓存平常很少用，你放深一些」。现在要两步才点得到
     // （我的 → 关于本项目 → 最底下），配得上「一年点不了两次」这个频率。
@@ -11490,53 +11544,32 @@ function aboutHtml(state) {
     + '</div>';
 }
 
-/** 「参考的项目」二级页面。点「‹ 关于本项目」回到上一屏。
- *  ⚠️ 单独一屏，但**内容一个字都没少** —— 删掉署名等于撤回「注明出处」，
- *     而 ZUA Wiki 那边明确写着「转载请注明出处」。 */
-function aboutRefsHtml() {
-  const refs = ABOUT_REFS.map((x) =>
-    '<div class="ab-item">'
-    + '<div class="ab-name">' + esc(x.name) + '</div>'
-    + '<div class="ab-by">' + esc(x.by) + '</div>'
-    + '<p>' + esc(x.why) + '</p>'
-    + '<button class="ab-go" data-url="' + escAttr(x.url) + '">' + esc(x.go)
-    + '<svg viewBox="0 0 24 24"><path d="M9 6l6 6-6 6"/></svg></button>'
-    + '</div>').join('');
-
-  return '<button class="ab-back" id="abBack">'
-    + '<svg viewBox="0 0 24 24"><path d="M15 6l-6 6 6 6"/></svg>'
-    + '关于本项目</button>'
-    + '<div class="sh-title">参考的项目</div>'
-    + '<div class="sh-sub">这些地方帮过这个项目。点开就是它们自己的页面。</div>'
-    + refs;
-}
-
-/** 当前在「关于」的第几屏：'main' 主页面 / 'refs' 参考项目。 */
-let aboutView = 'main';
-/** 当前手上这份内容（缓存先、网络后）。两个屏共用它，切换时不必重取。 */
+/** 当前手上这份内容（缓存先、网络后）。
+ *  2026-11-25 之前还有 `aboutView`（'main' / 'refs'）管着两屏，二级页面
+ *  下线之后它没有用处了 —— 留着只会让人以为还有别的屏。 */
 let aboutCur = ABOUT_FALLBACK;
 
-/** 按当前屏重画。**只有这一个地方动 `#sheetBody`** —— 主页面和二级页面
- *  各写一遍的话，迟早有一边忘了重绑事件（点了没反应，而且不报错）。 */
+/** 按当前内容重画。**只有这一个地方动 `#sheetBody`** —— 多写一遍就会
+ *  忘一处重绑（点了没反应，而且不报错）。 */
 function aboutPaint() {
   const sc = $('sheetBody');
   const keep = sc.scrollTop;
-  sc.innerHTML = (aboutView === 'refs') ? aboutRefsHtml() : aboutHtml(aboutCur);
+  sc.innerHTML = aboutHtml(aboutCur);
   aboutBind();
-  // 进二级页面从顶部读；返回时回到原来的位置，别让人自己再滚一次。
-  sc.scrollTop = (aboutView === 'refs') ? 0 : keep;
+  // 重画后把位置还回去，别让人自己再滚一次（联系方式刷新一下不该把人弹回顶部）。
+  sc.scrollTop = keep;
 }
 
 /** 「我的」那行右边的灰字跟着变。写了「联系方式」却没有联系入口就是空话，
  *  而「暂时没填」是允许的状态（用户随时可能换群）。
- *  0.44.0：里面从「参考的项目」变成「项目本身」—— 顺序改了，这行字也要跟着改，
- *  否则点进去第一眼看到的和这行字说的不是一回事。 */
+ *  2026-11-25：这行字原来写的是「网站 · 源码 · 参考的项目」，可那三样现在
+ *  一样都不在这一页里了 —— 关于页只剩「这个项目 + 联系方式 + 清缓存」。
+ *  所以只留「联系方式」（有才写），不再替页面许诺它没有的东西。 */
 function aboutSummary(state) {
   const v = document.querySelector('#rowAbout .v');
   if (!v) return;
   const st = state || ABOUT_FALLBACK;
-  v.textContent = (st.contact && st.contact.id)
-    ? '网站 · 源码 · 联系方式' : '网站 · 源码 · 参考的项目';
+  v.textContent = (st.contact && st.contact.id) ? '联系方式' : '';
 }
 
 function aboutBind() {
@@ -11559,21 +11592,8 @@ function aboutBind() {
       else toast('无法复制，请长按上方号码手动选择');
     });
   }
-  // 进 / 出二级页面。两个按钮都靠 aboutPaint 重画 —— 不在这里自己改 DOM。
-  const refs = $('abRefs');
-  if (refs) {
-    refs.addEventListener('click', () => {
-      aboutView = 'refs';
-      aboutPaint();
-    });
-  }
-  const back = $('abBack');
-  if (back) {
-    back.addEventListener('click', () => {
-      aboutView = 'main';
-      aboutPaint();
-    });
-  }
+  // 2026-11-25：这里原来绑着「进 / 出参考的项目二级页面」两颗按钮（#abRefs
+  // 和 #abBack）。那一屏已经删了，绑定的节点不存在，所以一并去掉。
   // 「清除本机缓存」现在住在这一层（2026-11-10 第三版）。它每次重画都是新节点，
   // 所以只能在这里绑 —— 写成文件顶层的 $('btnClearCache') 会在第一屏找不到它。
   const cc = $('btnClearCache');
@@ -11589,7 +11609,6 @@ function aboutBind() {
 async function openAboutSheet() {
   const old = aboutCached();
   aboutCur = old || ABOUT_FALLBACK;
-  aboutView = 'main';             // 下次打开永远从第一屏开始
   aboutPaint();
   const sheet = $('sheetMask');
   sheet.hidden = false;
@@ -11602,51 +11621,111 @@ async function openAboutSheet() {
   aboutCur = fresh;
   aboutSummary(fresh);
   if (sheet.hidden) return;               // 已经关掉了，别往空壳里写
-  // 🔴 用户正停在「参考的项目」那一屏时**不要重画** —— 那会把他从二级页面
-  //    直接弹回第一屏，而他要看的东西一个字都没变（联系方式不影响署名）。
-  //    aboutCur 已经换新，等他自己按返回时，aboutPaint 会用新的这份画。
-  if (aboutView === 'refs') return;
   aboutPaint();
 }
 
 $('rowAbout').addEventListener('click', openAboutSheet);
 
-/* 「检查更新」（2026-11-24）—— 版本行右边那颗胶囊。
+/* ================= 求一次 Star（2026-11-25） =================
  *
- * 为什么放在这里：版本号本身就是「我现在是几版」，查更新是对它最自然的一个动作，
- * 用户不用先去别的地方找入口（老版本是把开关藏在一个「检查更新」二级页里，
- * 而那个页面这一版已经不在了）。
+ * 用户：「有一个弹窗是使用多次了给我点个 star，里面的两个按钮一个是
+ * 下次再说一个是去 star，打开 Github，把 Github 的链接替换为
+ * https://github.com/dsy-star/NepuPass」。
  *
- * 🔴 手动查和自动查（checkUpdate(false)）的区别只有两点：
- *    ① 手动不认 `CFG.updSkip`（用户自己点的，不能被上次的「以后再说」拦掉）；
- *    ② 手动**必须说话** —— 没新版就 toast 一句「已经是最新」，
- *       失败就得把 error 原文端出来。自动查失败静默是对的（用户没在等），
- *       手动查失败静默就是「点了没反应」，那比报错还糟。
- * 🔴 站起来的时候按钮变「检查中」并置 disabled：那个请求最长 8 秒，
- *    没有任何反馈的话用户会连点，而连点在 checkUpdate 里会合并到同一个
- *    inflight 上 —— 点五次只发一次请求，但界面上看起来像是五次都没成。
+ * 三条规矩（结论沿用 2026-11-14 那版 —— 那份实现随 app.js 重写丢了，
+ * 这次按原意重新落地）：
+ *   ① **只问一次**。答过（点了或跳过）就 `CFG.starAsked=true` 落盘，永不再弹。
+ *      反复问是最快让人卸载的做法，而这一句本来只是想道个谢；
+ *   ② 只问**已经用起来的人**：打开过 3 次以上、而且课表已经同步到了。
+ *      第一次打开就伸手是要糖，不是道谢；
+ *   ③ 走 App 自己的弹层（`#sheetMask`），不用原生弹窗 / Toast —— 别处长什么样，
+ *      它就长什么样，用户不用学第二套。
+ *
+ *  ⚠️ 时机放在首屏画完 4 秒之后：开机那一下正在排闹钟、补作业考试，
+ *     这时候盖一张卡上去，用户第一反应是「怎么一打开就推销」。
+ *  🔴 链接一律走 openExternal（交系统浏览器）：APK 里塞进 WebView 会变成
+ *     GitHub 的页面，而且没法登录点赞。
  */
-$('meUpd').addEventListener('click', async () => {
-  const b = $('meUpd');
-  if (!b || b.disabled) return;
-  const idle = b.textContent;
-  b.disabled = true;
-  b.textContent = '检查中';
-  try {
-    const r = await checkUpdate(true);
-    if (!r || !r.ok) {
-      toast((r && r.error) || '更新服务暂时不可用', 2600);
-      return;
+function starAskOnce() {
+  if (CFG.starAsked) return;                  // ① 只问一次
+  if ((CFG.launchN || 0) < 3) return;         // ② 才算「使用多次了」
+  if (!DATA || !(DATA.courses || []).length) return;
+  // 正在看别的弹层（关于 / 消息 / 确认框）就别抢：等下次打开再说。
+  // 🔴 这里**不置** starAsked —— 这不算回答，只是这一趟没空。
+  if (!$('sheetMask').hidden) return;
+  CFG.starAsked = true;
+  store.set(KEY.settings, CFG);
+  $('sheetBody').innerHTML =
+    '<div class="sh-title">这个 App 帮上忙了吗</div>' +
+    '<div class="sh-sub">学生自己做的，免费、无广告。' +
+      '在 GitHub 上标一颗 Star，就是最好的支持。</div>' +
+    '<div class="sheetbtns">' +
+    '<button class="btn" id="starNo">下次再说</button>' +
+    '<button class="btn primary" id="starYes">去 star</button>' +
+    '</div>';
+  $('sheetMask').hidden = false;
+  $('starNo').addEventListener('click', closeSheet);
+  $('starYes').addEventListener('click', () => {
+    closeSheet();
+    if (!openExternal(ABOUT_GH)) toast('打不开浏览器，可以复制链接手动打开');
+  });
+}
+
+/* 更新设置从版本行下方进入：自动开关、检查频率和手动检查都放在同一张 sheet。 */
+function renderUpdSettingsState() {
+  const last = $('meUpdLast');
+  if (last) last.textContent = CFG.updOn
+    ? '自动检查已开启 · ' + (UPD_FREQ_CN[CFG.updFreq] || UPD_FREQ_CN.daily)
+    : '自动检查已关闭';
+}
+
+function openUpdSettingsSheet() {
+  const on = !!CFG.updOn;
+  const freq = UPD_FREQ_SEC[CFG.updFreq] != null ? CFG.updFreq : 'daily';
+  $('sheetBody').innerHTML =
+    '<div class="sh-title">检查更新</div>' +
+    '<div class="sh-sub">当前版本 v' + esc(MYVER) + ' · ' + esc(updAgo(CFG.updLast)) + '</div>' +
+    '<div class="upd-setting-row"><span>自动检查更新</span>' +
+      '<button type="button" class="upd-toggle' + (on ? ' active' : '') + '" id="updAutoToggle" role="switch" aria-checked="' + on + '"><i></i></button></div>' +
+    '<div class="upd-setting-label">间隔</div>' +
+    '<div class="upd-freq" role="group" aria-label="自动检查间隔">' +
+      UPD_FREQ_LIST.map((key) => '<button type="button" data-upd-freq="' + key + '" class="' + (freq === key ? 'active' : '') + '" aria-pressed="' + (freq === key) + '">' + UPD_FREQ_CN[key] + '</button>').join('') +
+    '</div>' +
+    '<div class="sheetbtns upd-settings-actions"><button type="button" class="btn primary" id="updCheckNow">立即检查</button></div>';
+  $('sheetMask').hidden = false;
+  $('updAutoToggle').addEventListener('click', (e) => {
+    CFG.updOn = !CFG.updOn;
+    store.set(KEY.settings, CFG);
+    openUpdSettingsSheet();
+    renderUpdSettingsState();
+  });
+  $('sheetBody').querySelectorAll('[data-upd-freq]').forEach((button) => {
+    button.addEventListener('click', () => {
+      CFG.updFreq = button.dataset.updFreq;
+      store.set(KEY.settings, CFG);
+      openUpdSettingsSheet();
+      renderUpdSettingsState();
+    });
+  });
+  $('updCheckNow').addEventListener('click', async (e) => {
+    const b = e.currentTarget;
+    if (b.disabled) return;
+    b.disabled = true;
+    b.textContent = '检查中…';
+    try {
+      const r = await checkUpdate(true);
+      if (!r || !r.ok) toast((r && r.error) || '更新服务暂时不可用', 2600);
+      else if (!r.newer) toast('已经是最新版本 v' + MYVER, 2000);
+    } catch (_) {
+      toast('检查更新失败，稍后再试', 2600);
+    } finally {
+      b.disabled = false;
+      b.textContent = '立即检查';
     }
-    // 有新版时 checkUpdate 自己已经弹了更新弹层，这里不再多说一句。
-    if (!r.newer) toast('已经是最新版本 v' + MYVER, 2000);
-  } catch (e) {
-    toast('检查更新失败，稍后再试', 2600);
-  } finally {
-    b.disabled = false;
-    b.textContent = idle;
-  }
-});
+  });
+}
+
+$('meUpd').addEventListener('click', openUpdSettingsSheet);
 
 /* ================= 权限自检（我的 → 权限，2026-11-15） =================
  *
@@ -11771,8 +11850,8 @@ document.addEventListener('visibilitychange', () => {
 /* Campus account, service portal, and reference-page bindings. */
 
 // 这一行右边的灰字在**开机时**就要对：用户可能先看到「我的」页，
-// 再决定点不点进去。等打开弹层才更新的话，那里会先显示「参考的项目与链接」，
-// 然后在他眼前变成「… · 联系方式」—— 一次没必要的跳动。
+// 再决定点不点进去。等打开弹层才更新的话，那里会先空着（或写着旧的
+// 「… · 参考的项目」），然后在他眼前变一次 —— 一次没必要的跳动。
 aboutSummary(aboutCached());
 // 校园公告和校园服务从「校园」页进入；服务仍作为独立二级页呈现。
 $('cpMoreToggle').addEventListener('click', () => { switchTab('services'); });
@@ -17573,6 +17652,10 @@ async function boot() {
   // 开机那一行：版本和运行环境只记在本机。
   appLog('启动 v' + APP_VERSION + ' code ' + APP_CODE + ' ' +
          (NATIVE ? 'android' : 'web'));
+  // 打开次数 +1（求 Star 的时机靠它，见 starAskOnce）。只加一个数字，
+  // 不碰别的设置；后台那个隐藏页面走 bgStart，不经过这里，所以不会被算进去。
+  CFG.launchN = (CFG.launchN || 0) + 1;
+  store.set(KEY.settings, CFG);
   // CX、WT 在脚本末尾初始化后才可访问，先用基础数据画出首屏。
   // 老版本存的默认开学日期比真实开学早一周（见 migrateStartDate），先修再画
   if (DATA && DATA.source !== 'nepu' && migrateStartDate(DATA.semester)) store.set(KEY.settings, CFG);
@@ -17642,6 +17725,10 @@ async function boot() {
   // 首屏画完之后再补作业和考试（两秒后，别和首屏抢带宽）。
   // 不这么补的话，用户不进「考试」页、不进「学习」页，课表上永远没有刻度和带子。
   setTimeout(schExtrasRefresh, 2000);
+  // 求一次 Star（2026-11-25）：等首屏、闹钟、预热都排完再说 —— 4 秒。
+  // 「第几次打开 / 有没有课表 / 有没有别的弹层」全在 starAskOnce 里判，
+  // 这里只负责别在开机那一下盖上去。
+  setTimeout(starAskOnce, 4000);
 
 
 }

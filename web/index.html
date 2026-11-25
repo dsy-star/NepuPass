@@ -1108,12 +1108,8 @@
                 所以不是把它做粗一点，是**让它单独占一行**。
              高度没加：把下面「关于本项目」从整行收成半颗（和清缓存并排），
                 省下的 44px 正好给这一行。整张卡反而比第一版矮 12px。 -->
-        <!-- 2026-11-24：用户「在版本那里增加检查更新按钮」。
-             按钮塞在**这一行里**，不新开一行 —— 这一页是一屏卡死的
-             （见上面 11-10 那几段），多 44px 就要从别处抠。
-             版本号仍是行的主体，按钮只是它右边的一颗小胶囊：
-             视觉上当附注，触控目标靠伪元素撑到 44px（样式见 app.css .meupd）。
-             逻辑在 app.js 里绑 #meUpd（手动查一次，见 checkUpdate(true)）。 -->
+        <!-- 2026-11-25：更新入口单独放在版本行下方；点击打开更新设置弹层，
+             自动检查开关、间隔和立即检查都在弹层里。 -->
         <!-- 2026-11-25：用户「这个设置按钮点击后做成一个新的页面，不要在上面用这个
              单独按钮的形式存在，在版本这个组件的上面（同一个框）起一个设置」。
              ⇒ 标题行那颗齿轮按钮删掉了，改成这张卡里的第一整行。
@@ -1129,11 +1125,15 @@
         </button>
         <div class="row">
           <span class="k">版本</span>
-          <span class="rowend">
-            <span class="v muted" id="meVersion">0.0.3</span>
-            <button class="meupd" id="meUpd" type="button">检查更新</button>
-          </span>
+          <span class="rowend"><span class="v muted" id="meVersion">0.0.3</span></span>
         </div>
+        <button class="row tap upd-entry" id="meUpd" type="button">
+          <span class="k">检查更新</span>
+          <span class="rowend">
+            <span class="v muted" id="meUpdLast">自动检查已开启 · 每天一次</span>
+            <svg class="rowico" viewBox="0 0 24 24"><path d="M9 6l6 6-6 6"/></svg>
+          </span>
+        </button>
         <!-- 0.41.0：用户 2026-11-02「我的 加上 关于本项目 的这一栏，里面写上
              本项目参考的项目及对应链接，再加上我的联系方式」。
              这一行只做入口，内容在弹层（app.js 的 openAboutSheet）——

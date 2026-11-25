@@ -1072,29 +1072,42 @@ body::after {
 .row .v { color: var(--sub); text-align: right; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .row .v.muted { color: var(--sub); font-size: 13px; }
 .rowend { display: flex; align-items: center; gap: 4px; min-width: 0; }
-/* 「检查更新」（2026-11-24）：挂在「版本」行右边的一颗小胶囊。
-   🔴 不能把行撑高：我的这一页是一屏卡死的（见 index.html 上方注释），
-      而 .row 的 min-height:44px 已经在那儿，按钮就贴在 rowend 里。
-   🔴 触控目标是靠 ::after 把可点区域补到 44px，**不是**把胶囊画成 44px 高 ——
-      视觉上一颗 26px 的胶囊才是「版本号旁边的附注」，方块会把版本号压成配角。
-   🔴 用 --accent-soft 底 + --accent 字，不描边：行里已经有一条 0.5px 分隔线，
-      再给按钮加边就成两张纸叠在一起了。 */
-.meupd {
-  position: relative; flex: 0 0 auto;
-  min-height: 26px; margin-left: 6px; padding: 0 11px;
-  display: inline-flex; align-items: center;
-  border: 0; border-radius: 999px;
-  background: var(--accent-soft); color: var(--accent);
-  font-family: inherit; font-size: 12.5px; line-height: 1; white-space: nowrap;
+/* 更新设置入口独占一行；点入 sheet 配置自动检查和立即检查。 */
+.upd-entry { text-align: left; }
+.upd-entry .rowend { gap: 8px; }
+@media (max-width: 380px) {
+  .upd-entry #meUpdLast { max-width: 175px; }
 }
-.meupd::after {
-  content: ''; position: absolute; left: 0; right: 0; top: 50%;
-  height: 44px; transform: translateY(-50%);
+.upd-setting-row {
+  display: flex; align-items: center; justify-content: space-between;
+  min-height: 56px; margin-top: 24px; color: var(--text); font-size: 15px;
 }
-.meupd:active { opacity: .62; }
-/* 查的过程中（disabled）不换颜色，只除下高亮 —— 颜色一换就像变成了另一个按钮，
-   而它还是同一颗，只是暂时不能按。 */
-.meupd[disabled] { background: var(--fill); color: var(--sub); }
+.upd-toggle {
+  position: relative; width: 50px; height: 30px; flex: 0 0 auto; padding: 0;
+  border: 0; border-radius: 999px; background: var(--fill); transition: background .18s ease;
+}
+.upd-toggle.active { background: var(--accent); }
+.upd-toggle i {
+  position: absolute; top: 3px; left: 3px; width: 24px; height: 24px;
+  border-radius: 50%; background: #fff; box-shadow: 0 1px 3px rgba(0,0,0,.22);
+  transition: transform .18s ease;
+}
+.upd-toggle.active i { transform: translateX(20px); }
+.upd-setting-label { margin: 26px 0 12px; color: var(--sub); font-size: 13px; }
+.upd-freq {
+  display: grid; grid-template-columns: repeat(3, minmax(0, 1fr));
+  padding: 3px; border-radius: 18px; background: var(--fill);
+}
+.upd-freq button {
+  min-width: 0; min-height: 48px; padding: 0 4px; border: 0; border-radius: 15px;
+  background: transparent; color: var(--sub); font: inherit; font-size: 13px; white-space: nowrap;
+}
+.upd-freq button.active {
+  background: var(--surface, #fff); color: var(--accent); font-weight: 600;
+  box-shadow: 0 2px 7px rgba(15, 30, 55, .12);
+}
+.upd-settings-actions { margin-top: 56px; }
+.upd-settings-actions .btn { width: 100%; min-height: 52px; }
 .rowico {
   width: 15px; height: 15px; flex: 0 0 auto; color: var(--sub);
   fill: none; stroke: currentColor; stroke-width: 1.8;
@@ -2048,7 +2061,6 @@ body::after {
 }
 .ab-item + .ab-item { margin-top: 14px; }
 .ab-name { font-size: 15px; font-weight: 600; }
-.ab-by { margin-top: 1px; font-size: 12px; color: var(--sub); }
 .ab-item p { margin: 5px 0 0; font-size: 13px; line-height: 1.55; color: var(--sub); }
 /* 「关于」页顶部那句提示，内容跟着站上的 about.json 走（0.42.0）。
    用浅色底把它和正文分开 —— 它是一条**临时**的话（比如「这版在测试」），
@@ -2069,33 +2081,6 @@ body::after {
 .ab-note {
   margin-top: 16px; padding-top: 12px; border-top: .5px solid var(--line);
   font-size: 12px; line-height: 1.6; color: var(--sub);
-}
-
-.ab-refs {
-  display: flex; align-items: center; justify-content: space-between;
-  width: 100%; margin-top: 14px; padding: 13px 0;
-  border: 0; border-top: .5px solid var(--line); background: none;
-  font-family: inherit; font-size: 15px; color: var(--text); text-align: left;
-}
-.ab-refs .ab-refs-v {
-  display: flex; align-items: center; gap: 2px;
-  font-size: 12px; color: var(--sub);
-}
-.ab-refs svg {
-  width: 15px; height: 15px; fill: none; stroke: currentColor;
-  stroke-width: 2; stroke-linecap: round; stroke-linejoin: round;
-}
-/* 二级页面的返回。弹层外壳上只有 ✕（关掉整个弹层），
-   这里是「回到上一屏」—— 两件事不能共用一个按钮。 */
-.ab-back {
-  display: inline-flex; align-items: center; gap: 2px;
-  margin: -2px 0 6px -4px; padding: 6px 4px;
-  border: 0; background: none; font-family: inherit;
-  font-size: 13px; color: var(--sub);
-}
-.ab-back svg {
-  width: 16px; height: 16px; fill: none; stroke: currentColor;
-  stroke-width: 2; stroke-linecap: round; stroke-linejoin: round;
 }
 
 /* ---------------- 气泡菜单 / 气泡确认（0.44.0） ----------------
@@ -5647,3 +5632,42 @@ body::after {
       「权限」和「关于本项目」看着像同一句话的两截。
    🔴 只从第二行起补：第一行顶上那条线会贴到卡片边缘，像多画了一条框。 */
 .about > .row + .row::after { display: block; }
+
+/* ---------------- 使用说明弹层（2026-11-25） ----------------
+   「我的 → 说明」从远端网页（docs.qq.com → hobson.cc/help/）改成随包自带的
+   本地说明页，用户原话：「以前是网页版，现在我们改成本地版」。
+   五个板块按底部 tab 的顺序排，一块一段。
+
+   🔴 文案里每条都带一个动作（「点左右箭头翻周」「点『我交过了』」），
+      所以这里用**无序列表 + 圆点**，不是 `.howto` 那套序号圈 —— 序号圈
+      要求「必须按顺序做」，而翻周、查空教室、隐藏课之间没有先后关系。 */
+.hlp-sec + .hlp-sec { margin-top: 18px; }
+.hlp-h {
+  display: flex; align-items: baseline; gap: 8px;
+  margin: 0 0 6px;
+}
+.hlp-h b { font-size: 15px; font-weight: 600; color: var(--text); }
+/* 右侧那颗「第一个 / 第二个」：说明页开头说了「从最左边开始」，
+   光靠段落顺序看不出来哪一块对应底部哪个图标，这里把序号钉死。 */
+.hlp-h span {
+  font-size: 11px; color: var(--sub);
+  padding: 1px 7px; border-radius: 999px;
+  background: var(--accent-soft);
+}
+.hlp-list {
+  margin: 0; padding: 0 0 0 18px;
+  list-style: disc;
+  color: var(--sub);
+}
+.hlp-list li {
+  margin: 0 0 5px;
+  font-size: 13px; line-height: 1.6;
+  overflow-wrap: anywhere;
+}
+.hlp-list li:last-child { margin-bottom: 0; }
+/* 列表里的 `<b>` 是「这一步动的是哪个按钮 / 哪一行」，要压过 `--sub` 的灰。
+   不另起颜色，仍用正文色 —— 说明页里不该出现第二套强调色。 */
+.hlp-list li b { color: var(--text); font-weight: 600; }
+/* 说明块里复用关于页那颗 `.ab-tip`，但那里是 10px 外边距给「关于」卡用的，
+   这里上下都要收紧一点，不然在列表末尾像多断了一段。 */
+.hlp-sec .ab-tip { margin: 10px 0 0; }

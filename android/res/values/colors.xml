@@ -4,5 +4,8 @@
          注意：XML 注释里不能出现连续两个减号，所以这里别写变量名的完整形式。 -->
     <color name="bg">#f4f5f7</color>
     <color name="card">#ffffff</color>
-    <color name="ic_launcher_bg">#344861</color>
+    <!-- 2026-11-25 图标换成戴耳机的小猫：原图是白底棚拍，前景那张 webp 本身也铺着
+         白底，所以底色必须跟着一起用白，否则自适应图标会露出一圈方形的边。
+         以前这里是一片深蓝（#344861）。 -->
+    <color name="ic_launcher_bg">#ffffff</color>
 </resources>
