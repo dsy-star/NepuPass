@@ -43,9 +43,10 @@ public class MainActivity extends Activity {
      * build_apk.py 校验 DongYouTong/ 版本标识与网页版本一致。
      *    改版本号时这里必须同步更新。
      */
-    public static final String UA_TAG = " DongYouTong/0.1.0";
+    public static final String UA_TAG = " DongYouTong/0.1.6";
 
     private WebView web;
+    private ThemeBridge themeBridge;
 
     /**
      * 界面现在是不是开着（0.50.0 v5）。
@@ -89,6 +90,7 @@ public class MainActivity extends Activity {
         java.net.CookieManager cm = new java.net.CookieManager(null, java.net.CookiePolicy.ACCEPT_ALL);
         java.net.CookieHandler.setDefault(cm);
 
+        themeMode = getPreferences(MODE_PRIVATE).getString("theme", "system");
         web = new WebView(this);
         web.setBackgroundColor(bgColor());
         // 2026-11-01：只有**调试包**才开 WebView 远程调试。
@@ -120,6 +122,8 @@ public class MainActivity extends Activity {
         // 别让 WebView 存表单/密码（凭据自己用 Keystore 管，不走这里）
         s.setSaveFormData(false);
 
+        themeBridge = new ThemeBridge();
+        web.addJavascriptInterface(themeBridge, "AndroidTheme");
         web.addJavascriptInterface(new NativeBridge(web), "Android");
         web.addJavascriptInterface(new NepuBridge(this, web), "AndroidNepu");
         // 提醒和小组件又一个对象（0.47.8）：它要拿 Activity 才能向系统要权限，
@@ -371,14 +375,26 @@ public class MainActivity extends Activity {
         }
     }
 
-    /** 状态栏跟着明暗模式走。硬写一个色的话，深色模式下顶上会挂一条亮白。 */
+    /** 将网页主题同步到系统栏，跟随系统时使用设备夜间模式。 */
+    private static final String SYS_BAR_TOP_LIGHT = "#f7f7f7";
+    private static final String SYS_BAR_TOP_DARK = "#101010";
+    private static final String SYS_BAR_BOTTOM_LIGHT = "#f7f7f7";
+    private static final String SYS_BAR_BOTTOM_DARK = "#101010";
+    private String themeMode = "system";
+
+    private boolean isDarkTheme() {
+        if ("dark".equals(themeMode)) return true;
+        if ("light".equals(themeMode)) return false;
+        return (getResources().getConfiguration().uiMode
+                & Configuration.UI_MODE_NIGHT_MASK) == Configuration.UI_MODE_NIGHT_YES;
+    }
+
     private void applySystemBars() {
         Window w = getWindow();
-        boolean dark = (getResources().getConfiguration().uiMode
-                & Configuration.UI_MODE_NIGHT_MASK) == Configuration.UI_MODE_NIGHT_YES;
+        boolean dark = isDarkTheme();
         if (Build.VERSION.SDK_INT >= 21) {
-            w.setStatusBarColor(dark ? Color.parseColor("#0f1013") : Color.parseColor("#f4f5f7"));
-            w.setNavigationBarColor(dark ? Color.parseColor("#191b20") : Color.parseColor("#ffffff"));
+            w.setStatusBarColor(Color.parseColor(dark ? SYS_BAR_TOP_DARK : SYS_BAR_TOP_LIGHT));
+            w.setNavigationBarColor(Color.parseColor(dark ? SYS_BAR_BOTTOM_DARK : SYS_BAR_BOTTOM_LIGHT));
         }
         if (Build.VERSION.SDK_INT >= 23) {
             // 「浅色状态栏」= 深色图标。系统 API 里名字是反的，容易搞混。
@@ -391,9 +407,22 @@ public class MainActivity extends Activity {
     }
 
     private int bgColor() {
-        boolean dark = (getResources().getConfiguration().uiMode
-                & Configuration.UI_MODE_NIGHT_MASK) == Configuration.UI_MODE_NIGHT_YES;
-        return Color.parseColor(dark ? "#0f1013" : "#f4f5f7");
+        boolean dark = isDarkTheme();
+        // 冷启动和下拉回弹时露出的那层底：跟 --bg 同色，才不会有一下白闪。
+        return Color.parseColor(dark ? SYS_BAR_BOTTOM_DARK : SYS_BAR_BOTTOM_LIGHT);
+    }
+
+    public final class ThemeBridge {
+        @android.webkit.JavascriptInterface
+        public void setTheme(final String mode) {
+            if (!"system".equals(mode) && !"light".equals(mode) && !"dark".equals(mode)) return;
+            runOnUiThread(() -> {
+                themeMode = mode;
+                getPreferences(MODE_PRIVATE).edit().putString("theme", mode).apply();
+                applySystemBars();
+                if (web != null) web.setBackgroundColor(bgColor());
+            });
+        }
     }
 
     private static String mimeOf(String path) {
@@ -434,6 +463,9 @@ public class MainActivity extends Activity {
     @Override
     public void onConfigurationChanged(Configuration cfg) {
         super.onConfigurationChanged(cfg);
+        if ("system".equals(themeMode) && web != null) {
+            web.evaluateJavascript("if(window.__onSystemThemeChanged)window.__onSystemThemeChanged()", null);
+        }
         applySystemBars();
         web.setBackgroundColor(bgColor());
     }

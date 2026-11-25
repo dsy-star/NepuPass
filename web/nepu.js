@@ -169,6 +169,68 @@
       courses: selected.length,
     };
   }
+  function pad2(n) { return String(n).padStart(2, '0'); }
+
+  /** "08:00" + 45 → "08:45"；跨天或格式不对返回空串。 */
+  function addMinutes(hhmm, minutes) {
+    const m = /^(\d{2}):(\d{2})$/.exec(hhmm || '');
+    if (!m) return '';
+    const total = Number(m[1]) * 60 + Number(m[2]) + minutes;
+    if (total < 0 || total >= 24 * 60) return '';
+    return pad2(Math.floor(total / 60)) + ':' + pad2(total % 60);
+  }
+
+  /** 整理出真正能画上时间轴的逐节作息。
+   *
+   *  教务页面 `businessHours` 的 `start` 是对的（08:00/08:50/09:55/10:45/13:30…），
+   *  但下午几节的 `end` 不可靠：13:30 配 14:45、14:20 配 15:35，一节压到下一节
+   *  头上，照抄就会画出互相重叠的节次栏。排课记录里的 qssj/jssj 才是这门课真实的
+   *  起止（7-8 节 15:25-17:00），所以：
+   *    · 每节开始时间优先用页面配置，没有就用课程块的开始时间；
+   *    · 结束时间先按一节 45 分钟推，越过下一节开始就截断；
+   *    · 再用课程块的真实结束时间覆盖这一大节的最后一节。
+   *  这样即使页面 end 是错的，节次栏也不会重叠，而且和课程详情里的时间一致。
+   */
+  function periodTimes(hours, courses, unitCount) {
+    const starts = [];
+    (Array.isArray(hours) ? hours : []).forEach(row => {
+      const index = Number(row && row.jcdm) - 1;
+      const start = time(row && (row.start || row.qssj));
+      if (Number.isInteger(index) && index >= 0 && index < 24 && start && !starts[index]) starts[index] = start;
+    });
+    const blocks = [];
+    (Array.isArray(courses) ? courses : []).forEach(c => {
+      if (!c || !Array.isArray(c.slots) || !c.slots.length) return;
+      const periods = c.slots.map(s => Number(s && s.period))
+        .filter(p => Number.isInteger(p) && p >= 0 && p < 24);
+      if (!periods.length) return;
+      const first = Math.min.apply(null, periods), last = Math.max.apply(null, periods);
+      const start = time(c.startTime), end = time(c.endTime);
+      if (start && !starts[first]) starts[first] = start;
+      if (start && end) blocks.push({last, end});
+    });
+    const fromBlocks = blocks.reduce((n, b) => Math.max(n, b.last + 1), starts.length);
+    const count = Math.min(24, Math.max(10, Number(unitCount) || 0, fromBlocks));
+    const out = [];
+    for (let i = 0; i < count; i++) {
+      const start = starts[i];
+      if (!start) continue;
+      let end = addMinutes(start, 45);
+      const next = starts[i + 1];
+      if (next && end > next) end = next;   // 页面配置不干净时，宁可截断也不重叠
+      out[i] = [start, end];
+    }
+    blocks.forEach(b => {
+      const row = out[b.last];
+      if (!row || !b.end || b.end <= row[0]) return;
+      const next = out[b.last + 1];
+      if (next && b.end > next[0]) return;              // 越到下一节里，多半是坏数据
+      if (addMinutes(row[0], 20) > b.end) return;       // 短于 20 分钟，同样不采信
+      row[1] = b.end;
+    });
+    return out;
+  }
+
   function normalize(raw) {
     if (!raw || !Array.isArray(raw.courses) || !Array.isArray(raw.grades) || !Array.isArray(raw.exams))
       throw new Error('教务响应结构不完整，已保留原有缓存');
@@ -176,12 +238,8 @@
     if (!/^\d{6}$/.test(term) || !/^\d{4}-\d{2}-\d{2}$/.test(text(raw.week1Monday)))
       throw new Error('学期或第一周日期缺失，已保留原有缓存');
     const courses = courseRows(raw.courses);
-    const businessHours = [];
-    (Array.isArray(raw.businessHours) ? raw.businessHours : []).forEach(r => {
-      const index = Number(r.jcdm) - 1;
-      const start = time(r.start || r.qssj), end = time(r.end || r.jssj);
-      if (Number.isInteger(index) && index >= 0 && index < 24 && start && end) businessHours[index] = [start, end];
-    });
+    const unitCount = Math.max(12, ...courses.flatMap(c => c.slots.map(s => s.period + 1)));
+    const businessHours = periodTimes(raw.businessHours, courses, unitCount);
     const grades = raw.grades.map(r => {
       const score = text(r.zcjfs) || text(r.zcj);
       const numericScore = Number(score);
@@ -204,7 +262,7 @@
       if (m) summary.push({year: m[1], term: Number(m[2])});
     });
     return {ok: true, source: 'nepu', profile: {}, termId: term, semester, terms,
-      week1Monday: raw.week1Monday, businessHours, unitCount: Math.max(12, ...courses.flatMap(c => c.slots.map(s => s.period + 1))),
+      week1Monday: raw.week1Monday, businessHours, unitCount,
       totalWeeks: Math.max(Number(raw.totalWeeks) || 22, ...courses.flatMap(c => c.weeks)), courses,
       grades: {courses: grades, summary, overall: gradeStats(grades)},
       exams: {semesterId: term, semesters: terms, exams: raw.exams.map(r => ({
@@ -214,7 +272,7 @@
         status: text(r.ksaplxmc), note: text(r.bz)}))},
       syncedAt: Math.floor(Date.now() / 1000)};
   }
-  const api = {normalize, normalizeNotices, weeks, termName, gradeStats, estimateGpa};
+  const api = {normalize, normalizeNotices, periodTimes, weeks, termName, gradeStats, estimateGpa};
   root.Nepu = api;
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
 })(typeof window === 'undefined' ? globalThis : window);

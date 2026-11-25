@@ -84,8 +84,8 @@ const DAY_CN = ['一', '二', '三', '四', '五', '六', '日'];
    build_apk.py 里，两处各写一遍，迟早会出现「软件里显示 0.1.0、装上去是 0.1.1」
    这种没法解释的事。现在 build_apk.py 和 version.json 都从这里读。
    code 是整数，只增不减：比版本号字符串靠谱（"0.10.0" < "0.9.0" 是字符串比较的经典坑）。 */
-const APP_VERSION = '0.1.0';
-const APP_CODE = 191;
+const APP_VERSION = '0.1.6';
+const APP_CODE = 197;
 
 /* 功能说明书的地址（2026-11-15）。
  *
@@ -139,18 +139,19 @@ const MYVER = APP_VERSION +
 const NATIVE = !!window.NativeApi;
 const envText = (web, app) => (NATIVE ? app : web);
 
-/* 默认作息：按常见高校排布填的，**不是从教务系统读的**（教务系统不给时间）。
-   和实际不一样，在「我的 → 上课时间」里改，改完存本地。 */
-// 🔴 郑航真实作息（2026-10-18 从 WakeUp 课表的左侧时间轴实测抄下来的）。
-//    之前那套是按「常见作息」猜的，整体偏了：第 2→3 节、第 6→7 节之间是
-//    20 分钟大课间（09:40→10:00、16:10→16:30），不是 10 分钟；
-//    第 3 节是 10:00 而不是 09:55。别凭印象改，要改先对一遍课表。
+/* 默认作息：东油教务一节 45 分钟。
+   教务页面里的节次配置只给了可靠的开始时间，下午几节的结束时间对不上
+   （13:30 配 14:45、14:20 配 15:35，会和下一节叠在一起），所以这里按
+   开学时间 + 45 分钟排，和排课记录里的真实起止一致（7-8 节 15:25-17:00）。
+   同步到教务数据后会用 Nepu.periodTimes 算出的作息覆盖它；想自己调就在
+   「我的 → 设置 → 上课时间和提醒」里改，改完存本地。 */
 const DEFAULT_TIMES = [
-  ['08:00', '08:45'], ['08:55', '09:40'],
-  ['10:00', '10:45'], ['10:55', '11:40'],
-  ['14:30', '15:15'], ['15:25', '16:10'],
-  ['16:30', '17:15'], ['17:25', '18:10'],
-  ['19:30', '20:15'], ['20:25', '21:10'],
+  ['08:00', '08:45'], ['08:50', '09:35'],
+  ['09:55', '10:40'], ['10:45', '11:30'],
+  ['13:30', '14:15'], ['14:20', '15:05'],
+  ['15:25', '16:10'], ['16:15', '17:00'],
+  ['18:00', '18:45'], ['18:50', '19:35'],
+  ['19:55', '20:40'], ['20:45', '21:30'],
 ];
 
 // 旧的默认作息。用户如果只是点过「保存」但没真改，localStorage 里存的是这一套，
@@ -300,7 +301,7 @@ let prefetchTotal = 0;
 let prefetchDone = 0;
 let prefetchTok = 0;
 let CFG = Object.assign(
-  { startDate: '', week: 0, view: 'week', cursor: '', times: null, hidden: [],
+  { startDate: '', week: 0, view: 'week', cursor: '', times: null, timesSource: '', hidden: [],
     // 自己给课程定的颜色：{ 课名: 色相 0~359 }。没记就是按课名散列（见 colorHue）。
     // 🔴 键是**课名**不是 code：教务数据里同一门课常被拆成好几条（不同周次、
     //    不同教室），按 code 存会出现「只改了其中一格」。
@@ -311,6 +312,7 @@ let CFG = Object.assign(
     // 余额提醒：默认开着、阈值 20 元。一卡通刷完才发现没钱是最常见的懊恼，
     // 而这条提示是**常驻行内提示**，不弹窗 —— 弹窗会被点掉，行内的一直在。
     alertOn: true, alertLow: 20,
+    theme: 'system',
     // 检查更新：默认开着，默认**每天查一次**（一次请求，几百字节）。
     // 为什么不是「每次打开」：一天开十次 App 就查十次，而一天之内
     // 根本不会有新版本 —— 纯属白耗流量。想更勤可以在设置里改成「每次打开」。
@@ -328,11 +330,73 @@ let CFG = Object.assign(
   store.get(KEY.settings, {})
 );
 
+const THEME_MODES = ['system', 'light', 'dark'];
+// 选择器上的三个字（2026-11-25）：设置页的按钮、「我的」那行灰字都读这一份。
+// 写在头顶而不是设置页旁边 —— renderMe 也可能先跑到，别让它撞上暂时性死区。
+const THEME_LABELS = { system: '跟随系统', light: '浅色', dark: '深色' };
+// Keep all existing component-level dark styles aligned with the user's choice,
+// not only the global palette. Local stylesheets are loaded before this script.
+const themeMediaRules = [];
+for (const sheet of document.styleSheets) {
+  try {
+    for (const rule of sheet.cssRules) {
+      if (rule.media && rule.media.mediaText === '(prefers-color-scheme: dark)') {
+        themeMediaRules.push(rule);
+      }
+    }
+  } catch (_) { /* Cross-origin stylesheets are not part of the local theme. */ }
+}
+function applyTheme(mode) {
+  const selected = THEME_MODES.includes(mode) ? mode : 'system';
+  const firstUse = !THEME_MODES.includes(CFG.theme);
+  CFG.theme = selected;
+  if (firstUse) {
+    try { store.set(KEY.settings, CFG); } catch (_) {}
+  }
+  document.documentElement.dataset.theme = selected;
+  for (const rule of themeMediaRules) {
+    rule.media.mediaText = selected === 'system'
+      ? '(prefers-color-scheme: dark)'
+      : (selected === 'dark' ? 'all' : 'not all');
+  }
+  const dark = selected === 'dark' ||
+    (selected === 'system' && window.matchMedia('(prefers-color-scheme: dark)').matches);
+  document.documentElement.style.colorScheme = dark ? 'dark' : 'light';
+  document.querySelectorAll('meta[name="theme-color"]').forEach((meta) => {
+    meta.content = dark ? '#101010' : '#f7f7f7';
+  });
+  if (window.AndroidTheme && typeof window.AndroidTheme.setTheme === 'function') {
+    window.AndroidTheme.setTheme(selected);
+  }
+}
+applyTheme(CFG.theme);
+const systemThemeQuery = window.matchMedia('(prefers-color-scheme: dark)');
+const onSystemThemeChange = () => {
+  if (CFG.theme === 'system') applyTheme('system');
+};
+window.__onSystemThemeChanged = onSystemThemeChange;
+if (systemThemeQuery.addEventListener) systemThemeQuery.addEventListener('change', onSystemThemeChange);
+else if (systemThemeQuery.addListener) systemThemeQuery.addListener(onSystemThemeChange);
+
 // 认旧的默认作息：等于 LEGACY_TIMES 就说明用户没真改过，直接换成新的。
 // （只要有一条不一样就尊重用户的选择，不覆盖）
 if (CFG.times && CFG.times.length === LEGACY_TIMES.length &&
     CFG.times.every((r, i) => r && r[0] === LEGACY_TIMES[i][0] && r[1] === LEGACY_TIMES[i][1])) {
-  CFG.times = null;
+  CFG.times = null; CFG.timesSource = '';
+}
+
+// 本机还存着 0.1.4 及更早同步下来的坏作息：教务页面的下午节次结束时间对不上，
+// 第 5 节起每节 75 分钟且压到下一节头上。这种表画出来的时间轴是错的，
+// 留着还不如回到默认 —— 下次同步会用排课记录重新算一份。
+if (CFG.times) {
+  const broken = CFG.times.some((r, i) => {
+    if (!r) return false;
+    const start = hhmmToMin(r[0]), end = hhmmToMin(r[1]);
+    if (start == null || end == null || !(end > start)) return true;
+    const next = CFG.times[i + 1];
+    return !!(next && next[0] && hhmmToMin(next[0]) != null && hhmmToMin(next[0]) < end);   // 结束晚于下一节开始 = 重叠
+  });
+  if (broken) { CFG.times = null; CFG.timesSource = ''; }
 }
 
 /* 出问题的时候，悄悄把「哪一类问题、哪个版本、它说的话」发回去。
@@ -662,6 +726,13 @@ function times() {
   const out = [];
   for (let i = 0; i < n; i++) out.push(t[i] || ['', '']);
   return out;
+}
+
+/** 「我的 / 设置」里那一行右侧的灰字：这份作息是哪来的。
+ *  nepu = 同步时按教务节次 + 排课记录算出来的；manual = 用户手改过。 */
+function timesLabel() {
+  if (!CFG.times) return '默认作息，可修改';
+  return CFG.timesSource === 'nepu' ? '教务作息 · 可修改' : '已自定义';
 }
 
 /** `08:45` → 525（当天第几分钟）。认不出返回 **null**，不是 0。
@@ -1575,7 +1646,7 @@ function visibleDays() {
    中间那格原来是「公告」，用户 2026-10-30 要求换成 WIKI —— 公告是低频内容，
    并进了「功能」页；攻略是新生天天翻的。 */
 const TABS = ['schedule', 'exams', 'wiki', 'campus', 'me'];
-const SUBPAGES = ['calendar', 'rooms', 'accounts', 'notice', 'stats', 'services', 'perm'];
+const SUBPAGES = ['calendar', 'rooms', 'accounts', 'notice', 'stats', 'services', 'perm', 'settings'];
 /* 子页是从哪个 tab 进去的 —— 返回时回那里，底部也要高亮那一个。
    原来只有校历/空教室两个、都挂在课表下，所以写死成 'schedule'；
    0.14.0 的「账号管理」是从「我的」进去的，再写死就会高亮错 tab。
@@ -1585,7 +1656,11 @@ const SUB_PARENT = { calendar: 'schedule', rooms: 'schedule',
                       services: 'wiki',
                       // 2026-11-15：权限自检挂在「我的」。它是一次「看看哪儿没配对」
                       // 的检查，一学期点不了两次，不该占底部一个位置。
-                      perm: 'me' };
+                      perm: 'me',
+                      // 2026-11-25：「设置」也挂在「我的」，同样是一次性的低频入口。
+                      // 🔴 少了这一条，pgDirection 算不出方向 → 不进动效、返回键也
+                      //    会回错地方（它的兜底是 'schedule'）。两处必须一起加。
+                      settings: 'me' };
 
 /* 当前真正在显示哪一页。
    🔴 不能拿 `.tab.active` 反推：子页亮的是「课表」，在空教室页按返回
@@ -1835,6 +1910,10 @@ function pgRunPair(top, bot, kTop, kBot, ms, name) {
 }
 
 function pgMotion(prev, name) {
+  // 底部主 Tab 页面内容密度高，整页双层横移会同时栅格化卡片、阴影和背景，
+  // 中低端 WebView 会掉帧并短暂露出底色。switchTab 已先用 pgOnly 显示目标页；
+  // 主 Tab 直接落位，子页 push/pop 继续保留层级动效。
+  if (TABS.indexOf(prev) >= 0 && TABS.indexOf(name) >= 0) return;
   const dir = pgDirection(prev, name);
   if (!dir) return;
   const prevEl = $('page-' + prev);
@@ -4391,6 +4470,13 @@ if (typeof statsWire === 'function') statsWire();
 // 后台自动（0.50.0 v9）：入口从学习页搬来「我的」标题行右边。
 // 它管着学习通和积分任务两件事，本来就该是「这台手机的设置」，不是某个页面的按钮。
 $('meAuto').addEventListener('click', () => openAutoSheet());
+/* 设置（2026-11-25）：「我的」那张卡里的第一整行，进的是独立二级页。
+   用户要求「做成一个新的页面，不要在上面用这个单独按钮的形式存在」——
+   所以这里只有一句「先重画、再切页」，弹层那套不再用。
+   🔴 必须先 renderSettingsPage() 再 switchTab()：反过来的话切过去会先看到
+     「正在读…」。两个都是同步的，顺序在这里是可见的差别。 */
+$('rowSettings').addEventListener('click', () => { renderSettingsPage(); switchTab('settings'); });
+$('settingsBack').addEventListener('click', () => { switchTab('me'); });
 
 /* 「说明」（2026-11-15）：打开功能说明书。
  *
@@ -6418,6 +6504,55 @@ async function queryRooms() {
 
 // ------------------------------------------------------------------ 我的
 
+/** 设置页（2026-11-25）：独立二级页，内容就是颜色三选一。
+ *  以前是弹层（openSettingsSheet），用户要求「做成一个新的页面」之后搬到这里。
+ *  🔴 点一下**立刻**生效并写本机：这里是设置页，不该再有「保存」按钮 ——
+ *     多一步确认，用户只会以为自己没点上。
+ *  🔴 `meTheme` 那行灰字也在这里一起改：它和本页说的是同一件事，只在
+ *     renderMe 里改的话，用户返回「我的」之前那一行还是旧值。 */
+function renderSettingsPage() {
+  const modes = [
+    ['light', '浅色'], ['dark', '深色'], ['system', '跟随系统'],
+  ];
+  const theme = THEME_MODES.includes(CFG.theme) ? CFG.theme : 'system';
+  const body = $('settingsBody');
+  if (body) {
+    body.innerHTML =
+      '<h2>颜色</h2>' +
+      '<p class="sub">浅色、深色，或者跟着系统的夜间模式走。选了立刻生效。</p>' +
+      '<div class="settings-segment" role="group" aria-label="颜色模式">' +
+      modes.map(([value, label]) => '<button type="button" class="settings-option' +
+        (theme === value ? ' active' : '') + '" data-theme-choice="' + value + '"' +
+        (theme === value ? ' aria-pressed="true"' : ' aria-pressed="false"') +
+        '>' + label + '</button>').join('') +
+      '</div>' +
+      // 课表：没绑定教务的时候「我的」里那一整块是 hidden 的，缓存下来的课表
+      // 就成了改不了时间的死数据 —— 作息放在这里，登录与否都能调。
+      '<h2 class="set-gap">课表</h2>' +
+      '<p class="sub">左侧节次栏的起止时间，上课提醒也按它算。</p>' +
+      '<button type="button" class="row tap" id="setTimes">' +
+        '<span class="k">上课时间和提醒</span>' +
+        '<span class="rowend">' +
+          '<span class="v muted" id="setTimesV">' + timesLabel() + '</span>' +
+          '<svg class="rowico" viewBox="0 0 24 24"><path d="M9 6l6 6-6 6"/></svg>' +
+        '</span>' +
+      '</button>';
+    body.querySelectorAll('[data-theme-choice]').forEach((button) => {
+      button.addEventListener('click', () => {
+        applyTheme(button.dataset.themeChoice);
+        store.set(KEY.settings, CFG);
+        // 整页重画，不只改 active 类：选中态、aria、右边那行灰字要一起变，
+        // 分两处改一定会漏（弹层那版只改 active，`meTheme` 就漏了）。
+        renderSettingsPage();
+      });
+    });
+    const setTimes = body.querySelector('#setTimes');
+    if (setTimes) setTimes.addEventListener('click', openTimesSheet);
+  }
+  const hint = $('meTheme');
+  if (hint) hint.textContent = THEME_LABELS[theme] || '跟随系统';
+}
+
 function renderMe() {
   const oldLogin = document.querySelector('#meUnbound .bindcard');
   if (oldLogin) oldLogin.hidden = true;
@@ -6438,6 +6573,9 @@ function renderMe() {
   autoRepaint();
   // 「权限」那颗半按钮：只在读得到状态的壳里出现（网页版没有系统权限这回事）。
   renderPermEntry();
+  // 「设置」那行右边的灰字（2026-11-25）：写着当前选的颜色，
+  // 这样不用点进去也知道现在是什么模式。真值只在 THEME_LABELS 里有一份。
+  $('meTheme').textContent = THEME_LABELS[CFG.theme] || '跟随系统';
   const bound = !!(DATA && DATA.profile && DATA.profile.studentId);
   $('meBound').hidden = !bound;
   $('meUnbound').hidden = bound;
@@ -6510,9 +6648,8 @@ function renderMe() {
 
   const tt = times();
   const first = tt.find((x) => x[0]);
-  $('meTimes').textContent = CFG.times
-    ? '已自定义' + (first ? '（第1节 ' + first[0] + '）' : '')
-    : '默认作息，可修改';
+  $('meTimes').textContent = timesLabel() +
+    (CFG.times && first ? '（第1节 ' + first[0] + '）' : '');
 
   // 🔴 0.46.0：「课程调整」这一行**常显** —— 它是「自己加课」唯一的常驻入口。
   //    以前只有藏过课才出现，现在跟着隐藏条数一起藏着的话，
@@ -7774,7 +7911,11 @@ $('btnWidget').addEventListener('click', () => {
  * （寒暑假前后各一次很常见）就再也没地方改了，课表和提醒会一起错。
  * 所以改成：默认不展开，只留一行小字入口，点开才是原来那十行 + 保存。
  * 弹层一进来就是提醒，跟用户要的样子一致；功能也没丢。 */
-$('btnTimes').addEventListener('click', () => {
+$('btnTimes').addEventListener('click', openTimesSheet);
+
+/** 提醒 + 改作息的弹层。原来只挂在「我的 → 上课时间和提醒」那颗按钮上，
+ *  而那颗按钮在没绑定教务时整块是 hidden 的；设置页也要能进来，所以抽成函数。 */
+function openTimesSheet() {
   // 提醒放在作息**上面**：提醒只有三行，压在十行作息后面等于没人看到。
   const html = '<div class="sh-title">' + REMIND_ROW_NAME + '</div>' +
     '<div class="rm-box" id="rmBox">' + remindInnerHtml() + '</div>' +
@@ -7784,7 +7925,7 @@ $('btnTimes').addEventListener('click', () => {
   $('sheetMask').hidden = false;
   bindRemindBox();
   $('timeEdit').addEventListener('click', openTimeEdit);
-});
+}
 
 /** 展开作息编辑（原「上课时间和提醒」弹层的主体）。 */
 function openTimeEdit() {
@@ -7807,9 +7948,10 @@ function openTimeEdit() {
 
   $('timeReset').addEventListener('click', () => {
     CFG.times = null;
+    CFG.timesSource = '';
     store.set(KEY.settings, CFG);
     $('sheetMask').hidden = true;
-    renderSchedule(); renderMe();
+    renderSchedule(); renderMe(); renderSettingsPage();
     // 作息变了，提醒时间也要跟着变 —— 不重推的话，明天的提醒还是按旧作息算的。
     remindPush(true);
     toast('已恢复默认时间');
@@ -7822,9 +7964,10 @@ function openTimeEdit() {
       out[i][k] = inp.value;
     });
     CFG.times = out;
+    CFG.timesSource = 'manual';
     store.set(KEY.settings, CFG);
     $('sheetMask').hidden = true;
-    renderSchedule(); renderMe();
+    renderSchedule(); renderMe(); renderSettingsPage();
     remindPush(true);
     toast('已保存');
   });
@@ -10717,7 +10860,13 @@ async function doNepuSync(goSchedule) {
     payload.source = 'nepu';
     payload.nepuTerms = nepuTerms;
     payload.week1Monday = raw.week1Monday || '';
-    if (payload.businessHours.length >= payload.unitCount && Array.from(payload.businessHours).every(r => Array.isArray(r) && r.length === 2)) CFG.times = payload.businessHours;
+    // 教务给的节次时间（Nepu.periodTimes 已按 45 分钟一节 + 排课记录修过）优先，
+    // 但用户手改过的作息不覆盖 —— 他改就是因为学校临时调了课。
+    const bh = payload.businessHours;
+    if (Array.isArray(bh) && bh.some(r => Array.isArray(r) && r.length === 2) && CFG.timesSource !== 'manual') {
+      CFG.times = bh;
+      CFG.timesSource = 'nepu';
+    }
     if (payload.week1Monday) {
       // The selected term replaces the displayed snapshot, so dates must follow it too.
       CFG.startDate = String(payload.week1Monday).slice(0, 10);
@@ -11958,6 +12107,15 @@ const UPD_FREQ_LIST = ['always', 'daily', 'weekly'];
 /* 自动检查查到新版本时，用户正开着别的弹层 —— 先存这儿，等他关掉再弹。
    存的是清单本身，不是「待办标记」：关掉的那一刻直接拿来渲染。 */
 let updPending = null;
+// All sheet callers share this mask, including those that close it directly.
+new MutationObserver(() => {
+  if (!$('sheetMask').hidden || !updPending) return;
+  const info = updPending;
+  updPending = null;
+  setTimeout(() => {
+    if (CFG.updOn && CFG.updSkip !== updKey(info) && updNewer(info)) showUpdateSheet(info, false);
+  }, 0);
+}).observe($('sheetMask'), { attributes: true, attributeFilter: ['hidden'] });
 
 /** 把 '0.10.2' 拆成 [0,10,2]。别用字符串比大小 —— "0.10" < "0.9"。 */
 function verNum(s) {
@@ -12044,7 +12202,14 @@ async function fetchOne(base, ms) {
       return { ok: false, error: '更新服务暂时不可用' };
     }
     const j = await r.json();
-    if (!j || typeof j !== 'object' || !j.version) {
+    const validVersion = j && typeof j === 'object' &&
+      typeof j.version === 'string' && /^\d+(?:\.\d+){1,3}$/.test(j.version);
+    const validCode = Number.isSafeInteger(j && j.code) && j.code > 0;
+    const validSize = Number.isSafeInteger(j && j.size) && j.size > 0;
+    const validSha = typeof (j && j.sha256) === 'string' && /^[a-f0-9]{64}$/i.test(j.sha256);
+    const validUrls = j && typeof j === 'object' &&
+      [j.apk_cn, j.apk, j.page].some((x) => typeof x === 'string' && /^https:\/\//i.test(x));
+    if (!validVersion || !validCode || !validSize || !validSha || !validUrls) {
       console.warn('[upd] ' + u + ' 清单格式不对');
       return { ok: false, error: '更新服务暂时不可用' };
     }
@@ -12624,7 +12789,7 @@ function updVerify(info) {
   const u = nativeUpd();
   const want = String(info.sha256 || '').toLowerCase();
   const got = (u && u.sha256(updDl.id)) || '';
-  if (want && got !== want) {
+  if (!/^[a-f0-9]{64}$/.test(want) || !/^[a-f0-9]{64}$/.test(got) || got !== want) {
     u.cancel(updDl.id);                 // 连文件一起删掉，别留在手机上
     updDl.state = 'failed';
     updDl.allowBrowser = true;          // 给一条退路，别把人卡死在这
@@ -12664,7 +12829,12 @@ function updInstall(info) {
 /** 主按钮点下去该干什么，全看当前状态。 */
 function updAction(info) {
   const st = updDl ? updDl.state : 'idle';
-  if (st === 'needperm') { nativeUpd().openInstallSettings(); return; }
+  if (st === 'needperm') {
+    const u = nativeUpd();
+    if (u && u.canInstall()) updInstall(info);
+    else if (u) u.openInstallSettings();
+    return;
+  }
   if (st === 'ready') { updInstall(info); return; }
   if (st === 'downloading') return;          // 按钮此时是禁用的
   if (st === 'failed' && updDl && updDl.allowBrowser) {

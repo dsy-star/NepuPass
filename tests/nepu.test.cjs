@@ -52,7 +52,37 @@ assert.throws(() => normalize({...raw, courses:[{...row, ps:'00'}]}), /节次/);
 assert.deepEqual(normalize(raw).courses.map(c => c.code), result.courses.map(c => c.code));
 assert.equal(raw.courses[0].zc, '16,1,2,2');
 assert.equal(typeof result.syncedAt, 'number');
-assert.deepEqual(normalize({...raw, businessHours:[{jcdm:'01',start:'08:00:00',end:'08:45:00'}]}).businessHours, [['08:00','08:45']]);
+const onlyFirst = normalize({...raw, businessHours:[{jcdm:'01',start:'08:00:00',end:'08:45:00'}]}).businessHours;
+assert.deepEqual(onlyFirst[0], ['08:00','08:45']);
+// 页面只给了第 1 节时，第 7 节（period 6）的开始时间从排课记录（15:25）补上，不再留空洞
+assert.deepEqual(onlyFirst[6], ['15:25','16:10']);
+
+// 教务页面 businessHours 的下午结束时间是错的（13:30 配 14:45、14:20 配 15:35），
+// 直接抄会画出互相重叠的节次栏；periodTimes 要按 45 分钟一节 + 排课记录修回来。
+const {periodTimes} = require('../web/nepu.js');
+const pageHours = ['08:00','08:50','09:55','10:45','13:30','14:20','15:25','16:15','18:00','18:50','19:55','20:45']
+  .map((start, i) => {
+    const [h, m] = start.split(':').map(Number);
+    const end = new Date(2026, 0, 1, h, m + (i < 4 ? 45 : 75));   // 上午 45 分钟，下午 75 分钟
+    return {jcdm: String(i + 1).padStart(2, '0'), start, end: end.toTimeString().slice(0, 5)};
+  });
+const fixed = periodTimes(pageHours, [], 12);
+assert.equal(fixed.length, 12);
+assert.deepEqual(fixed[4], ['13:30', '14:15']);
+askMonotonic(fixed);
+function askMonotonic(table) {
+  for (let i = 0; i + 1 < table.length; i++) {
+    if (!table[i] || !table[i + 1]) continue;
+    assert.ok(table[i][1] <= table[i + 1][0], `第${i + 1}节结束晚于第${i + 2}节开始`);
+  }
+}
+// 排课记录 7-8 节 15:25-17:00：块末节按记录收口，前一节仍是 45 分钟
+const courseBlock = {slots:[{day:0, period:6}, {day:0, period:7}], startTime:'15:25', endTime:'17:00'};
+assert.deepEqual(periodTimes(pageHours, [courseBlock], 12).slice(6, 8), [['15:25','16:10'], ['16:15','17:00']]);
+// 页面没给第 9 节开始时间时，用课程块的开始时间补
+assert.deepEqual(periodTimes([], [{slots:[{period:8}], startTime:'18:00', endTime:'18:45'}], 12)[8], ['18:00','18:45']);
+// 越到下一节里的结束时间不采信，保留推算值（第 5 节 13:30 不该收到 15:40）
+assert.deepEqual(periodTimes(pageHours, [{slots:[{period:4}], startTime:'13:30', endTime:'15:40'}], 12)[4], ['13:30','14:15']);
 const {normalizeNotices} = require('../web/nepu.js');
 const now = new Date(2026, 10, 24, 17).getTime();
 const notice = (id, date, title = '通知') => ({id, date, title});

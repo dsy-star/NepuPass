@@ -176,9 +176,10 @@ def main():
         + "\n\n安装包：%s/%s\n" % (PAGES_BASE, name),
         encoding="utf-8")
 
+    # Human-readable diagnostics go to stderr so callers may safely eval stdout.
     print("版本 %s（code %d），%d 条更新内容，安装包 %.1f KB"
-          % (version, code, len(notes), size / 1024.0))
-    print("清单：%s" % (out / "version.json"))
+          % (version, code, len(notes), size / 1024.0), file=sys.stderr)
+    print("清单：%s" % (out / "version.json"), file=sys.stderr)
     # 给 CI 的 eval 用：值都是版本号/路径，不会有空格。
     print("VERSION=%s" % version)
     print("CODE=%d" % code)

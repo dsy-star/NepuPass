@@ -5418,3 +5418,232 @@ body::after {
   -webkit-tap-highlight-color: transparent;
 }
 .perm-go:active { background: var(--active); }
+
+/* ==================================================================
+   Liquid Glass visual pass · 2026-11
+   ------------------------------------------------------------------
+   仅收敛视觉层：不改变 DOM、业务状态、事件绑定或桥接契约。
+   材质分三层：背景光、内容面、浮层玻璃；backdrop blur 只放在
+   压住内容的导航/工具栏/弹层，避免长列表每个卡片都触发重绘。
+   ================================================================== */
+:root {
+  --r: 22px;
+  --r-card: 22px;
+  --r-sheet: 30px;
+  --r-ctl: 14px;
+  --gap-card: 10px;
+  --ease-move: cubic-bezier(.22, .61, .36, 1);
+  --ease-drawer: cubic-bezier(.32, .72, 0, 1);
+  --ease-soft: cubic-bezier(.23, 1, .32, 1);
+  --t-sheet: 360ms;
+  --t-fade: 220ms;
+}
+
+:root[data-theme="light"] {
+  color-scheme: light;
+}
+
+/* 内容面：透光但保持文字清晰，不使用 backdrop-filter。 */
+.card,
+.sumcard, .daynext, .crhero, .crcats, .crcard, .gradelist, .gptrend,
+.exsum, .exitem, .rmlist, .ntitem, .calhero, .cx-item {
+  background: var(--card);
+  background-image: var(--card-grad);
+  border: .5px solid var(--card-line);
+  box-shadow: var(--shadow-card);
+  border-radius: var(--r-card);
+}
+
+/* 浮层材质：导航、顶栏、底部 sheet 才使用真实背景模糊。 */
+.weekbar,
+.tabbar {
+  background: color-mix(in srgb, var(--card) 82%, transparent);
+  -webkit-backdrop-filter: saturate(105%) blur(24px);
+  backdrop-filter: saturate(105%) blur(24px);
+  border-color: var(--card-line);
+  box-shadow: var(--shadow-float);
+  transition: background-color 240ms var(--ease-move), box-shadow 240ms var(--ease-move);
+}
+.sheet {
+  background: color-mix(in srgb, var(--card) 90%, transparent);
+  -webkit-backdrop-filter: saturate(105%) blur(28px);
+  backdrop-filter: saturate(105%) blur(28px);
+  border-radius: var(--r-sheet) var(--r-sheet) 0 0;
+  box-shadow: var(--shadow-raise);
+}
+.sheet-mask { background: rgba(5, 12, 24, .28); }
+
+/* 底部栏仍保持原有布局和 tab 数量，只提升为悬浮玻璃层。 */
+.tabbar {
+  /* 悬浮胶囊：离屏幕底边留出安全区，**高度不再叠加安全区** ——
+     原来是 bottom:0 + 高度含安全区；现在 bottom 让出了安全区，
+     高度再把安全区算进去就会把整条栏顶高一份，压住学习页的动作条。 */
+  bottom: max(8px, env(safe-area-inset-bottom));
+  left: 10px;
+  right: 10px;
+  height: var(--tab-h);
+  padding-bottom: 0;
+  border: 1px solid var(--card-line);
+  border-radius: 24px;
+  /* 🔴 不写 `overflow: hidden`。带 `backdrop-filter` 的元素再套一层圆角裁切，
+     Chromium 得单独开一个渲染表面、每帧按圆角做遮罩，换页那 240ms 直接掉帧。
+     栏里没有会溢出圆角的东西（图标胶囊本身自带圆角），裁不裁都一样。 */
+}
+/* 内容区的下边距跟着胶囊的实际占位走：栏高 + 离底距离 + 一点呼吸。 */
+.page {
+  padding-bottom: calc(var(--tab-h) + max(8px, env(safe-area-inset-bottom)) + 10px);
+}
+.tabbar .tab { transition: color 220ms var(--ease-move), transform 120ms var(--ease-soft); }
+.tabbar .tab.active svg { background: color-mix(in srgb, var(--accent) 16%, transparent); }
+.tabbar .tab::before { transition: transform 220ms var(--ease-move), opacity 160ms linear; }
+
+/* 切页改为即时显示下一页，避免整张高密度页面平移时的合成掉帧与露底。 */
+#app.pg-run .tabbar,
+#app.pg-run .weekbar {
+  -webkit-backdrop-filter: none;
+  backdrop-filter: none;
+  background: var(--bg);
+  transition: none;
+}
+@media (prefers-reduced-transparency: reduce) {
+  #app.pg-run .tabbar,
+  #app.pg-run .weekbar {
+    background: var(--bg);
+    -webkit-backdrop-filter: none;
+    backdrop-filter: none;
+  }
+}
+
+/* Neutral glass palette: warm white in light mode, restrained charcoal in dark mode. */
+:root {
+  --bg: #f7f7f7;
+  --bg-grad: linear-gradient(180deg, #fafafa 0%, #f7f7f7 38%, #f7f7f7 100%);
+  --card: rgba(255, 255, 255, .72);
+  --card-grad: linear-gradient(180deg, rgba(255,255,255,.82), rgba(255,255,255,.66));
+  --card-line: rgba(255,255,255,.68);
+  --row-bg: rgba(0,0,0,.035);
+  --text: #202020;
+  --sub: #707070;
+  --line: rgba(0,0,0,.10);
+  --rule: rgba(0,0,0,.06);
+  --active: rgba(0,0,0,.07);
+  --fill: rgba(0,0,0,.045);
+  --accent: #4f5964;
+  --accent-grad: linear-gradient(135deg, #68737e, #4f5964);
+  --accent-glow: none;
+  --accent-soft: #eceeef;
+  --primary: #4f5964;
+  --shadow-card: 0 1px 2px rgba(0,0,0,.025), 0 8px 20px -16px rgba(0,0,0,.16);
+  --shadow-raise: 0 8px 24px -18px rgba(0,0,0,.22), 0 1px 4px rgba(0,0,0,.04);
+  --shadow-float: 0 -4px 16px -12px rgba(0,0,0,.14), 0 8px 20px -16px rgba(0,0,0,.18);
+}
+:root[data-theme="dark"] {
+  --bg: #101010;
+  --bg-grad: linear-gradient(180deg, #171717 0%, #101010 38%, #101010 100%);
+  --card: rgba(35,35,35,.82);
+  --card-grad: linear-gradient(180deg, rgba(42,42,42,.86), rgba(31,31,31,.82));
+  --card-line: rgba(255,255,255,.12);
+  --row-bg: rgba(255,255,255,.055);
+  --text: #f2f2f2;
+  --sub: #a3a3a3;
+  --line: rgba(255,255,255,.10);
+  --rule: rgba(255,255,255,.07);
+  --active: rgba(255,255,255,.10);
+  --fill: rgba(255,255,255,.06);
+  --accent: #c7c7c7;
+  --accent-grad: linear-gradient(135deg, #d5d5d5, #aaa);
+  --accent-glow: none;
+  --accent-soft: rgba(255,255,255,.12);
+  --primary: #c7c7c7;
+  --primary-ink: #151515;
+  --shadow-card: inset 0 1px 0 rgba(255,255,255,.035), 0 8px 18px -16px rgba(0,0,0,.7);
+  --shadow-raise: inset 0 1px 0 rgba(255,255,255,.05), 0 12px 24px -20px rgba(0,0,0,.8);
+  --shadow-float: 0 -5px 14px -12px rgba(0,0,0,.55), 0 8px 20px -16px rgba(0,0,0,.6);
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]):not([data-theme="dark"]) {
+    --bg: #101010;
+    --bg-grad: linear-gradient(180deg, #171717 0%, #101010 38%, #101010 100%);
+    --card: rgba(35,35,35,.82);
+    --card-grad: linear-gradient(180deg, rgba(42,42,42,.86), rgba(31,31,31,.82));
+    --card-line: rgba(255,255,255,.12);
+    --row-bg: rgba(255,255,255,.055);
+    --text: #f2f2f2;
+    --sub: #a3a3a3;
+    --line: rgba(255,255,255,.10);
+    --rule: rgba(255,255,255,.07);
+    --active: rgba(255,255,255,.10);
+    --fill: rgba(255,255,255,.06);
+    --accent: #c7c7c7;
+    --accent-grad: linear-gradient(135deg, #d5d5d5, #aaa);
+    --accent-glow: none;
+    --accent-soft: rgba(255,255,255,.12);
+    --primary: #c7c7c7;
+    --primary-ink: #151515;
+    --shadow-card: inset 0 1px 0 rgba(255,255,255,.035), 0 8px 18px -16px rgba(0,0,0,.7);
+    --shadow-raise: inset 0 1px 0 rgba(255,255,255,.05), 0 12px 24px -20px rgba(0,0,0,.8);
+    --shadow-float: 0 -5px 14px -12px rgba(0,0,0,.55), 0 8px 20px -16px rgba(0,0,0,.6);
+  }
+}
+#app.pg-run .tabbar,
+#app.pg-run .weekbar { background: var(--bg); }
+:root[data-theme="dark"] .meacts .ghost-btn,
+:root[data-theme="dark"] .helpbtn { color: var(--text); }
+@media (prefers-reduced-transparency: reduce) {
+  .weekbar, .tabbar, .sheet { -webkit-backdrop-filter: none; backdrop-filter: none; }
+  .weekbar, .tabbar { background: var(--card); }
+}
+:root[data-theme="dark"] .meacts .ghost-btn,
+:root[data-theme="dark"] .helpbtn { color: var(--text); }
+.settings-sheet { padding: 8px 0 20px; }
+.settings-sheet h2 { margin: 0 0 22px; font-size: 21px; color: var(--text); }
+.settings-label { margin: 0 0 10px; color: var(--sub); font-size: 13px; }
+.settings-segment {
+  display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 4px;
+  padding: 4px; border: 1px solid var(--line); border-radius: 13px;
+  background: var(--fill);
+}
+.settings-option {
+  min-height: 40px; padding: 0 4px; border: 0; border-radius: 10px;
+  background: transparent; color: var(--sub); font: inherit; font-size: 14px;
+}
+.settings-option.active {
+  background: var(--card); color: var(--text); font-weight: 600;
+  box-shadow: 0 1px 3px rgba(0,0,0,.10);
+}
+
+/* ---------------- 设置页（2026-11-25） ----------------
+   「我的 → 设置」从弹层改成独立页（用户原话：「做成一个新的页面」）。
+
+   🔴 2026-11-25 修「子标题像窗格、像没加载完」：
+   以前这里按「`.card` 自带 16px」的假设写，只补了标题外边距。但 `.card`
+   在 0.53 的 Liquid Glass 一轮之后**自己是没有内边距的**（全 App 都靠内部
+   元素自己给，见上面那条「卡片内边距」的注释）。结果 `h2` 的 2px 外边距
+   直接把「颜色」顶在卡片圆角上：标题被卡沿切掉一点、左侧贴着边框，
+   分段条又铺满整张卡 —— 读起来像一块没渲染完的窗格。
+   这里把内边距补给卡片本身，卡里的标题、说明、分段条、行都从同一条
+   16px 基线开始；行不再缩成「卡里的小玻璃」，它就是这一段的最后一行。 */
+#settingsBody { padding: 14px 16px 8px; }
+#settingsBody h2 { margin: 0 0 6px; }
+#settingsBody .sub { margin: 0 0 12px; }
+#settingsBody .settings-segment { margin: 0; }
+/* 第二段（课表）和上面那组颜色之间留一口气，不然两个标题像连在一起。 */
+#settingsBody h2.set-gap { margin-top: 20px; }
+/* 行跟着卡片的 16px 走：`.card > .row` 那套 8px 外边距 + 玻璃底在这里会
+   变成「第二层卡片」，和上面的标题对不齐。铺平，只当一段可点区域。 */
+#settingsBody > .row {
+  margin: 0; padding: 10px 0;
+  background: transparent; border-radius: 0;
+}
+/* 这一行是页尾唯一一行，行底那条分隔线会贴着卡片下沿，看着像多画了一条框。 */
+#settingsBody .row::after { display: none; }
+/* 页面顶部那团光会往下压 30px，透过半透明的卡片把标题染成淡蓝 ——
+   正是「窗格」感的一半来源。设置页只有两张面，收短一点就够。 */
+#page-settings > .pagehead::before { bottom: -6px; }
+
+/* 「我的 → 关于」那张卡现在是四整行（设置 / 版本 / 权限 / 关于本项目）。
+   🔴 原来那条 `.about .row::after { display: none }` 是对的：那时卡里只有
+      一行版本，没有「行与行」可言。四行叠起来就必须有分隔线，否则
+      「权限」和「关于本项目」看着像同一句话的两截。
+   🔴 只从第二行起补：第一行顶上那条线会贴到卡片边缘，像多画了一条框。 */
+.about > .row + .row::after { display: block; }
