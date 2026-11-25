@@ -84,8 +84,8 @@ const DAY_CN = ['一', '二', '三', '四', '五', '六', '日'];
    build_apk.py 里，两处各写一遍，迟早会出现「软件里显示 0.1.0、装上去是 0.1.1」
    这种没法解释的事。现在 build_apk.py 和 version.json 都从这里读。
    code 是整数，只增不减：比版本号字符串靠谱（"0.10.0" < "0.9.0" 是字符串比较的经典坑）。 */
-const APP_VERSION = '0.1.7';
-const APP_CODE = 198;
+const APP_VERSION = '0.1.8';
+const APP_CODE = 199;
 
 /* 功能说明书的地址（2026-11-15）。
  *
@@ -12130,8 +12130,12 @@ window.appBack = function () {
  *    没开的时候这一条会 404，fetchManifest 会落到 jsDelivr 那条，不算错。
  */
 // 正式版清单 = 所有人「检查更新」读的那份。
+// 2026-11-25：加了 fastly 这条 —— cdn.jsdelivr.net 在移动网/校园网会直接 TLS 失败
+// （实测 curl 报 000），fastly.jsdelivr.net 却 200，两个域名是同一份缓存，
+// 加进来等于白捡一条活路，成本只是一次没人走到的请求。
 const UPD_STABLE = [
   'https://dsy-star.github.io/NepuPass/version.json',
+  'https://fastly.jsdelivr.net/gh/dsy-star/NepuPass@gh-pages/version.json',
   'https://cdn.jsdelivr.net/gh/dsy-star/NepuPass@gh-pages/version.json',
   'https://raw.githubusercontent.com/dsy-star/NepuPass/gh-pages/version.json',
 ];

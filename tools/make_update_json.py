@@ -20,7 +20,8 @@ App 的「检查更新」（web/app.js 的 checkUpdate / fetchOne）读的是**�
 🔴 版本号不在这里写：一律从 web/app.js 的 APP_VERSION / APP_CODE 读。
    发版要改的还是那四个文件六个值（见 RELEASE-NOTES.md 开头）。
 🔴 清单里的 apk / apk_cn 必须是**同一个文件的两个入口**，只是线路不同：
-   Pages 是我们自己的域名，国内一般能连；jsDelivr 走国内 CDN，两个都不行才真没辙。
+   cn 那条走 ghproxy 反代 GitHub Release（实测校网能连、字节一致），
+   主站走我们自己的 Pages。两根都断才真没辙。
 """
 
 import argparse
@@ -40,8 +41,11 @@ DIST = ROOT / "android" / "dist"
 
 # 发布地址。仓库换了就改这两行（web/app.js 的 UPD_STABLE 也要跟着改）。
 PAGES_BASE = "https://dsy-star.github.io/NepuPass"
-CDN_BASE = "https://cdn.jsdelivr.net/gh/dsy-star/NepuPass@gh-pages"
 REPO_URL = "https://github.com/dsy-star/NepuPass"
+# 2026-11-25：jsDelivr 的 @gh-pages 分支地址对大文件会 301 到 raw.githubusercontent，
+# 那条域名在校园网/移动网基本连不上；实测 ghproxy 反代 Release 资产是通的，
+# 字节也一致（App 侧还会再核 SHA-256），所以「国内线路」改成它。
+MIRROR_PREFIX = "https://ghproxy.net/"
 
 
 def die(msg):
@@ -158,8 +162,8 @@ def main():
         "size": size,
         "sha256": sha,
         # 🔴 两个入口指向同一个文件。cn 那条排在前面（web/app.js 的 UPD_LINES
-        #    默认选 'cn'），因为校网里 jsDelivr 比 Pages 稳。
-        "apk_cn": "%s/%s" % (CDN_BASE, name),
+        #    默认选 'cn'），因为校网里反代 GitHub 比 Pages 稳。
+        "apk_cn": "%s%s/releases/download/v%s/%s" % (MIRROR_PREFIX, REPO_URL, version, name),
         "apk": "%s/%s" % (PAGES_BASE, name),
         "page": PAGES_BASE + "/",
         "notes": notes,

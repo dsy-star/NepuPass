@@ -43,7 +43,7 @@ public class MainActivity extends Activity {
      * build_apk.py 校验 DongYouTong/ 版本标识与网页版本一致。
      *    改版本号时这里必须同步更新。
      */
-    public static final String UA_TAG = " DongYouTong/0.1.7";
+    public static final String UA_TAG = " DongYouTong/0.1.8";
 
     private WebView web;
     private ThemeBridge themeBridge;
