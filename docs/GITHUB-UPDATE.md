@@ -20,7 +20,8 @@ gh-pages 分支 / version.json      ← .github/workflows/release.yml 每次发�
 三条清单地址（`web/app.js` 的 `UPD_STABLE`）:
 
 1. `https://dsy-star.github.io/NepuPass/version.json` —— GitHub Pages，排第一，更新最快
-2. `https://cdn.jsdelivr.net/gh/dsy-star/NepuPass@gh-pages/version.json` —— jsDelivr，国内稳
+2. `https://fastly.jsdelivr.net/gh/dsy-star/NepuPass@gh-pages/version.json` —— jsDelivr 的 fastly 域名
+3. `https://cdn.jsdelivr.net/gh/dsy-star/NepuPass@gh-pages/version.json` —— jsDelivr 默认域名（2026-11-25 实测在移动网会直接 TLS 失败，留着兜底）
 3. `https://raw.githubusercontent.com/dsy-star/NepuPass/gh-pages/version.json` —— 备用
 
 主源成功时备源根本不会发出去（见 `fetchManifest`），所以第 2、3 条只在 Pages 连不上时才用。
@@ -141,9 +142,12 @@ cat pub/version.json
 
 ## 坑
 
-- **别把安装包放 Release 当主下载**：`github.com` 在国内时通时断。
-  现在 `apk` 走 Pages、`apk_cn` 走 jsDelivr，Release 里那份只是留档。
-- **国内线路默认选中**：`UPD_LINES` 里 `cn` 排前面，所以校网里默认走 jsDelivr。
+- **别把安装包直接放 Release 当主下载**：`github.com` 在国内时通时断。
+  现在 `apk` 走 Pages、`apk_cn` 走 ghproxy 反代同一份 Release 资产（字节一致、App 侧再核 SHA-256），
+  Release 原件对外仍可下，只是不当默认线路。
+- **国内线路默认选中**：`UPD_LINES` 里 `cn` 排前面，所以校网里默认走 ghproxy 那条。
+  jsDelivr 的 `@gh-pages` 分支地址对大文件会 301 到 `raw.githubusercontent`，那条在国内基本不通，
+  所以它只用来兜底清单，不再当安装包线路。
 - **应用内下载已恢复**：从旧 worktree 找回 `UpdateDownloader.java` 和 `ApkProvider.java`，
   迁移到 `com.nepu.dongyoutong`，注册 `AndroidUpdate`，并把 `NativeApi.update` 接回
   `UpdApi`（此前此出口仍是返回 false 的占位对象）。APK 内直接下载到应用私有目录，
