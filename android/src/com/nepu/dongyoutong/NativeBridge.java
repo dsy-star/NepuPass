@@ -918,6 +918,42 @@ public class NativeBridge {
         }
     }
 
+    /**
+     * 把一个网页地址交给**系统浏览器**打开（2026-11-26 加）。
+     *
+     * 返回："ok" = 已经交给系统了；"fail: xxx" = 没交出去（没装浏览器之类）。
+     *
+     * 🔴 为什么非有这个桥不可（2026-11-26 修「去 star 点了没反应」）：
+     *    MainActivity 的 shouldOverrideUrlLoading 只放行 app.local，网页里
+     *    任何 window.open 都被拦下 —— 于是 app.js 的 openExternal 在 APK 里
+     *    两条路都断：NativeApi.openUrl 打到不存在的 Java 方法（抛异常 → false），
+     *    兜底的 window.open 被拦（→ null），最后只剩一句「打不开浏览器」。
+     *    求 Star 弹窗的「去 star」在真机上就是这么点不动的。
+     * 🔴 只认 http/https：进来的地址是**网页侧传的**，放开 scheme 等于把这个桥
+     *    变成「能拉起任意 intent」的后门（file: / javascript: / intent: 都不能走）。
+     *    这里**不套 allowedRequestUrl**：那个白名单是给 App 内 WebView 装
+     *    cookie 的办事系统用的（只认 chaoxing / ilife798），拿来卡外链会把
+     *    更新下载、应用商店这些正常跳转一起卡死。
+     */
+    @JavascriptInterface
+    public String openUrl(String url) {
+        String u = url == null ? "" : url.trim();
+        if (u.isEmpty()) return "fail: 没有地址";
+        if (u.length() > 2048) return "fail: 地址太长";
+        String lower = u.toLowerCase(java.util.Locale.ROOT);
+        if (!lower.startsWith("http://") && !lower.startsWith("https://")) {
+            return "fail: 只认网页地址";
+        }
+        try {
+            Intent it = new Intent(Intent.ACTION_VIEW, Uri.parse(u));
+            it.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+            web.getContext().startActivity(it);
+            return "ok";
+        } catch (Throwable t) {
+            return "fail: " + t;
+        }
+    }
+
     // ------------------------------------------------------------ 权限自检
 
     /**

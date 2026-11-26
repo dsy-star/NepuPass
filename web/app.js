@@ -91,8 +91,8 @@ const DAY_CN = ['一', '二', '三', '四', '五', '六', '日'];
    这种没法解释的事。现在 build_apk.py 从这里读，更新清单里的
    version/code 也由 tools/make_update_json.py 从这里读。
    code 是整数，只增不减：比版本号字符串靠谱（"0.10.0" < "0.9.0" 是字符串比较的经典坑）。 */
-const APP_VERSION = '0.1.9';
-const APP_CODE = 200;
+const APP_VERSION = '0.1.10';
+const APP_CODE = 201;
 
 /* 功能说明书的地址（2026-11-15）。
  *
@@ -11375,7 +11375,10 @@ if ($('btnUpdate')) $('btnUpdate').hidden = true;
  *
  * 🔴 2026-11-25：地址换成 dsy-star/NepuPass（用户：「把 Github 的链接替换为
  *    https://github.com/dsy-star/NepuPass」）。同一次还要求把关于页里那两颗
- *    跳转按钮删掉，所以这个常量现在**只剩「求 Star」弹窗一处在用**。
+ *    跳转按钮删掉 —— 那两颗是「参考的项目」的署名跳转，删的是那一块，不是
+ *    「关于页不许链 GitHub」。
+ * 🔴 2026-11-26：用户「在关于本项目的地方添加一个入口打开 Github」，
+ *    所以现在有**两处**在用：关于弹层的「在 GitHub 打开」和求 Star 弹窗的「去 star」。
  * 🔴 一律走 openExternal ⇒ 交系统浏览器。APK 里塞进 WebView 会让
  *    App 变成 GitHub 的页面，而且没法登录点赞。 */
 const ABOUT_GH = 'https://github.com/dsy-star/NepuPass';
@@ -11483,7 +11486,7 @@ function aboutContactHtml(c) {
  *
  *  🔴 0.44.0 调过顺序（用户 2026-11-03：自己的项目、网站放前面，
  *     「参考的项目」压成一行点开再看）。2026-11-25 那份清单整个删了，
- *     现在这一屏是：这是什么 → 联系方式 → 清除本机缓存。
+ *     现在这一屏是：这是什么（+ 在 GitHub 打开）→ 联系方式 → 清除本机缓存。
  */
 function aboutHtml(state) {
   const st = state || ABOUT_FALLBACK;
@@ -11495,6 +11498,13 @@ function aboutHtml(state) {
     + '<div class="ab-item">'
     + '<div class="ab-name">东油通</div>'
     + '<p>面向东北石油大学的本地校园助手。</p>'
+    // 2026-11-26（用户要求）：「在关于本项目的地方添加一个入口打开 Github」。
+    // 这是关于页**唯一**的 GitHub 入口 —— 2026-11-25 删掉的那两条是
+    // 「参考的项目」的署名跳转（别人的仓库），这里指向的是本项目自己的仓库。
+    // 🔴 复用 `.ab-go[data-url]`：aboutBind 已经绑好了它（openExternal + 复制链接兜底），
+    //    再写一颗自定义按钮就得多一处绑定，漏一处就是「点了没反应且不报错」。
+    + '<button class="ab-go" data-url="' + escAttr(ABOUT_GH) + '">在 GitHub 打开'
+    + '<svg viewBox="0 0 24 24"><path d="M9 6l6 6-6 6"/></svg></button>'
     + '</div>'
     + aboutContactHtml(st.contact)
     // 2026-11-25：这里原来有一行「参考的项目 N 个」，点开是二级页面。
@@ -11544,8 +11554,11 @@ function aboutBind() {
   const body = $('sheetBody');
   body.querySelectorAll('.ab-go[data-url]').forEach((b) => {
     b.addEventListener('click', () => {
-      if (!openExternal(b.getAttribute('data-url'))) {
-        toast('打不开浏览器，可以复制链接手动打开');
+      const u = b.getAttribute('data-url') || '';
+      // 打不开浏览器就把地址复制下来 —— 只说「可以复制链接」而不给链接，
+      // 用户还得自己抄一遍（和求 Star 弹窗同一个毛病，2026-11-26 一起修）。
+      if (!openExternal(u)) {
+        toast(wtCopy(u) ? '没能打开浏览器，链接已复制' : '没能打开浏览器，请手动访问 ' + u, 3200);
       }
     });
   });
@@ -11635,7 +11648,14 @@ function starAskOnce() {
   $('starNo').addEventListener('click', closeSheet);
   $('starYes').addEventListener('click', () => {
     closeSheet();
-    if (!openExternal(ABOUT_GH)) toast('打不开浏览器，可以复制链接手动打开');
+    // 🔴 2026-11-26：原来 fail 时只说一句「打不开浏览器，可以复制链接手动打开」——
+    //    可弹层已经关了，界面上**根本没有那个链接**可复制，等于让用户自己去背地址。
+    //    现在失败就把地址塞进剪贴板再说这句话（wtCopy 在 App 里可用）。
+    if (!openExternal(ABOUT_GH)) {
+      toast(wtCopy(ABOUT_GH)
+        ? '没能打开浏览器，GitHub 地址已复制'
+        : '没能打开浏览器，请手动访问 ' + ABOUT_GH, 3200);
+    }
   });
 }
 

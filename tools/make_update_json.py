@@ -153,6 +153,16 @@ def main():
     out.mkdir(parents=True, exist_ok=True)
 
     name = "dongyoutong-%s.apk" % version
+    # 🔴 先清掉上一次留下的旧包（2026-11-26）。这里不清理的话，反复在同一个
+    #    --out 目录跑就会攒一堆历史 APK —— 工作流是 `git add -A` 整个推上去的，
+    #    等于把每一版的安装包都留在下载站上（几个版本就是几 MB，而且旧包还能被
+    #    直接点到）。只删 `dongyoutong-*.apk`，别碰目录里别的东西。
+    for old in out.glob("dongyoutong-*.apk"):
+        if old.name != name:
+            try:
+                old.unlink()
+            except OSError:
+                pass
     shutil.copyfile(apk, out / name)
 
     manifest = {

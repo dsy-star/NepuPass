@@ -7158,14 +7158,19 @@
       }
     },
     /**
-     * 用系统浏览器打开链接。目前只给「检查更新 → 立即更新」下载 APK 用。
+     * 用系统浏览器打开链接。更新下载、GitHub、应用商店都走它。
      *
-     * 🔴 WebView 默认没有 DownloadListener，点 .apk 链接什么都不会发生，
-     *    所以必须走系统浏览器（Java 那边的 openUrl）。返回 false = 没交出去，
-     *    界面要给出「复制下载地址」的兜底，不能假装打开了。
+     * 🔴 WebView 默认没有 DownloadListener，点 .apk 链接什么都不会发生；
+     *    而且 MainActivity 只放行 app.local，window.open 一律被拦 ——
+     *    所以「打开外链」这件事在 APK 里**只有这一个出口**。
+     * 🔴 返回 false = 没交出去，界面要给出「复制链接」的兜底，不能假装打开了。
+     *    **必须看 Java 的返回值**：0.1.9 及更早的壳里根本没有这个方法，
+     *    光靠「没抛异常」判断成败，会走进一个点了永远没反应的岔路
+     *    （求 Star 弹窗的「去 star」就是这么坏的，2026-11-26 修）。
      */
     openUrl: function (url) {
-      try { Android.openUrl(String(url || '')); return true; }
+      if (!(window.Android && typeof window.Android.openUrl === 'function')) return false;
+      try { return String(window.Android.openUrl(String(url || '')) || '') === 'ok'; }
       catch (e) { return false; }
     },
 
