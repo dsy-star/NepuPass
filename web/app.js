@@ -91,8 +91,8 @@ const DAY_CN = ['一', '二', '三', '四', '五', '六', '日'];
    这种没法解释的事。现在 build_apk.py 从这里读，更新清单里的
    version/code 也由 tools/make_update_json.py 从这里读。
    code 是整数，只增不减：比版本号字符串靠谱（"0.10.0" < "0.9.0" 是字符串比较的经典坑）。 */
-const APP_VERSION = '0.1.8';
-const APP_CODE = 199;
+const APP_VERSION = '0.1.9';
+const APP_CODE = 200;
 
 /* 功能说明书的地址（2026-11-15）。
  *
