@@ -433,6 +433,36 @@ public class WebActivity extends Activity {
     private View moreBtn;
     /** 左栏当前是不是被收起来了（决定按钮写「菜单」还是「收栏」）。 */
     private boolean sideHidden = false;
+    /** 这个窗口开的是不是一道**问卷调查**（2026-11-26 加，目前只有问题反馈的
+     *  Tally 表单）。
+     *
+     *  ================================================================
+     *  为什么需要单独认一下
+     *  ================================================================
+     *  这个窗口是为「办事系统」写的，里面全是替坏页面擦屁股的动作：
+     *  `SIDE_JS` 收左栏、`FIT_JS` 整页缩、电脑版 UA + 宽排版。这些对教务、
+     *  请假那种 1200px 桌面布局是对的，对 Tally 就是**帮倒忙**：
+     *    · Tally 是单栏响应式，`FIT_JS` 的「横向溢出」判据本来就不会触发
+     *      （不触发是对的，但那是碰巧，不是设计）；
+     *    · 首屏那个欢迎标题会断在「欢迎填写 / 反馈问卷」这种位置 ——
+     *      因为它按桌面宽度排版。
+     *
+     *  所以对这类站点：**给手机版 UA、居中一条窄栏、不跑两个擦屁股脚本**。
+     *  表单要的是「跟手机上打开微信里的问卷一样」。
+     *
+     *  🔴 别拿它去判「是不是公开页」—— 判公开页看的是 `warn`
+     *     （公告正文、百科那批），两者条件不同，混用会让公告也变窄。 */
+    private static boolean isFormSite(String url) {
+        try {
+            String host = Uri.parse(url).getHost();
+            if (host == null) return false;
+            host = host.toLowerCase(java.util.Locale.ROOT);
+            return host.equals("tally.so") || host.endsWith(".tally.so");
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
     /** 「收左栏」重试的代数：每次 `onPageFinished` +1。
      *
      *  🔴 为什么需要它：办事系统（学生信息管理、请假、打印中心…）是 **SPA**，
@@ -495,6 +525,9 @@ public class WebActivity extends Activity {
             return;
         }
 
+        // 入口地址的 final 副本：WebViewClient 那几个匿名内部类要用它判
+        // 「这是不是问卷页」（见 isFormSite）。
+        final String entryUrl = url;
         boolean dark = isDark();
         int cBg = Color.parseColor(dark ? "#0f1013" : "#f4f5f7");
         int cCard = Color.parseColor(dark ? "#191b20" : "#ffffff");
@@ -634,7 +667,11 @@ public class WebActivity extends Activity {
         //     学习通和公开站（公告正文、百科，`warn == false`）给**手机版**
         //     —— 它们本来就是给手机做的，硬上桌面版只会字更小。
         int saved = getSharedPreferences(PREF, MODE_PRIVATE).getInt(PREF_MODE, -1);
-        applyMode(saved == 1 || (saved == -1 && warn && !isChaoxing(url)), false);
+        // 2026-11-26：问卷类站点（问题反馈的 Tally 表单）一律手机版。
+        // 🔴 不能只靠上面那个 `warn`：生态里凡是 warn=true 的地址都会吃电脑版
+        //    UA，而反馈表是**公开页**（进去时 JS 传 warn=false），可它同样不想
+        //    被当成办事系统排版。两件事分开判，理由见 isFormSite。
+        applyMode(isFormSite(url) || saved == 1 || (saved == -1 && warn && !isChaoxing(url)), false);
 
         // 🔴 顺序不能反：先开、再灌。反了的话 setCookie 静默丢弃，
         //    表现是「网页照样弹登录页」，看起来像身份证过期。
@@ -675,7 +712,21 @@ public class WebActivity extends Activity {
                 // 所以 ② 挂在 ① 的回调里，不在这一行直接调（见 applySide）。
                 // ⚠️ 放在 onPageFinished 而不是 onPageStarted：那时候还没有布局，
                 //    量不到 offsetWidth / scrollWidth，会静默判成「不用管」。
-                applySide(v);
+                //
+                // 🔴 2026-11-26：问卷类站点（isFormSite）两个都不跑。它们不是
+                //    「坏页面」，是正常响应式的单栏 —— 收左栏是空转，整页缩
+                //    更是可能把一张本来正好铺满的表单压小。空转也要遍历 DOM
+                //    （SIDE_JS 会等元素数稳定、扫全部元素），白白拖慢滚动。
+                // 🔴 用 entryUrl（onCreate 里那个 final 副本），不是 `url`：
+                //    这里是匿名内部类，`url` 是 onCreate 的局部变量、早就出了作用域。
+                boolean form = isFormSite(u) || isFormSite(entryUrl);
+                if (!form) {
+                    applySide(v);
+                } else {
+                    // 问卷页首次进来直接给焦点到正文，省一次「点了没反应」的怀疑
+                    // —— 表单要的是立刻能打字，不是先滚到顶看清标题。
+                    try { v.requestFocus(); } catch (Throwable ignored) { }
+                }
                 // 网页自己 Set-Cookie 拿到的东西（比如 CAS 换出来的会话）要落盘，
                 // 不然关掉窗口就丢了。
                 try { CookieManager.getInstance().flush(); } catch (Throwable ignored) { }

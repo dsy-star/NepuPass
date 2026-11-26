@@ -91,8 +91,8 @@ const DAY_CN = ['一', '二', '三', '四', '五', '六', '日'];
    这种没法解释的事。现在 build_apk.py 从这里读，更新清单里的
    version/code 也由 tools/make_update_json.py 从这里读。
    code 是整数，只增不减：比版本号字符串靠谱（"0.10.0" < "0.9.0" 是字符串比较的经典坑）。 */
-const APP_VERSION = '0.1.10';
-const APP_CODE = 201;
+const APP_VERSION = '0.1.11';
+const APP_CODE = 202;
 
 /* 功能说明书的地址（2026-11-15）。
  *
@@ -4555,6 +4555,116 @@ function openHelpSheet() {
 $('meHelp').addEventListener('click', openHelpSheet);
 $('rmBack').addEventListener('click', () => switchTab('schedule'));
 
+/* ---------------- 问题反馈（2026-11-26） ----------------
+ *
+ * 用户：「我已经做好了表单链接 https://tally.so/r/yXYNzx，国内可以访问，
+ * 你在我的页添加一个问题反馈按钮，打开后使用webview打开这个页面」
+ *
+ * 分工：
+ *   · 表单本身在 Tally（第三方），这边只负责「把窗口开出来」。
+ *   · 打开走 `openApp`（App 内 WebView），**不是** `openExternal`
+ *     （系统浏览器）。用户要的就是「在 App 里填完就回来」。
+ *
+ * 🔴 为什么不在页面里塞 iframe：CSP 写着 `frame-src 'none'`，而且那个 iframe
+ *    里的表单提交会被 `form-action 'none'` 拦掉 —— 一半坏、一半好的东西
+ *    比全坏更难查。原生 WebView 窗口不受网页 CSP 管。
+ *
+ * 🔴 为什么链接要拼参数：用户选了「用隐藏字段带上版本号/机型」。
+ *    Tally 的 hidden fields 靠 URL 参数填（官方文档 /help/hidden-fields），
+ *    提交后在 Submissions 里看得到。版本号是排第一的排查信息 ——
+ *    「哪个版」比用户描述的十个字更准。
+ *
+ * 🔴 拼参数失败的代价必须是**零**：任何一步抛异常都要退回到裸链接，
+ *    不能出现「点了没反应」。所以整段都包在 try 里，最后兜底 BASE。
+ */
+const FEEDBACK_BASE = 'https://tally.so/r/yXYNzx';
+
+/** 表单里那两个隐藏字段的名字。
+ *  ⚠️ 改这里之前先看 Tally 表单：隐藏字段的**标识**必须和这里一致，
+ *     对不上时 Tally 会**静默忽略**这个参数（不报错，Submissions 里那一列空着）。 */
+const FEEDBACK_FIELD_VERSION = 'version';
+const FEEDBACK_FIELD_DEVICE = 'device';
+
+/** 拼出真正要打开的反馈地址。
+ *
+ *  两个参数都做「异常就算了」处理：拿不到就少带一个，而不是整条链接作废。 */
+function feedbackUrl() {
+  let v = '';
+  try {
+    v = 'v' + APP_VERSION + (APP_CHANNEL === 'beta'
+      ? ' beta' + (APP_BETA_SEQ > 0 ? APP_BETA_SEQ : '') : '');
+  } catch (e) { /* 版本号读不出来就别带 */ }
+  let dev = '';
+  try {
+    // 机型 + 系统版本。UA 里那一段长得像
+    //   `(Linux; Android 13; PJZ110 Build/TP1A.220905.001; wv)`  ← Chrome
+    //   `(Linux; U; Android 13; zh-cn; PJZ110 Build/...)`        ← 国产 WebView
+    // 所以不能「取分号后的第一段」—— 那样会拿到 `U` 或者空串。
+    // 做法：先拿到 Android 段，**从`Android x` 往后按分号切**，跳过前两段
+    // （`Linux` / `Android 13`），再在第一段里砍掉 ` Build/...` 和 `; wv`。
+    const ua = String(navigator.userAgent || '');
+    const os = /Android\s+([0-9.]+)/.exec(ua);
+    let model = '';
+    const seg = /\(([^)]*Android[^)]*)\)/.exec(ua);
+    if (seg && seg[1]) {
+      const parts = seg[1].split(';').map((x) => x.trim());
+      const i = parts.findIndex((x) => /^Android\b/.test(x));
+      if (i >= 0 && parts[i + 1]) {
+        // 从 `Android x` 往后找**第一段不是语言标签**的：`U` / `zh-cn` / `en-us`
+        // 那几个是「语言」，不是机型。找不到就算了 —— 宁可少带一个字段，
+        // 也别把 `zh-cn` 当成手机型号写进反馈。
+        for (let k = i + 1; k < parts.length; k++) {
+          const cand = parts[k];
+          if (!cand) continue;
+          if (/^(u|[a-z]{2,3}([-_][a-z]{2,4})?)$/i.test(cand)) continue;
+          model = cand.split(' Build/')[0].trim();
+          break;
+        }
+      }
+    }
+    dev = model + (os && os[1] ? (model ? ' / ' : '') + 'Android ' + os[1] : '');
+  } catch (e) { /* 同上 */ }
+  const qs = [];
+  if (v) qs.push(FEEDBACK_FIELD_VERSION + '=' + encodeURIComponent(v));
+  if (dev) qs.push(FEEDBACK_FIELD_DEVICE + '=' + encodeURIComponent(dev));
+  return qs.length ? FEEDBACK_BASE + '?' + qs.join('&') : FEEDBACK_BASE;
+}
+
+/** 「我的」标题行那颗「反馈」药丸：只在能开 App 内窗口的壳里出现。
+ *
+ *  网页版没有 WebView，点开只能跳新标签页 —— 而且新标签里用户填完，
+ *  跟这个 App 一点关系都没有。那不如不出现（和 `renderPermEntry` 同一条规矩）。 */
+function renderFeedbackEntry() {
+  const b = $('meFeedback');
+  if (!b) return;
+  b.hidden = !(NATIVE && window.NativeApi && typeof NativeApi.openWeb === 'function');
+}
+
+function openFeedback() {
+  if (!(window.NativeApi && typeof NativeApi.openWeb === 'function')) {
+    // 网页版兜底：至少让人能填上。新标签页里没有 App 的 WebView，
+    // 但表单本身是同一张，填完一样到得了。
+    if (!openExternal(FEEDBACK_BASE)) {
+      toast(wtCopy(FEEDBACK_BASE) ? '打不开，反馈地址已复制'
+        : '打不开，反馈地址是 ' + FEEDBACK_BASE, 3200);
+    }
+    return;
+  }
+  const url = feedbackUrl();
+  let why = 'none';
+  try { why = String(NativeApi.openWeb(url, '问题反馈', false) || ''); }
+  catch (e) { why = 'fail: ' + ((e && e.message) || e); }
+  if (why === '') return;              // 窗口开出来了，收工
+  // 起不来（老壳 / tally.so 不在白名单）⇒ 退回系统浏览器。
+  // 🔴 退回时用 **BASE**，不带参数：那串参数是给 Tally 读的，浏览器里
+  //    也能读、但用户可能复制这串地址到处发，带上手机机型没必要。
+  if (!openExternal(FEEDBACK_BASE)) {
+    toast(wtCopy(FEEDBACK_BASE) ? '打不开，反馈地址已复制'
+      : '打不开，反馈地址是 ' + FEEDBACK_BASE, 3200);
+  }
+}
+
+$('meFeedback').addEventListener('click', openFeedback);
 // ------------------------------------------------------------------ 成绩
 
 let gradeTerm = 'all';
@@ -6636,6 +6746,10 @@ function renderMe() {
   autoRepaint();
   // 「权限」那颗半按钮：只在读得到状态的壳里出现（网页版没有系统权限这回事）。
   renderPermEntry();
+  // 「反馈」那颗药丸（2026-11-26）：和「权限」同一条规矩 —— 只在开得出
+  // App 内窗口的壳里出现。它挂在标题行，不进 renderPermEntry 那个函数，
+  // 因为两者出现条件不同（权限要读得到状态，反馈只要能开窗口）。
+  renderFeedbackEntry();
   // 「设置」那行右边的灰字（2026-11-25）：写着当前选的颜色，
   // 这样不用点进去也知道现在是什么模式。真值只在 THEME_LABELS 里有一份。
   $('meTheme').textContent = THEME_LABELS[CFG.theme] || '跟随系统';

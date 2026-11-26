@@ -5282,6 +5282,18 @@ body::after {
 .helpbtn span { font-size: 13px; font-weight: 600; letter-spacing: -.1px; }
 .helpbtn:active { background: var(--line); color: var(--text); }
 
+/* 「我的」标题行现在是三颗药丸（说明 / 后台 / 反馈，2026-11-26 加第三颗）。
+   360 屏上量一遍：标题「我的」+ 3 颗 + 2 个 8px 缝 ≈ 372，**差一点挤掉标题的最后
+   一个字**（.helpbtn 的注释里写着同样的坑，那次是四字标签）。
+   所以窄屏时在这条轴上收一点点：内边距 10→8、图标 15→14、缝 8→6。
+   🔴 只动 `.meacts` 里的，不动 `.helpbtn` 本体 —— 别处没有第二排药丸，
+      但也别让一条全局规则为了这一处变窄。 */
+@media (max-width: 380px) {
+  .meacts { gap: 6px; }
+  .meacts .helpbtn, .meacts .autobtn { padding: 0 9px 0 8px; }
+  .meacts .helpbtn svg, .meacts .autobtn svg { width: 14px; height: 14px; }
+}
+
 /* ---- 后台运行记录（2026-11-14）----
    一行一条：时间 / 哪一类 / 结果。收起时只占一行按钮 —— 一夜能跑十几轮，
    全摊开会把「允许后台运行」那颗主按钮顶到屏幕外。 */

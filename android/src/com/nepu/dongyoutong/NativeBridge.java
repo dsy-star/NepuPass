@@ -58,6 +58,38 @@ public class NativeBridge {
             return false;
         }
     }
+
+    /**
+     * 「这个地址能不能开进 App 内的窗口」—— `openWebEx` 用它。
+     *
+     * ================================================================
+     * 为什么不是直接拿 allowedRequestUrl 用（2026-11-26 拆开）
+     * ================================================================
+     * `allowedRequestUrl` 是**请求闸**：`/api/cx/*` 那些带着学号密码出去的请求
+     * 只准去超星和 ilife798。那个名单不能动 —— 它是凭据外流的最后一道门。
+     *
+     * 但「开窗口」是另一件事：它只决定**用户自己的手机屏幕上显示哪个网页**，
+     * 一个字节的凭据都不经过它。两件事共用一个函数，结果就是「想开个 Tally
+     * 表单」必须顺带把凭据闸也放开 —— 谁都不敢那么改，于是只能不开。
+     *
+     * 所以拆成两条：这里只负责「能开窗吗」，请求闸原样不动。
+     *
+     * 🔴 新增站点要写清楚理由和日期，别攒成一串没人敢动的名单。
+     */
+    private static boolean allowedWindowUrl(String value) {
+        if (allowedRequestUrl(value)) return true;
+        try {
+            URL url = new URL(value);
+            String host = url.getHost().toLowerCase(java.util.Locale.ROOT);
+            if (!"https".equalsIgnoreCase(url.getProtocol())) return false;
+            if (url.getPort() != -1 && url.getPort() != 443) return false;
+            // 2026-11-26：问题反馈表单（用户自己做在 Tally 上，国内可访问）。
+            //   它是静态表单页，不带任何本机凭据；提交完就没事了。
+            return host.equals("tally.so") || host.endsWith(".tally.so");
+        } catch (Exception ignored) {
+            return false;
+        }
+    }
     private static final String UA =
             "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 " +
             "(KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36";
@@ -730,7 +762,7 @@ public class NativeBridge {
     public String openWebEx(String url, String title, boolean warn) {
         if (url == null) return "fail: 没有地址";
         String u = url.trim();
-        if (!allowedRequestUrl(u)) return "fail: 东油适配中";
+        if (!allowedWindowUrl(u)) return "fail: 东油适配中";
         try {
             Intent it = new Intent(web.getContext(), WebActivity.class);
             it.putExtra(WebActivity.EXTRA_URL, u);
