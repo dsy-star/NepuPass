@@ -1,6 +1,6 @@
 # 用 GitHub 发版 / 检查更新
 
-2026-11-24 起，东油通的「检查更新」接的是**这个 GitHub 仓库**，不再连 hobson.cc 那套。
+东油通的「检查更新」接的是**这个 GitHub 仓库**，不连任何自建服务。
 本文只写怎么用、怎么配、坑在哪；代码在 `web/app.js` 的更新那一段和
 `.github/workflows/release.yml`。
 
@@ -9,7 +9,7 @@
 ```
 我的 → 版本 → [检查更新]
       ↓  web/app.js  checkUpdate(true)
-      ↓  UPD_STABLE 里的三条地址（同一份文件，三条线路）
+      ↓  UPD_STABLE 里的四条地址（同一份文件，四条线路）
 gh-pages 分支 / version.json      ← .github/workflows/release.yml 每次发版重写
       ↓  比 code（整数，比版本号字符串可靠）
 比当前大 → 弹层「发现新版本」+ 更新内容
@@ -17,46 +17,35 @@ gh-pages 分支 / version.json      ← .github/workflows/release.yml 每次发�
 安装包地址（version.json 里的 apk / apk_cn）
 ```
 
-三条清单地址（`web/app.js` 的 `UPD_STABLE`）:
+四条清单地址（`web/app.js` 的 `UPD_STABLE`）:
 
 1. `https://dsy-star.github.io/NepuPass/version.json` —— GitHub Pages，排第一，更新最快
 2. `https://fastly.jsdelivr.net/gh/dsy-star/NepuPass@gh-pages/version.json` —— jsDelivr 的 fastly 域名
 3. `https://cdn.jsdelivr.net/gh/dsy-star/NepuPass@gh-pages/version.json` —— jsDelivr 默认域名（2026-11-25 实测在移动网会直接 TLS 失败，留着兜底）
-3. `https://raw.githubusercontent.com/dsy-star/NepuPass/gh-pages/version.json` —— 备用
+4. `https://raw.githubusercontent.com/dsy-star/NepuPass/gh-pages/version.json` —— 备用
 
-主源成功时备源根本不会发出去（见 `fetchManifest`），所以第 2、3 条只在 Pages 连不上时才用。
-**三条必须是同一个分支上的同一份文件**，否则备源可能拿到上一次发版的清单，被判成
+主源成功时备源根本不会发出去（见 `fetchManifest`），所以第 2～4 条只在 Pages 连不上时才用。
+**四条必须是同一个分支上的同一份文件**，否则备源可能拿到上一次发版的清单，被判成
 「已是最新」——那等于把更新吃掉，而且不报错。
 
-## 第 0 步：先把代码推到 GitHub（这一步最容易漏）
-
-2026-11-24 实测 `dsy-star/NepuPass`：`main` 上只有 59 个文件 —— `README.md`、`LICENSE`、
-`android/`，**没有 `web/`**。而且它是一条**独立的历史**（`95fc587 Initial commit` 只加了
-LICENSE，`76de96c` 加了 README + android），跟本地这条一百多个提交的历史没有共同祖先。
-
-后果很直接：`android/build_apk.py` 第一步就读 `web/app.js` 对版本号，CI 拿不到这个文件，
-**打不出包**；就算绕过去，打出来的 APK 里也没有界面。
-
-所以顺序是：把本地这条历史推上去 → 再打第一个 tag。
+## 第 0 步：先自查这棵树能不能出包
 
 ```bash
-py tools/check_release_tree.py        # 先自查：文件在不在、进没进 git
-
-git fetch github                      # 远端那条历史抓到本地（之后就算强推也不会丢）
-git tag gh-origin-backup github/main  # 留个记号，想回看随时 git show
-git push --force github HEAD:main     # 历史不相交，普通 push 会被拒，只能强推
+py tools/check_release_tree.py        # 文件在不在、进没进 git
 ```
 
-强推覆盖的是远端那 2 个提交（只有 LICENSE + 56 行 README + android/，
-本地都有且更新），覆盖不会丢掉工作区里的东西；不放心就先 `git tag` 留底。
-
-推之前那个自查脚本要跑一遍，它会抓两类问题：
+它会抓两类问题：
 
 - **文件根本不在** —— CI 在这棵树上一定失败；
 - **文件在磁盘上、但没进 git** —— 最常见的一种：`web/nepu.js` 一旦漏掉，
   `web/index.html` 引用的脚本在 APK 里就是 404，页面看着能开、功能却是残的。
 
-`_diag/` 里是本地调试脚本和截图，别一起提交。
+本地调试用的目录（`_diag/`、`work/`、`design/`）和构建产物（`android/build/`、
+`android/dist/`、`pub/`）都在 `.gitignore` 里，别强行加进去。
+
+仓库的 `main` 只有东油通这一套代码，历史从东油通第一版开始，与上一代软件无关。
+发版前推到 `github` 远端即可，普通 `git push github main` 就够，不需要强推，也不需要
+先把别的历史搬过来。
 
 ## 一次性配置（三道）
 
@@ -101,16 +90,17 @@ base64 -w 0 android/.local/dongyoutong.keystore
 
 ## 发一版
 
-1. 改版本号 —— **四个文件六个值**，漏一个打包脚本直接拒绝（见 `RELEASE-NOTES.md` 开头）：
+1. 改版本号 —— **三个文件六个值**，漏一个打包脚本直接拒绝（见 `RELEASE-NOTES.md` 开头）：
    - `web/app.js`：`APP_VERSION` / `APP_CODE`（`code` 只增不减）
    - `android/build_apk.py`：`VERSION_NAME` / `VERSION_CODE`
    - `android/src/com/nepu/dongyoutong/MainActivity.java`：`UA_TAG` 后缀
-   - `RELEASE-NOTES.md`：加一节 `## <版本>`，更新内容写成 `- ` 开头的行
+   - 另外在 `RELEASE-NOTES.md` 加一节 `## <版本>`，更新内容写成 `- ` 开头的行
+     （这一条不进构建校验，但不写就没东西显示在更新弹层里）
 2. 提交，然后打 tag 推上去：
 
 ```bash
-git add -A && git commit -m "0.1.1"
-git tag v0.1.1 && git push origin HEAD --tags
+git add -A && git commit -m "0.1.9"
+git tag v0.1.9 && git push github HEAD --tags
 ```
 
 3. 工作流自动：出包 → 生成 `version.json` → 推 gh-pages → 建 Release。
@@ -137,8 +127,8 @@ cat pub/version.json
 - **自动检查已启用**：启动 5 秒后运行 `updAutoCheck()`，默认每天检查一次；遵守
   `CFG.updOn/updFreq/updLast`，成功获取清单才记录检查时间。自动失败保持安静，
   点过「以后再说」的版本不再自动弹；手动检查仍可查看。这里只在启动时检查，不是后台常驻任务。
-- **仓库根目录的 `version.json`** 只是本地副本（每次 `tools/make_update_json.py`
-  出来的同一份），真正被 App 读的是 gh-pages 分支上那份。改发版流程时别只改根目录这个。
+- **仓库里没有 `version.json`**：清单只在 `tools/make_update_json.py` 生成时落到 `pub/`，
+  再由工作流推到 gh-pages。别在仓库根目录再放一份「手改版」，两份会各说各话。
 
 ## 坑
 

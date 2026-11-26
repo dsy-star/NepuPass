@@ -22,27 +22,5 @@ __pycache__/
 .DS_Store
 Thumbs.db
 
-# 测试版清单（2026-11-06）：`build_apk.py --beta` 写的那个。
-# 它是「这一版测试包有多大、哈希多少」的留档，只在打测试版的那台机器上有意义。
-# 🔴 千万别把它提交上去 —— `check_beta.py` 有一条判据是「仓库里不该有
-#    residue 的 beta.json」，有的话说明上一次测试版没收尾（版本号和渠道还停在
-#    beta 状态），而那种状态下一旦误打正式包，就会被打包脚本拦下来。
+# 上一代产品的测试版清单（`beta.json`）别再提交，留着这条防止误加。
 beta.json
-
-# 鸿蒙（2026-11-14）：下面这些全是本机的，进仓库只会给别人添乱。
-# local.properties 里是**这台机器**的 SDK 绝对路径；.sign 里是从 SDK 里
-# 导出来的证书链和签好的 profile —— 都不是我们的东西，也不该由我们保管。
-harmony/local.properties
-harmony/.sign/
-harmony/entry/build/
-harmony/entry/.preview/
-harmony/build/
-harmony/.hvigor/
-harmony/.cxx/
-harmony/oh_modules/
-harmony/node_modules/
-# 🔴 网页资源是**拷**进来的（`build_hap.py --copy`），不进仓库。
-#    进来的话仓库里就有第二份 app.js —— 改了真的那份、忘了这份，
-#    打出来的包还是旧的，而「我的」里版本号看着是新的。Android 侧同理，
-#    它的副本在 android/build/ 底下，本来就被忽略。
-harmony/entry/src/main/resources/rawfile/web/

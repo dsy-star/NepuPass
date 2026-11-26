@@ -1,6 +1,12 @@
-/* 郑航课表 · 手机端逻辑
+/* 东油通 · 手机端逻辑
    纯原生 JS，无框架、无构建步骤。
-   数据来源：同源的本地服务（bridge.py），由它去登录教务系统。 */
+
+   数据来源有两条，都在本机：
+   - Android：`window.AndroidNepu`（NepuBridge.java）拿教务的课表/成绩/考试/公告，
+     再交给 `web/nepu.js` 归一成界面用的结构；
+   - 网页版：同源的本地服务，由它去登录教务系统。
+
+   🔴 这个文件里不要再加任何「运营后台」相关的代码（老的 stats/数据台已整个删除）。 */
 
 'use strict';
 
@@ -82,7 +88,8 @@ const DAY_CN = ['一', '二', '三', '四', '五', '六', '日'];
 /* 🔴 版本号只在这里写一次。
    以前「我的 → 版本」那行是 HTML 里写死的 0.1.0，安卓的 versionName 又写在
    build_apk.py 里，两处各写一遍，迟早会出现「软件里显示 0.1.0、装上去是 0.1.1」
-   这种没法解释的事。现在 build_apk.py 和 version.json 都从这里读。
+   这种没法解释的事。现在 build_apk.py 从这里读，更新清单里的
+   version/code 也由 tools/make_update_json.py 从这里读。
    code 是整数，只增不减：比版本号字符串靠谱（"0.10.0" < "0.9.0" 是字符串比较的经典坑）。 */
 const APP_VERSION = '0.1.8';
 const APP_CODE = 199;
@@ -1494,7 +1501,7 @@ function confirmDelMyCourse(code) {
 }
 
 /* ---------------- 隐藏课程 ----------------
- * 为什么需要：教务系统的数据里会有「你实际上不上的课」——实测郑航 2026 秋季
+ * 为什么需要：教务系统的数据里会有「你实际上不上的课」——实测旧版 2026 秋季
  * 就有一门「高等数学Ⅰ(二)」，四个时段**全部**和别的课撞车，而学生实际课表里没有它。
  * 这种脏数据没法靠规则自动判（撞课也可能是真的调课），只能让用户自己点一下藏起来。
  * 键用 course.code：同一门课的多个时段/多个教室共用一个 code，一次隐藏全干净。
@@ -1653,13 +1660,13 @@ function visibleDays() {
    中间那格原来是「公告」，用户 2026-10-30 要求换成 WIKI —— 公告是低频内容，
    并进了「功能」页；攻略是新生天天翻的。 */
 const TABS = ['schedule', 'exams', 'wiki', 'campus', 'me'];
-const SUBPAGES = ['calendar', 'rooms', 'accounts', 'notice', 'stats', 'services', 'perm', 'settings'];
+const SUBPAGES = ['calendar', 'rooms', 'accounts', 'notice', 'services', 'perm', 'settings'];
 /* 子页是从哪个 tab 进去的 —— 返回时回那里，底部也要高亮那一个。
    原来只有校历/空教室两个、都挂在课表下，所以写死成 'schedule'；
    0.14.0 的「账号管理」是从「我的」进去的，再写死就会高亮错 tab。
    0.50.0 的「校园服务」同理：它挂在「功能」下，是那一页的低频区块。 */
 const SUB_PARENT = { calendar: 'schedule', rooms: 'schedule',
-                      accounts: 'me', notice: 'wiki', stats: 'me',
+                      accounts: 'me', notice: 'wiki',
                       services: 'wiki',
                       // 2026-11-15：权限自检挂在「我的」。它是一次「看看哪儿没配对」
                       // 的检查，一学期点不了两次，不该占底部一个位置。
@@ -1951,21 +1958,7 @@ function pgMotion(prev, name) {
   pgRunPair(top, bot, kTop, kBot, PG_MS, name);
 }
 
-/** 数据台（控制台）在不在。
- *
- *  2026-11-13 起它整个在 `web/stats.js` 里，**正式版的包里没有这个文件**
- *  （build_apk.py 打正式版时不复制它，也不复制 index.html 里那一段和 stats.css）。
- *  所以这里不能直接读那边的名字 —— 正式版里那个标识符根本不存在，
- *  一读就是 ReferenceError，整份 app.js 在那一行停住（白屏）。
- *  `typeof` 对不存在的名字是安全的，它只会回 'undefined'。 */
-function statsReady() {
-  return typeof statsLoad === 'function' && statsOn();
-}
-
 function switchTab(name) {
-  // 🔴 数据台只有测试版：正式版里被深链指着（?p=stats）也不许开，
-  //    否则会看到一张永远「正在取数…」的空页。
-  if (name === 'stats' && !statsReady()) return;
   appLog('切到 ' + name);
   // 换页时关掉气泡：它是 fixed 定位的，页都换了它还悬在那儿，
   // 指着的却是上一个页面的行。
@@ -1988,9 +1981,6 @@ function switchTab(name) {
     cxLiveRun();
   }
   if (name === 'me') renderMe();
-  // 数据台（只有测试版）：进来就取一次，一分钟内重复进来不再打。
-  // 上面那道 statsReady() 已经在这个分支之前 return 过了，这里只管调用。
-  if (name === 'stats') statsLoad(false);
   if (name === 'accounts') {
     renderAccounts(); wtStateRefresh();
   }
@@ -4470,10 +4460,6 @@ document.addEventListener('visibilitychange', () => {
    系统返回键三处会互相打架。 */
 $('wkRooms').addEventListener('click', () => switchTab('rooms'));
 $('calBack').addEventListener('click', () => switchTab('schedule'));
-// 数据台（0.49.0 v4）：入口挂在「我的」标题右边，只有测试版露出。
-// 2026-11-13 起它的接线也在那边（`stats.js` 的 statsWire）—— 那几颗元素
-// 只在这一页存在，正式版里连这个文件都没有，这里就是一句空转。
-if (typeof statsWire === 'function') statsWire();
 // 后台自动（0.50.0 v9）：入口从学习页搬来「我的」标题行右边。
 // 它管着学习通和积分任务两件事，本来就该是「这台手机的设置」，不是某个页面的按钮。
 $('meAuto').addEventListener('click', () => openAutoSheet());
@@ -4628,7 +4614,7 @@ function renderGpaTrend(g) {
   if (rows.length < 2) { box.hidden = true; return; }
   box.hidden = false;
 
-  // 分母取 max(4, 实际最高)：郑航是 4 分制，按 4 折算柱子高矮可比；
+  // 分母取 max(4, 实际最高)：教务是 4 分制，按 4 折算柱子高矮可比；
   // 万一遇到 5 分制的学校也不会把柱子顶出框。
   const top = Math.max(4, Math.max.apply(null, rows.map((r) => r.gpa)));
   const last = rows[rows.length - 1];
@@ -4961,7 +4947,7 @@ function creditProgress() {
   out.total = plan.total || 0;
   out.cats = Object.keys(catMap).map((k) => catMap[k]);
   // 各类小计之和 vs 全程总计：教务系统有时不给「通识选修课」小计
-  // （郑航 2026 级就是：各类加起来 160，总计写 164，差的那 4 学分
+  // （2026 级就遇到过：各类加起来 160，总计写 164，差的那 4 学分
   //   是「通用选修课 4 学分」，只写在备注里）。差多少要说出来，不能装作没有。
   out.catSum = out.cats.reduce((s, c) => s + (c.need || 0), 0);
   out.ok = out.total > 0;
@@ -5262,11 +5248,11 @@ function icsEsc(s) {
 function icsText(ev) {
   const uid = 'exam-' + icsDay(ev.begin) + '-' +
     String(ev.title).replace(/[^0-9A-Za-z\u4e00-\u9fa5]/g, '').slice(0, 24) +
-    '@hangyuantong';
+    '@dongyoutong';
   const L = [
     'BEGIN:VCALENDAR',
     'VERSION:2.0',
-    'PRODID:-//HangYuanTong//Exam//CN',
+    'PRODID:-//DongYouTong//Exam//CN',
     'CALSCALE:GREGORIAN',
     'BEGIN:VEVENT',
     'UID:' + uid,
@@ -5369,7 +5355,7 @@ function icsTextMulti(events, prodid, calName) {
     L.push('BEGIN:VEVENT');
     // 🔴 UID 必须唯一且稳定。重导一次如果 UID 变了，日历里就会出现两份。
     //    这里用「时间 + 序号」：同一份课表每次导出的 UID 一致。
-    L.push('UID:' + icsStamp(ev.begin).replace(/Z$/, '') + '-' + i + '-sched@hangyuantong');
+    L.push('UID:' + icsStamp(ev.begin).replace(/Z$/, '') + '-' + i + '-sched@dongyoutong');
     L.push('DTSTAMP:' + stamp);
     L.push('DTSTART:' + icsStamp(ev.begin));
     L.push('DTEND:' + icsStamp(ev.end));
@@ -5506,7 +5492,7 @@ function exportScheduleIcs() {
     return;
   }
   const name = ('东油通-课表-' + ymd(startDate())).replace(/[\\/:*?"<>|]/g, '_') + '.ics';
-  const text = icsTextMulti(r.events, '-//HangYuanTong//Schedule//CN', '课表');
+  const text = icsTextMulti(r.events, '-//DongYouTong//Schedule//CN', '课表');
   shareCalendar(name, text, '已生成 ' + r.events.length + ' 次课，可导出到日历');
   if (r.skipped.length) {
     // 「有几门课没导出来」必须说出来 —— 否则用户以为导全了，
@@ -5558,7 +5544,7 @@ function exportDueIcs() {
     return;
   }
   const name = ('东油通-作业-' + ymd(today0())).replace(/[\\/:*?"<>|]/g, '_') + '.ics';
-  const text = icsTextMulti(evs, '-//HangYuanTong//Due//CN', '作业');
+  const text = icsTextMulti(evs, '-//DongYouTong//Due//CN', '作业');
   shareCalendar(name, text, '已生成 ' + evs.length + ' 条，可导出到日历');
 }
 
@@ -6101,7 +6087,7 @@ async function prefetchExams() {
 /** 节次块：两节一组，跟作息表对得上。学校接口收的是「第几节」。
  *
  *  🔴 块数**不能写死**。这里以前硬编码了 6 块（1-2 … 11-12），是照「常见高校
- *     12 节」抄的 —— 郑航只有 10 节，于是界面上凭空多出一个「11-12」，
+ *     12 节」抄的 —— 实际只有 10 节，于是界面上凭空多出一个「11-12」，
  *     用户会以为学校真有第 11、12 节课（2026-10-20 用户就是照这个问的）。
  *
  *  真值从 `curTT().unitCount` 来：它是教务系统课表 HTML 里 `unitCount = 10`
@@ -6146,7 +6132,7 @@ function defaultRoomBlock() {
     const hm = end.split(':').map(Number);
     if (hm[0] * 60 + hm[1] > mins) {
       // 第 i 节（0 起）落在哪一大节：0,1 → 1-2；2,3 → 3-4 ……
-      // 上限是作息表自己的长度，不是写死的 12（郑航只有 10 节）。
+      // 上限是作息表自己的长度，不是写死的 12（实际只有 10 节）。
       const start = i - (i % 2) + 1;
       return [start, Math.min(start + 1, tt.length)];
     }
@@ -6645,9 +6631,6 @@ function renderMe() {
     (APP_CHANNEL === 'beta'
       ? ' · 测试版' + (APP_BETA_SEQ > 0 ? ' v' + APP_BETA_SEQ : '')
       : '');
-  // 🔴 数据台只给测试版：正式版里这个按钮不能出现（连"灰着"都不要）。
-  //    2026-11-13 起这件事由 stats.js 的 statsWire 自己做（那颗按钮也只在那份
-  //    HTML 里）—— 正式版的包里两样都没有，这里不再碰它。
   // 标题行那颗「后台自动」：文案跟着开关走（开着写「自动开着」）——
   // 不写清楚的话，用户只能点进弹层才知道自己到底开没开。
   autoRepaint();
@@ -11387,7 +11370,6 @@ if ($('btnUpdate')) $('btnUpdate').hidden = true;
  *    别再照它把清单加回来。署名的事现在只剩仓库根目录的 LICENSE 和 README
  *    （MIT 的版权与许可声明在那边随分发保留）。
  */
-const ABOUT_REPO = 'https://cnb.cool/Hobson2233/hangyuantong';
 /* GitHub 仓库（用户 2026-11-14：「加上咱们的 github 项目地址跳转链接，
  * 要求跳转到系统默认浏览器，在 APP 里面求 star」）。
  *
@@ -11397,26 +11379,13 @@ const ABOUT_REPO = 'https://cnb.cool/Hobson2233/hangyuantong';
  * 🔴 一律走 openExternal ⇒ 交系统浏览器。APK 里塞进 WebView 会让
  *    App 变成 GitHub 的页面，而且没法登录点赞。 */
 const ABOUT_GH = 'https://github.com/dsy-star/NepuPass';
-// 网页版。和 App 是同一份前端代码（`mobile/web`），所以「网站」也是这个项目本身，
-// 不是另做一个 —— 写进关于页是为了让人能在电脑上直接用，也能转给同学。
-// 🔴 0.44.2：主域名从 dpdns.org 换成 hobson.cc。
-//    dpdns.org 是免费动态域名，国内网络对它做 TLS 层干扰（实测同 IP 换 SNI，
-//    带 dpdns.org 的 10 次断 3 次，hobson.cc 10 次全通），
-//    表现就是「偶尔打不开」。旧域名继续可用，但不再对外露出。
-const ABOUT_SITE = 'https://cnb.cool/Hobson2233/hangyuantong';
-
-/* ---------------- 联系方式：放在站上，不写进包 ----------------
+/* ---------------- 联系方式：只认本机，不去远端取 ----------------
  *
- * 🔴 0.42.0 改的。以前群号是这里的一个常量，后果是：
- *    换一次群就得重新打包、重新发版，而**已经装出去的旧包永远显示旧群号**。
- *    群是会满的、会换的，这个设计一开始就想错了。
- *    现在包里只留一份**兜底**，打开这一页时去站点取
- *    `/hangyuantong/about.json`；取到用站上的，取不到用兜底。
- *    改联系方式因此从「发版」变成「改一个文件重新上传网站」——
- *    已经装出去的所有旧版本下次打开就都是新的。
- *
- * 🔴 远端内容是**不可信输入**：它会被拼进 innerHTML。所以三层都过
- *    （类型 → 长度 → 链接协议和域名），见 aboutClean / aboutSafeUrl。
+ * 这一页现在不联网（`aboutFetch()` 直接回 null）。原来它会去站点上取一份
+ * `about.json`，但那个站点是旧项目的基础设施，随仓库分离一并下线了。
+ * 下面这套清洗函数（aboutClean / aboutSafeUrl / aboutContactHtml）保留着：
+ * 哪天重新接上远端数据，仍然走同样的三层校验 ——
+ * 远端内容是**不可信输入**，它会被拼进 innerHTML（类型 → 长度 → 协议和域名）。
  */
 
 const ABOUT_CACHE = 'hyt.about.v1';   // 上次从站上拿到的，下次先拿它顶上
@@ -11425,8 +11394,7 @@ const ABOUT_WAIT = 4000;              // 4 秒没回来就不等了，用手上�
 const ABOUT_FALLBACK = { contact: null, notice: '' };
 // 链接只认这几个站。白名单比黑名单可靠 —— 谁把 about.json 换成了
 // `javascript:` 或者一个钓鱼站，用户点「打开」就中招了。
-const ABOUT_HOSTS = ['qm.qq.com', 'hobson.cc', 'hobson2233.dpdns.org',
-                     'github.com', 'cnb.cool', 'wiki.zua.fan'];
+const ABOUT_HOSTS = ['qm.qq.com', 'github.com', 'cnb.cool'];
 
 // 2026-11-25：ABOUT_REFS（「参考的项目」那三条署名、以及它们各自的
 // 「查看项目」/「在 GitHub 打开」跳转）按用户要求整块删掉了，二级页面
@@ -11911,16 +11879,12 @@ function dirSheet(title, sub, steps, copyName) {
   $('dirOk').addEventListener('click', () => { $('sheetMask').hidden = true; });
 }
 
-// ---- 缴费平台（2026-11-16 下午补）
-// 用户给了学院财务处的地址：`http://cwcfw.zua.edu.cn/xysf/aAppPage/index.aspx?type=1`，
-// 站点标题写的是「校园统一支付平台」。翻它的前端包（`CoreMethod/Services/AppServices.js`）
-// 能看清里面有什么：学费/住宿费的欠费与缴费，还有 `user/ElecRoomIs/*` 那一组
-// 「电费充值 / 用电记录」—— 也就是说**公众号「学生缴费」跳的就是这个站**。
-// 所以原来那格「空调电费 → 去公众号」是绕远路：能直接开，就别教人翻公众号。
-//
-// 🔴 地址是 **http**：学校这台没开 443（和教务一样）。别顺手改成 https，
-//    那会白屏。WebView 允许明文，教务早就这么用。
-// 🔴 `warn` 传 true（默认值）：这站要登录，进去时**该**提醒，别按「公开站」处理。
+// ---- 缴费平台
+// 🔴 东油通**没有**接缴费平台：`PAY_URL` 留空，界面上那格点开只会提示。
+//    上一代产品接过郑航的「校园统一支付平台」（学费/住宿费欠费、电费充值），
+//    那套地址和登录态在这里都不通用，删掉了，留着空字符串当开关即可。
+//    真要接东油的缴费入口，先确认学校有没有、地址是什么，再填进来 ——
+//    别照抄别校的地址：点开一个 404 比不给入口更糟。
 const PAY_URL = '';
 
 // 公告使用 NEPU 教务会话与独立缓存。
@@ -12154,18 +12118,16 @@ const UPD_SRC = (APP_CHANNEL === 'beta' ? UPD_BETA : []).concat(UPD_STABLE);
 
 /* 测试版那一层的口令（2026-11-10）。
  *
- * 起因为什么要有它：测试版的清单和安装包挂在 `hobson.cc/hangyuantong/beta/`
- * 下面，路径虽然不在任何页面上露出来，但**猜得到**（版本号就那几个）。
- * 拿到了包就等于拿到了包里的东西（以前还等于拿到数据台那把钥匙，
- * 2026-11-13 之后控制台整个不进正式版的包了）。
+ * 测试版清单和安装包曾经挂在需要口令的私有路径下，路径虽然不在任何页面上
+ * 露出来，但**猜得到**（版本号就那几个）。拿到了包就等于拿到了包里的东西。
  *
  * 🔴 源码里永远是空串，只有**打测试版那一刻**才由 build_apk.py 从
  *    `deploy/beta_key.txt`（已 gitignore）读出来塞进来。正式版一律空。
- *    这和 `web/stats.js` 里那把钥匙是同一套做法，理由也一样：源码在公开仓库里。
+ *    理由和别处的密钥一样：源码在公开仓库里。
  * 🔴 空串时 `updBetaUrl()` 原样返回 —— 网页版、正式版都不带这个参数，
  *    也就不会因为「服务端要口令、本地没有」而把检查更新弄挂。
- *    服务端那边对不带口令的请求是 403，落到「更新服务暂时不可用」，
- *    这个行为对正式版没影响：正式版根本不请求 /beta/ 那条路径。 */
+ * 🔴 现在 `UPD_BETA` 是空的（测试版改成走 GitHub Release 的 tag），
+ *    这套口令是留给以后重新开测试版通道时用的，别顺手删掉。 */
 const BETA_KEY = '';
 
 /** 给测试版那一层的地址挂上口令。别的地址一律原样返回。
@@ -12177,7 +12139,10 @@ const BETA_KEY = '';
 function updBetaUrl(u) {
   const s = String(u || '');
   if (!BETA_KEY) return s;
-  if (s.indexOf('/hangyuantong/beta/') < 0) return s;
+  /* 只给「本项目的清单地址」挂口令。原来认的是旧站点的 `/hangyuantong/beta/`，
+     现在清单在 gh-pages 上，认 `version.json` 就够了；别的地址一律原样返回，
+     免得把口令带到第三方镜像（ghproxy、jsDelivr）的 URL 里。 */
+  if (s.indexOf('/NepuPass') < 0 && s.indexOf('version.json') < 0) return s;
   if (s.indexOf('k=') >= 0) return s;             // 已经带过了，别挂两次
   return s + (s.indexOf('?') < 0 ? '?' : '&') + 'k=' + encodeURIComponent(BETA_KEY);
 }
@@ -16753,7 +16718,7 @@ function openAutoSheet() {
 /** 打开 App 时按设置自动查一次。默认「每次打开」。 */
 // ------------------------------------------------------------------ 校历
 /* 数据来源：学校发布的《2026–2027 学年校历》（外国语学院转载的公开页面
-   https://wyx.zua.edu.cn/info/1051/8303.htm），关键日期逐条人工核对过。
+   原网站），关键日期逐条人工核对过。
 
    🔴 为什么写死在代码里，而不是每次去抓：
       ① 校历一个学年只变一次，天天去抓 364 天是白抓；
@@ -16959,7 +16924,7 @@ function renderCalendar() {
 
 // ------------------------------------------------------------------ 校园（智慧门户）
 /*
- * 这一页装的是**智慧门户**（rhmh.zua.edu.cn）的东西，跟教务系统是两套账号：
+ * 这一页装的是**智慧门户**的东西，跟教务系统是两套账号：
  *   · 密码不一样（实测自助服务 9 位、门户 10 位）
  *   · 登录要算一道**算术验证码**，而且**错 5 次锁号**
  *
@@ -17379,7 +17344,7 @@ async function openPortalSheet() {
  *      会被 MainActivity 拦掉，于是「点了没反应且不报错」。）
  *
  * 🔴 第三个参数 `warn`（默认 true）：这个地址「本来就要登录」吗。
- *    false 用于公开页（公告正文、郑航百科）—— 那边没有 CASTGC 也照样能看，
+ *    false 用于公开页（公告正文、校园百科）—— 那边没有 CASTGC 也照样能看，
  *    不该弹「门户登录已过期」。办事入口必须留默认值 true。
  *
  * 🔴 界面上那句说明是**两套文案**（index.html 的 data-app / 默认值）。
@@ -17512,23 +17477,20 @@ async function unbindPortal() {
 // 用户 2026-10-22：「很多时候用户可能忘记了密码，再去找官网改密码之类的很麻烦」
 // +「在输入密码的密码框右侧加个显示密码的按键吧」。
 //
-// 🔴 三个找回地址都是**当天实测打开过的**，别凭印象改：
-//      · 教务 `/eams/resetPassword.action` —— 正方 EAMS 的密码重置，
-//        页面只有「账号所用邮箱」一个框。**没在教务里绑过邮箱就用不了**，
-//        所以文案不能写成「一定能自助找回」。
-//      · 学习通 `fid=1286` —— 郑航的学校 id，跟抓作业用的是同一个。
-//      · 门户 `/aqzx/#/password/passwordFound` —— 统一身份认证的安全中心，
-//        要 学号 + 姓名 + 身份证号 + 验证码。它自己写着：不行就找辅导员，
-//        或者带证件去信息管理中心（0371-61912710）。
-//   写错的代价比不给还大：点开一个 404，用户会以为整个 App 坏了。
+// 🔴 三个地址都得是**这个 App 已经在用的那几个域名**，别凭印象改：
+//      · 教务 —— 走学校的 WebVPN 登录页（`NepuActivity.LOGIN_URL` 同一个地址），
+//        教务系统本身没有独立的「忘记密码」页，重置由统一认证那边管。
+//      · 学习通 —— 超星账号级的找回页，跟学校 id 关系不大。
+//      · 门户 —— 统一身份认证入口（`portal.nepu.edu.cn`），重置在它里面。
+//   写错的代价比不给还大：点开一个 404 或者别人学校的站，用户会以为整个 App 坏了。
 
 const PWD_HELP = {
-  jw: { name: '教务系统',
-        url: 'http://jwglxt.zua.edu.cn/eams/resetPassword.action' },
+  jw: { name: '统一认证',
+        url: 'https://webvpn.nepu.edu.cn/users/sign_in' },
   cx: { name: '学习通',
         url: 'https://passport2.chaoxing.com/pwd/findpwd?version=1&fid=1286' },
   portal: { name: '智慧门户',
-            url: 'https://sfrz.zua.edu.cn/aqzx/#/password/passwordFound' },
+            url: 'https://portal.nepu.edu.cn/#/index4' },
 };
 
 /** 「显示密码」眼睛按钮。`id` 是要切换的那个输入框。

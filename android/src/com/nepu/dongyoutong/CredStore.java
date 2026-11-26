@@ -49,6 +49,11 @@ import javax.crypto.spec.SecretKeySpec;
  */
 public final class CredStore {
 
+    /* 🔴 这个字符串是**已经装在用户手机上的数据的家**，不是品牌名。
+     *    改名等于把所有人的已存凭据（教务密码、学习通 cookie、饮水状态）
+     *    全丢掉：读的时候找不到文件，用户看到的是「要重新输一次密码」。
+     *    所以包名早就从 com.hobson.hangyuantong 改成 com.nepu.dongyoutong 了，
+     *    这里和下面的 KEY_ALIAS / PBEKeySpec 盐都保持原样，永远别动。 */
     private static final String PREFS = "hangyuantong";
     /**
      * 学习通存的是 **cookie**，不是密码。
