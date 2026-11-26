@@ -1,0 +1,13 @@
+{
+  "name": "东油通",
+  "version": "0.1.11",
+  "code": 202,
+  "size": 953382,
+  "sha256": "a4f93b94fe95c18586c131bd8cc574978e76a4a3ff18c4b6f0daaa520497176c",
+  "apk_cn": "https://ghproxy.net/https://github.com/dsy-star/NepuPass/releases/download/v0.1.11/dongyoutong-0.1.11.apk",
+  "apk": "https://dsy-star.github.io/NepuPass/dongyoutong-0.1.11.apk",
+  "page": "https://dsy-star.github.io/NepuPass/",
+  "notes": [
+    "添加问题反馈功能"
+  ]
+}
